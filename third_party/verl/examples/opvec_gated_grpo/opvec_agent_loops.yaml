@@ -1,0 +1,2 @@
+- name: opvec_memagent
+  _target_: verl.experimental.opvec.memagent_agent_loop.OpVecMemAgentAgentLoop

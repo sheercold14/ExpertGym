@@ -1,0 +1,87 @@
+storage_root: /tmp/shared-storage/ExpertGym/LLaMA
+hf_endpoint: https://hf-mirror.com
+
+models:
+  base:
+    repo_id: meta-llama/Llama-3.2-3B-Instruct
+    local_dir: models/base/Llama-3.2-3B-Instruct
+    gated: true
+  math:
+    repo_id: sunblaze-ucb/Llama-3.2-3B-Instruct-GRPO-MATH-1EPOCH
+    local_dir: models/experts/Llama-3.2-3B-Instruct-GRPO-MATH-1EPOCH
+    domain: math
+  tool:
+    repo_id: chengq9/ToolRL-Llama3.2-3B
+    local_dir: models/experts/ToolRL-Llama3.2-3B
+    domain: tool_use
+  search:
+    repo_id: Alibaba-NLP/ZeroSearch_google_V2_Llama_3.2_3B_Instruct
+    local_dir: models/experts/ZeroSearch_google_V2_Llama_3.2_3B_Instruct
+    domain: search
+
+datasets:
+  math_train:
+    repo_id: EleutherAI/hendrycks_math
+    repo_type: dataset
+    local_dir: datasets/math/hendrycks_math
+    note: GRPO-MATH model card states it was trained on MATH.
+  search_train:
+    repo_id: sunhaonlp/ZeroSearch_dataset
+    fallback_repo_id: Alibaba-NLP/ZeroSearch_dataset
+    repo_type: dataset
+    local_dir: datasets/search/ZeroSearch_dataset
+    note: ZeroSearch official quick start uses this RL training dataset.
+  tool_train:
+    source: github
+    repo_url: https://github.com/qiancheng0/ToolRL.git
+    sparse_paths:
+      - dataset/rlla_4k
+      - dataset/rlla_4k_raw
+    local_dir: datasets/tool/ToolRL
+    note: ToolRL keeps its 4K processed/raw training data in the source repo.
+
+eval_datasets:
+  gsm8k:
+    repo_id: openai/gsm8k
+    repo_type: dataset
+    local_dir: eval/math/gsm8k
+    split: main/test
+  math500:
+    repo_id: HuggingFaceH4/MATH-500
+    repo_type: dataset
+    local_dir: eval/math/MATH-500
+    split: test
+  nq_open:
+    repo_id: google-research-datasets/nq_open
+    repo_type: dataset
+    local_dir: eval/search/nq_open
+    split: validation
+  two_wiki:
+    repo_id: voidful/2WikiMultihopQA
+    repo_type: dataset
+    local_dir: eval/search/2WikiMultihopQA
+    split: dev
+  bfcl:
+    repo_id: gorilla-llm/Berkeley-Function-Calling-Leaderboard
+    repo_type: dataset
+    local_dir: eval/tool/BFCL
+    splits:
+      live:
+        - BFCL_v3_live_multiple.json
+        - BFCL_v3_live_irrelevance.json
+        - BFCL_v3_live_simple.json
+        - BFCL_v3_live_parallel.json
+        - BFCL_v3_live_parallel_multiple.json
+      non_live:
+        - BFCL_v3_multiple.json
+        - BFCL_v3_parallel.json
+        - BFCL_v3_parallel_multiple.json
+        - BFCL_v3_irrelevance.json
+        - BFCL_v3_simple.json
+
+evaluation:
+  math:
+    - openai/gsm8k
+    - EleutherAI/hendrycks_math
+  tool:
+    - gorilla-llm/Berkeley-Function-Calling-Leaderboard

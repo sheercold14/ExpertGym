@@ -1,0 +1,5 @@
+lm-eval[vllm,math]==0.4.11
+huggingface_hub
+pyyaml
+safetensors
+tqdm

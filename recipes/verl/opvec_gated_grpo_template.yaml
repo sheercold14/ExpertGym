@@ -1,0 +1,29 @@
+# Template for a VeRL GRPO run using OP-VEC prompt/reward adapters.
+# This file is intentionally a template because VeRL cluster/backend keys vary
+# across versions.  The OP-VEC-specific pieces are the custom reward function
+# and the actor patch hook in opvec.frameworks.verl_gated_actor.
+
+# Dataset created by scripts/frameworks/opvec_prepare_verl_data.py
+# data.train_files: [/tmp/shared-storage/OnPolicy/data/verl_opvec_prompts.parquet]
+# data.val_files: [/tmp/shared-storage/OnPolicy/data/verl_opvec_val.parquet]
+
+algorithm:
+  adv_estimator: grpo
+
+custom_reward_function:
+  path: scripts/frameworks/opvec_verl_reward_fn.py
+  name: compute_score
+
+opvec_gate_actor:
+  config: configs/gated_grpo.yaml
+  mode_manifest: /tmp/shared-storage/OnPolicy/modes/opvec4/mode_manifest.json
+  gate_parameterization: global
+  init_gate_checkpoint: null
+  max_gated_modules: null
+  freeze_base: true
+  trainable_parameters: gate_manager_only
+
+# In a real VeRL worker patch, call:
+#   from opvec.frameworks.verl_gated_actor import install_opvec_gate_actor
+#   gate_manager, audit = install_opvec_gate_actor(torch, model, ...)
+# and build the actor optimizer from gate_manager.parameters() only.

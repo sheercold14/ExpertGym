@@ -1,0 +1,108 @@
+# Gated-GRPO configuration for OP-VEC.
+# This file keeps the original OP-VEC model/task-vector definitions but tunes
+# defaults for small on-policy RL over gate coefficients.
+
+run:
+  name: opvec-gated-grpo
+  seed: 20260510
+
+storage:
+  root: ${ONPOLICY_STORAGE_ROOT}
+
+models:
+  base: /mnt/cache/wuruixiao/models/Qwen2.5-7b-instruct
+  experts:
+    tool: /mnt/cache/wuruixiao/models/Qwen2.5-7B-Instruct-ToolRL-grpo-cold
+    memory: /mnt/cache/wuruixiao/models/RL-MemoryAgent-7B
+    code: /mnt/cache/wuruixiao/models/ReasonFlux-Coder-7B
+  reference_policy: /tmp/shared-storage/AgentMerging_plan/experiments/conflict_gated_residual/ITER_019_cg_tool_extra020/model
+
+modes:
+  mode_set: opvec4
+  artifact_dir: ${ONPOLICY_STORAGE_ROOT}/modes/opvec4
+  residual_zero_mean: true
+  include_regex:
+    - "^model\\.layers\\.[0-9]+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\\.weight$"
+  exclude_regex:
+    - ".*lm_head.*"
+    - ".*norm.*"
+    - ".*embed_tokens.*"
+    - ".*bias.*"
+  delta_dtype: float32
+
+# Recommended first run: global coefficients only.  Initialize from a known TA
+# or cg checkpoint via --init-gate-checkpoint when available; otherwise common
+# 0.75 is a stronger starting point than 0.50 for this project.
+initial_gates:
+  common: 0.75
+  tool_residual: 0.00
+  memory_residual: 0.00
+  code_residual: 0.00
+
+gate_bounds:
+  common: [0.00, 1.20]
+  residual: [-0.35, 0.35]
+  coefficient: [-0.20, 1.30]
+  global_coefficient: [0.00, 1.20]
+  parameter_residual: [-0.10, 0.10]
+
+data:
+  seed_manifest: ${ONPOLICY_STORAGE_ROOT}/data/seed_prompt_manifest.jsonl
+  behavior_matrix: ${ONPOLICY_STORAGE_ROOT}/data/behavior_matrix.jsonl
+  rollout_store: ${ONPOLICY_STORAGE_ROOT}/runs/gated_grpo/onpolicy_rollouts.jsonl
+
+rollout:
+  samples_per_prompt: 8
+  temperature: 0.7
+  top_p: 0.95
+  max_new_tokens:
+    tool: 512
+    memory: 512
+    code: 2048
+
+frontier:
+  min_frontier_weight: 0.20
+  min_reward_std: 0.05
+  drop_all_success_from_policy_loss: true
+  drop_all_failure_without_contract_signal: true
+
+loss:
+  eps_clip: 0.2
+  beta_kl: 0.02
+  lambda_prior: 0.02
+  lambda_retention: 0.10
+  lambda_invalid: 0.10
+  advantage_eps: 1.0e-6
+  global_coefficient_prior_scale: 0.10
+  parameter_residual_prior_scale: 1.00
+
+reward:
+  # Keep rollout reward equal to the official task verifier by default.
+  # Nonzero behavior-span mixing is useful only for diagnostics/smoke tests.
+  behavior_span_weight: 0.00
+
+calibration:
+  frontier_task_quota:
+    code: 64
+    tool: 64
+    memory: 32
+  task_loss_weight:
+    code: 1.5
+    tool: 1.5
+    memory: 0.5
+
+optimizer:
+  name: adamw
+  lr: 0.01
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+
+train:
+  max_steps: 1
+  prompt_batch_size: 150
+  retention_batch_size: 32
+  eval_interval: 1
+  bake_interval: 1
+
+evaluation:
+  model_name: opvec-gated-grpo

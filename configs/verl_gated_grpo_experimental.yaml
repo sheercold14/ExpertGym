@@ -1,0 +1,65 @@
+# Experimental VeRL config skeleton for OP-VEC Gated-GRPO.
+#
+# This is a reference template, not a drop-in cluster config: keep the native
+# OP-VEC loop as the first-line training path.  Use this template when you want
+# VeRL to run GRPO while an external_lib hook freezes the base LM and exposes
+# only OP-VEC gate parameters as trainable.
+
+algorithm:
+  adv_estimator: grpo
+
+# Convert OP-VEC prompts with:
+# python scripts/frameworks/opvec_prepare_verl_data.py \
+#   --seed-manifest /path/to/frontier150_prompts.jsonl \
+#   --output /path/to/verl_opvec_prompts.jsonl \
+#   --parquet /path/to/verl_opvec_prompts.parquet
+
+data:
+  train_files: /tmp/shared-storage/OnPolicy/data/verl_opvec_prompts.parquet
+  val_files: null
+  prompt_key: prompt
+  max_prompt_length: 2048
+  max_response_length: 1024
+  train_batch_size: 150
+
+custom_reward_function:
+  path: scripts/frameworks/opvec_verl_reward_fn.py
+  name: compute_score
+
+actor_rollout_ref:
+  model:
+    path: /mnt/cache/wuruixiao/models/Qwen2.5-7b-instruct
+    trust_remote_code: true
+    # VeRL imports this before loading the HF actor.  The module reads the
+    # OPVEC_* environment variables below and installs OP-VEC gated linears.
+    external_lib: scripts.frameworks.opvec_verl_external_lib
+  actor:
+    optim:
+      lr: 1.0e-2
+      weight_decay: 0.0
+    ppo_mini_batch_size: 150
+    ppo_micro_batch_size_per_gpu: 1
+    clip_ratio: 0.2
+    use_kl_loss: true
+    kl_loss_coef: 0.02
+  rollout:
+    name: vllm
+    n: 8
+    temperature: 0.7
+    top_p: 0.95
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+
+trainer:
+  project_name: onpolicy-merge
+  experiment_name: opvec-gated-grpo-verl-experimental
+  total_epochs: 1
+  logger: [console]
+
+# Required environment for the external_lib hook:
+# export OPVEC_ENABLE_VERL_PATCH=1
+# export OPVEC_CONFIG=$PWD/configs/gated_grpo.yaml
+# export OPVEC_MODE_MANIFEST=/tmp/shared-storage/OnPolicy/modes/opvec4/mode_manifest.json
+# export OPVEC_GATE_PARAMETERIZATION=global
+# export OPVEC_MAX_GATED_MODULES=0
+# export OPVEC_FREEZE_BASE=1

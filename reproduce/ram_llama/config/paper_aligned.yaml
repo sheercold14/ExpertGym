@@ -1,0 +1,47 @@
+paper:
+  title: Behavior Knowledge Merge in Reinforced Agentic Models
+  arxiv: "2601.13572"
+  llama_section: "Appendix B.4"
+
+storage_root: /tmp/shared-storage/ExpertGym/LLaMA
+source_root: /tmp/shared-storage/ExpertGym/LLaMA/sources
+hf_endpoint: https://hf-mirror.com
+
+models:
+  base: models/base/Llama-3.2-3B-Instruct
+  math: models/experts/Llama-3.2-3B-Instruct-GRPO-MATH-1EPOCH
+  tool: models/experts/ToolRL-Llama3.2-3B
+  search: models/experts/ZeroSearch_google_V2_Llama_3.2_3B_Instruct
+  ram: models/merged/ram_math_tool_search
+  ram_plus: models/merged/ram_plus_math_tool_search
+
+merge:
+  method: RAM/RAM+
+  threshold: 1.0e-5
+  ram_r: 0.0
+  ram_plus_r: 0.10
+  alpha: 2.0
+
+evaluation:
+  math:
+    evaluator: lm-evaluation-harness
+    apply_chat_template: false
+    domain_score: average(gsm8k flexible-extract exact_match, minerva_math500 exact_match)
+    tasks:
+      - gsm8k
+      - minerva_math500
+  search:
+    evaluator: ZeroSearch protocol
+    tasks:
+      - nq_open
+      - two_wiki
+    max_turns: 5
+    topk: 5
+    temperature: 0.7
+    top_p: 1.0
+  tool:
+    evaluator: BFCL AST
+    categories:
+      - live
+      - non_live
+    bfcl_model_id: meta-llama/Llama-3.2-3B-Instruct-FC
