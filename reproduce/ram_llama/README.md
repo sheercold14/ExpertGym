@@ -76,10 +76,14 @@ Math 默认任务是 `gsm8k,minerva_math500`，并且默认不套 chat template�
 MODEL_SET=base,ram_plus        # 只评测部分模型
 MAX_SAMPLES=20                 # Search smoke test
 RUN_MATH=0 RUN_TOOL=1 RUN_SEARCH=0
-SEARCH_BACKEND=wiki            # wiki/google/exa/local_context
+SEARCH_BACKEND=wiki            # wiki/google/serper/exa/local_context
 SEARCH_URL=http://localhost:6002/retrieve
 SER_API_KEY=xxx                # SEARCH_BACKEND=google 时需要
+SERPER_API_KEY=xxx             # SEARCH_BACKEND=serper 时需要
+SERPER_API_KEY_FILE=/path/key.json
 EXA_API_KEY=xxx                # SEARCH_BACKEND=exa 时需要
+SEARCH_CACHE_PATH=/path/cache.jsonl
+ZEROSEARCH_INVALID_FEEDBACK=1  # 无效动作后继续让 agent 重试，贴近 ZeroSearch 官方交互
 ```
 
 结果写到：
@@ -120,7 +124,7 @@ GPU=0 PY=/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python SEARCH_BACKEND=wik
   /path/to/model my_model my_run
 ```
 
-说明：ZeroSearch 官方仓库只提供交互式 inference 入口和训练入口；这里的批量 Search 评测复用了它的 prompt、stop sequence、`<search>/<information>/<answer>` 协议和默认采样设置。要更贴近 `ZeroSearch_google` expert，使用 `SEARCH_BACKEND=google`；要离线无 API，则启动 wiki retriever 或用 `SEARCH_BACKEND=local_context` 做近似 smoke test。
+说明：ZeroSearch 官方仓库只提供交互式 inference 入口和训练入口；这里的批量 Search 评测复用了它的 prompt、stop sequence、`<search>/<information>/<answer>` 协议和默认采样设置。要更贴近 `ZeroSearch_google` expert，使用 `SEARCH_BACKEND=google` 或 `SEARCH_BACKEND=serper`；要离线无 API，则启动 wiki retriever 或用 `SEARCH_BACKEND=local_context` 做近似 smoke test。`SEARCH_CACHE_PATH` 默认写到当前 run 目录，同样的 backend/query/topk 会直接复用缓存。
 
 ## 快速本地评测
 

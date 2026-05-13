@@ -17,11 +17,12 @@ from opvec.config import load_config, write_json
 from opvec.data.io import read_jsonl, write_jsonl
 from opvec.data.prompt_filters import filter_memory_records, parse_memory_kind_filter
 from opvec.data.prompt_sampler import task_balanced_sample
+from opvec.data.schema import make_gate_id, validate_rollout_row
 from opvec.modeling.apply_gates import install_gated_linears_from_manifest
 from opvec.modeling.bake import load_gate_values
 from opvec.modeling.devices import model_input_device, model_load_device_kwargs
 from opvec.modeling.gate_parameters import make_torch_gate_manager
-from opvec.modeling.logprob import render_chat_prompt, response_logprob_from_text
+from opvec.modeling.logprob import render_chat_prompt, response_logprob_details_from_text, response_logprob_from_text
 from opvec.modeling.manifest import manifest_param_names
 from opvec.rewards.router import RewardRouter
 from opvec.train.frontier import should_keep_frontier
@@ -163,6 +164,7 @@ def collect_hf_rollouts(config: dict, args: argparse.Namespace) -> dict:
                 installed=installed,
                 gate_manager=gate_manager,
             )
+            validate_rollout_row(row)
             rollout_rows.append(row)
             if stream_handle is not None:
                 stream_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -198,6 +200,7 @@ def collect_hf_rollouts(config: dict, args: argparse.Namespace) -> dict:
         "policy_model": model_path,
         "disable_gates": bool(args.disable_gates),
         "skip_logprob": bool(args.skip_logprob),
+        "store_token_logprobs": bool(args.store_token_logprobs),
         "stream_output": bool(args.stream_output),
         "reward_definition": {
             "main": "task_reward",
@@ -277,38 +280,43 @@ def collect_one_prompt(
             ),
         )
         old_logprob = None
+        token_payload = {}
         if not args.skip_logprob:
-            old_logprob = response_logprob_from_text(
+            old_logprob, token_payload = _old_logprob_payload(
                 torch,
                 model,
                 tokenizer,
                 prompt_text=prompt_text,
                 response_text=response_text,
-                device=input_device,
-                max_length=args.max_logprob_tokens,
+                args=args,
+                input_device=input_device,
             )
-        samples.append(
-            {
-                "sample_id": f"{prompt_record['prompt_id']}__k{sample_idx}",
-                "text": response_text,
-                "old_logprob": old_logprob,
-                "old_logprob_max_length": None if args.skip_logprob else args.max_logprob_tokens,
-                "length": len(response_ids),
-                **scored,
-            }
-        )
+        sample = {
+            "sample_id": f"{prompt_record['prompt_id']}__k{sample_idx}",
+            "text": response_text,
+            "old_logprob": old_logprob,
+            "old_logprob_max_length": None if args.skip_logprob else args.max_logprob_tokens,
+            "length": len(response_ids),
+            **scored,
+        }
+        sample.update(token_payload)
+        samples.append(sample)
     keep, skip_reason, frontier = should_keep_frontier(
         samples,
         min_frontier_weight=float(config["frontier"]["min_frontier_weight"]),
         min_reward_std=float(config["frontier"]["min_reward_std"]),
     )
+    gate_values = gate_manager.gate_values() if gate_manager is not None else {}
     return {
         "run_id": args.run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "step": step,
         "policy_id": "gated-grpo-current-policy",
         "gate_checkpoint": args.gate_checkpoint,
-        "gate_values": gate_manager.gate_values() if gate_manager is not None else {},
+        "gate_values": gate_values,
+        "gate_id": make_gate_id(gate_values, args.gate_checkpoint),
+        "group_id": prompt_record.get("group_id") or prompt_record["prompt_id"],
+        "seed": int(args.seed if args.seed is not None else config["run"]["seed"]),
         "installed_modules": installed,
         "prompt_id": prompt_record["prompt_id"],
         "task": prompt_record["task"],
@@ -354,6 +362,9 @@ def collect_one_memagent_trajectory(
         turns = []
         old_logprob_total = 0.0
         has_logprob = not args.skip_logprob
+        sample_token_ids = []
+        sample_old_logprobs = []
+        sample_response_mask = []
         total_length = 0
         for chunk_idx, chunk in enumerate(chunks, start=1):
             user_text = MEMAGENT_UPDATE_TEMPLATE.format(prompt=question, memory=memory_text, chunk=chunk)
@@ -368,31 +379,35 @@ def collect_one_memagent_trajectory(
                 input_device=input_device,
             )
             turn_logprob = None
+            turn_token_payload = {}
             if not args.skip_logprob:
-                turn_logprob = response_logprob_from_text(
+                turn_logprob, turn_token_payload = _old_logprob_payload(
                     torch,
                     model,
                     tokenizer,
                     prompt_text=prompt_text,
                     response_text=response_text,
-                    device=input_device,
-                    max_length=args.max_logprob_tokens,
+                    args=args,
+                    input_device=input_device,
                 )
                 if turn_logprob is None:
                     has_logprob = False
                 else:
                     old_logprob_total += float(turn_logprob)
+                    sample_token_ids.extend(turn_token_payload.get("response_token_ids", []))
+                    sample_old_logprobs.extend(turn_token_payload.get("old_logprobs", []))
+                    sample_response_mask.extend(turn_token_payload.get("response_mask", []))
             total_length += response_len
-            turns.append(
-                {
-                    "turn": chunk_idx,
-                    "kind": "memory_update",
-                    "prompt_text": prompt_text,
-                    "text": response_text,
-                    "old_logprob": turn_logprob,
-                    "length": response_len,
-                }
-            )
+            turn = {
+                "turn": chunk_idx,
+                "kind": "memory_update",
+                "prompt_text": prompt_text,
+                "text": response_text,
+                "old_logprob": turn_logprob,
+                "length": response_len,
+            }
+            turn.update(turn_token_payload)
+            turns.append(turn)
             memory_text = response_text
         user_text = MEMAGENT_FINAL_TEMPLATE.format(prompt=question, memory=memory_text)
         prompt_text = render_chat_prompt(tokenizer, [{"role": "user", "content": user_text}], user_text)
@@ -406,31 +421,35 @@ def collect_one_memagent_trajectory(
             input_device=input_device,
         )
         final_logprob = None
+        final_token_payload = {}
         if not args.skip_logprob:
-            final_logprob = response_logprob_from_text(
+            final_logprob, final_token_payload = _old_logprob_payload(
                 torch,
                 model,
                 tokenizer,
                 prompt_text=prompt_text,
                 response_text=final_text,
-                device=input_device,
-                max_length=args.max_logprob_tokens,
+                args=args,
+                input_device=input_device,
             )
             if final_logprob is None:
                 has_logprob = False
             else:
                 old_logprob_total += float(final_logprob)
+                sample_token_ids.extend(final_token_payload.get("response_token_ids", []))
+                sample_old_logprobs.extend(final_token_payload.get("old_logprobs", []))
+                sample_response_mask.extend(final_token_payload.get("response_mask", []))
         total_length += final_len
-        turns.append(
-            {
-                "turn": len(chunks) + 1,
-                "kind": "final_answer",
-                "prompt_text": prompt_text,
-                "text": final_text,
-                "old_logprob": final_logprob,
-                "length": final_len,
-            }
-        )
+        final_turn = {
+            "turn": len(chunks) + 1,
+            "kind": "final_answer",
+            "prompt_text": prompt_text,
+            "text": final_text,
+            "old_logprob": final_logprob,
+            "length": final_len,
+        }
+        final_turn.update(final_token_payload)
+        turns.append(final_turn)
         scored = router.score(prompt_record, final_text)
         scored = _apply_behavior_span_mix(
             scored,
@@ -440,29 +459,40 @@ def collect_one_memagent_trajectory(
                 else config.get("reward", {}).get("behavior_span_weight", 0.0)
             ),
         )
-        samples.append(
-            {
-                "sample_id": f"{prompt_record['prompt_id']}__k{sample_idx}",
-                "text": final_text,
-                "old_logprob": None if args.skip_logprob or not has_logprob else old_logprob_total,
-                "old_logprob_max_length": None if args.skip_logprob else args.max_logprob_tokens,
-                "length": total_length,
-                "trajectory": turns,
-                **scored,
-            }
-        )
+        sample = {
+            "sample_id": f"{prompt_record['prompt_id']}__k{sample_idx}",
+            "text": final_text,
+            "old_logprob": None if args.skip_logprob or not has_logprob else old_logprob_total,
+            "old_logprob_max_length": None if args.skip_logprob else args.max_logprob_tokens,
+            "length": total_length,
+            "trajectory": turns,
+            **scored,
+        }
+        if args.store_token_logprobs and has_logprob and sample_token_ids:
+            sample.update(
+                {
+                    "response_token_ids": sample_token_ids,
+                    "old_logprobs": sample_old_logprobs,
+                    "response_mask": sample_response_mask,
+                }
+            )
+        samples.append(sample)
     keep, skip_reason, frontier = should_keep_frontier(
         samples,
         min_frontier_weight=float(config["frontier"]["min_frontier_weight"]),
         min_reward_std=float(config["frontier"]["min_reward_std"]),
     )
+    gate_values = gate_manager.gate_values() if gate_manager is not None else {}
     return {
         "run_id": args.run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "step": step,
         "policy_id": "gated-grpo-current-policy",
         "gate_checkpoint": args.gate_checkpoint,
-        "gate_values": gate_manager.gate_values() if gate_manager is not None else {},
+        "gate_values": gate_values,
+        "gate_id": make_gate_id(gate_values, args.gate_checkpoint),
+        "group_id": prompt_record.get("group_id") or prompt_record["prompt_id"],
+        "seed": int(args.seed if args.seed is not None else config["run"]["seed"]),
         "installed_modules": installed,
         "prompt_id": prompt_record["prompt_id"],
         "task": prompt_record["task"],
@@ -493,6 +523,45 @@ def _generate_response_text(torch, model, tokenizer, *, prompt_text: str, args: 
         output_ids = model.generate(**generation_kwargs)
     response_ids = output_ids[0, inputs["input_ids"].shape[1] :]
     return tokenizer.decode(response_ids, skip_special_tokens=True), int(len(response_ids))
+
+
+def _old_logprob_payload(
+    torch,
+    model,
+    tokenizer,
+    *,
+    prompt_text: str,
+    response_text: str,
+    args: argparse.Namespace,
+    input_device,
+) -> tuple[float | None, dict]:
+    if args.store_token_logprobs:
+        details = response_logprob_details_from_text(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            response_text=response_text,
+            device=input_device,
+            max_length=args.max_logprob_tokens,
+        )
+        if details is None:
+            return None, {}
+        return float(details["sum_logprob"]), {
+            "response_token_ids": details["response_token_ids"],
+            "old_logprobs": details["old_logprobs"],
+            "response_mask": details["response_mask"],
+        }
+    logprob = response_logprob_from_text(
+        torch,
+        model,
+        tokenizer,
+        prompt_text=prompt_text,
+        response_text=response_text,
+        device=input_device,
+        max_length=args.max_logprob_tokens,
+    )
+    return logprob, {}
 
 
 def _memagent_trajectory(prompt_record: dict) -> dict | None:
@@ -526,6 +595,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-prompt-tokens", type=int, default=1024)
     parser.add_argument("--max-logprob-tokens", type=int, default=1536)
     parser.add_argument("--skip-logprob", action="store_true", help="Skip old-policy logprob scoring for reward-only evaluation rollouts.")
+    parser.add_argument("--store-token-logprobs", action="store_true", help="Store response_token_ids, old_logprobs, and response_mask for token-level PPO/GRPO.")
     parser.add_argument("--stream-output", action="store_true", help="Write rollout rows as each prompt finishes.")
     parser.add_argument("--progress-every", type=int, default=0, help="Print progress every N prompts; 0 disables progress logs.")
     parser.add_argument("--temperature", type=float, default=0.7)

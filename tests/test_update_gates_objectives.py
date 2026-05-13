@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 import torch
@@ -17,6 +18,51 @@ SPEC.loader.exec_module(update_gates_module)
 
 
 class UpdateGatesObjectivesTest(unittest.TestCase):
+    def test_update_batcher_accumulates_rows_before_step(self):
+        class TinyGateManager(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+                self.project_calls = 0
+
+            def project_(self):
+                self.project_calls += 1
+
+            def gate_values(self):
+                return {"weight": float(self.weight.detach().item())}
+
+        manager = TinyGateManager()
+        optimizer = torch.optim.SGD(manager.parameters(), lr=1.0)
+        batcher = update_gates_module._UpdateBatcher(
+            torch=torch,
+            optimizer=optimizer,
+            gate_manager=manager,
+            grad_clip_norm=10.0,
+            min_grad_norm_for_step=0.0,
+            update_batch_size=2,
+            batch_loss_reduction="mean",
+            train_coefficients=set(),
+            coefficient_anchor_gates={},
+            args=Namespace(
+                max_coefficient_delta_from_init=None,
+                tool_min_margin_over_memory=0.0,
+                tool_min_margin_over_code=0.0,
+            ),
+        )
+        log_rows = [{"prompt_id": "a"}, {"prompt_id": "b"}]
+        (manager.weight * batcher.loss_scale).backward()
+        batcher.add(log_rows, 0)
+        self.assertAlmostEqual(float(manager.weight.detach().item()), 1.0, places=6)
+        (manager.weight * batcher.loss_scale).backward()
+        batcher.add(log_rows, 1)
+
+        self.assertAlmostEqual(float(manager.weight.detach().item()), 0.0, places=6)
+        self.assertEqual(batcher.optimizer_steps, 1)
+        self.assertEqual(manager.project_calls, 1)
+        self.assertEqual(log_rows[0]["optimizer_step_index"], 1)
+        self.assertEqual(log_rows[1]["optimizer_step_index"], 1)
+        self.assertAlmostEqual(log_rows[0]["batch_loss_scale"], 0.5, places=6)
+
     def test_pairwise_best_response_loss_pushes_positive_above_negative(self):
         positive = torch.tensor(-2.0, requires_grad=True)
         negative = torch.tensor(-1.0, requires_grad=True)
@@ -211,6 +257,156 @@ class UpdateGatesObjectivesTest(unittest.TestCase):
             update_gates_module.response_logprob_tensor_from_text = original
 
         self.assertAlmostEqual(float(value.detach().item()), 8.0, places=6)
+
+    def test_token_logprob_entry_uses_response_mask(self):
+        original = update_gates_module.response_logprob_tensor_details_from_text
+
+        def fake_details(torch_module, model, tokenizer, *, prompt_text, response_text, device, max_length):
+            return {
+                "response_token_ids": [1, 2],
+                "logprobs": torch.tensor([-0.2, -0.3], requires_grad=True),
+                "response_mask": [1, 1],
+            }
+
+        update_gates_module.response_logprob_tensor_details_from_text = fake_details
+        try:
+            entry = update_gates_module._sample_response_logprob_entry(
+                torch,
+                None,
+                None,
+                prompt_text="prompt",
+                sample={
+                    "sample_id": "s0",
+                    "text": "answer",
+                    "old_logprobs": [-0.1, -0.2],
+                    "response_mask": [1, 0],
+                },
+                device="cpu",
+                max_length=128,
+                loss_granularity="token",
+            )
+        finally:
+            update_gates_module.response_logprob_tensor_details_from_text = original
+
+        self.assertIsNotNone(entry)
+        self.assertAlmostEqual(float(entry["current"].detach().item()), -0.2, places=6)
+        self.assertAlmostEqual(float(entry["old"].detach().item()), -0.1, places=6)
+        self.assertEqual(int(entry["current_logprobs"].numel()), 2)
+
+    def test_token_logprob_entry_prefers_stored_response_token_ids(self):
+        original_ids = update_gates_module.response_logprob_tensor_details_from_token_ids
+        original_text = update_gates_module.response_logprob_tensor_details_from_text
+        calls = []
+
+        def fake_details_from_ids(torch_module, model, tokenizer, *, prompt_text, response_token_ids, device, max_length):
+            calls.append(("ids", list(response_token_ids)))
+            return {
+                "response_token_ids": list(response_token_ids),
+                "logprobs": torch.tensor([-0.2, -0.3], requires_grad=True),
+                "response_mask": [1, 1],
+            }
+
+        def fake_details_from_text(*args, **kwargs):
+            calls.append(("text", None))
+            raise AssertionError("text tokenizer path should not be used")
+
+        update_gates_module.response_logprob_tensor_details_from_token_ids = fake_details_from_ids
+        update_gates_module.response_logprob_tensor_details_from_text = fake_details_from_text
+        try:
+            entry = update_gates_module._sample_response_logprob_entry(
+                torch,
+                None,
+                None,
+                prompt_text="prompt",
+                sample={
+                    "sample_id": "s0",
+                    "text": "answer",
+                    "response_token_ids": [7, 8],
+                    "old_logprobs": [-0.1, -0.2],
+                    "response_mask": [1, 1],
+                },
+                device="cpu",
+                max_length=128,
+                loss_granularity="token",
+            )
+        finally:
+            update_gates_module.response_logprob_tensor_details_from_token_ids = original_ids
+            update_gates_module.response_logprob_tensor_details_from_text = original_text
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(calls, [("ids", [7, 8])])
+
+    def test_token_policy_metrics_respect_mask(self):
+        metrics = update_gates_module._entry_policy_metrics(
+            torch,
+            {
+                "current_logprobs": torch.tensor([-0.2, -10.0]),
+                "old_logprobs": torch.tensor([-0.1, -0.1]),
+                "response_mask": torch.tensor([1, 0]),
+            },
+            {},
+            length_normalize=False,
+            loss_granularity="token",
+            eps_clip=0.05,
+        )
+
+        self.assertEqual(metrics["clip_frac"], 1.0)
+        self.assertAlmostEqual(metrics["approx_kl"], 0.1, places=6)
+
+    def test_fill_missing_old_logprobs_adds_token_payload_for_trajectory(self):
+        original = update_gates_module.response_logprob_tensor_details_from_text
+
+        class Model:
+            def eval(self):
+                pass
+
+            def train(self):
+                pass
+
+        def fake_details(torch_module, model, tokenizer, *, prompt_text, response_text, device, max_length):
+            length = len(response_text)
+            return {
+                "response_token_ids": list(range(length)),
+                "logprobs": torch.full((length,), -1.0),
+                "response_mask": [1 for _ in range(length)],
+            }
+
+        rows = [
+            {
+                "rendered_prompt": "unused",
+                "samples": [
+                    {
+                        "sample_id": "memory__k0",
+                        "text": "final",
+                        "trajectory": [
+                            {"prompt_text": "p0", "text": "a"},
+                            {"prompt_text": "p1", "text": "bc"},
+                        ],
+                    }
+                ],
+            }
+        ]
+        update_gates_module.response_logprob_tensor_details_from_text = fake_details
+        try:
+            filled = update_gates_module._fill_missing_old_logprobs(
+                torch,
+                Model(),
+                None,
+                rows,
+                device="cpu",
+                max_logprob_tokens=128,
+                fill_token_logprobs=True,
+            )
+        finally:
+            update_gates_module.response_logprob_tensor_details_from_text = original
+
+        sample = rows[0]["samples"][0]
+        self.assertEqual(filled, 1)
+        self.assertAlmostEqual(sample["old_logprob"], -3.0, places=6)
+        self.assertEqual(sample["old_logprobs"], [-1.0, -1.0, -1.0])
+        self.assertEqual(sample["response_mask"], [1, 1, 1])
+        self.assertAlmostEqual(sample["trajectory"][0]["old_logprob"], -1.0, places=6)
+        self.assertAlmostEqual(sample["trajectory"][1]["old_logprob"], -2.0, places=6)
 
     def test_bounded_pairwise_samples_prefers_high_positive_low_negative(self):
         positives = [

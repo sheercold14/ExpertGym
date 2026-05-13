@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -21,9 +22,13 @@ from opvec.modeling.bake import load_gate_values
 from opvec.modeling.devices import model_input_device, model_load_device_kwargs
 from opvec.modeling.gate_parameters import make_torch_gate_manager
 from opvec.modeling.manifest import manifest_param_names
-from opvec.modeling.logprob import response_logprob_tensor_from_text
+from opvec.modeling.logprob import (
+    response_logprob_tensor_details_from_text,
+    response_logprob_tensor_details_from_token_ids,
+    response_logprob_tensor_from_text,
+)
 from opvec.train.frontier import group_relative_advantages, policy_frontier_weight, should_keep_frontier
-from opvec.train.gated_grpo import gate_initialization_prior
+from opvec.train.gated_grpo import clipped_grpo_token_loss, gate_initialization_prior, reverse_kl_token_penalty
 
 
 def main() -> None:
@@ -78,6 +83,11 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             else config.get("calibration", {}).get("max_frontier_rows_per_task")
         ),
     )
+    rows = _order_frontier_rows(
+        rows,
+        order=str(args.frontier_order),
+        seed=_frontier_shuffle_seed(args),
+    )
     frontier_task_counts = _task_counts(rows)
     if args.max_retention_rows is not None:
         retention_rows = retention_rows[: args.max_retention_rows]
@@ -131,6 +141,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             rows,
             device=device,
             max_logprob_tokens=args.max_logprob_tokens,
+            fill_token_logprobs=args.loss_granularity == "token",
         )
         if args.use_retention and retention_rows:
             filled_old_logprobs += _fill_missing_old_logprobs(
@@ -140,6 +151,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                 retention_rows,
                 device=device,
                 max_logprob_tokens=args.max_logprob_tokens,
+                fill_token_logprobs=args.loss_granularity == "token",
             )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -162,6 +174,18 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         enabled=bool(args.task_normalize_advantages),
     )
     coefficient_anchor_gates = dict(config.get("initial_gates", {}))
+    update_batcher = _UpdateBatcher(
+        torch=torch,
+        optimizer=optimizer,
+        gate_manager=gate_manager,
+        grad_clip_norm=float(config["optimizer"]["grad_clip_norm"]),
+        min_grad_norm_for_step=float(args.min_grad_norm_for_step),
+        update_batch_size=int(args.update_batch_size),
+        batch_loss_reduction=str(args.batch_loss_reduction),
+        train_coefficients=train_coefficients,
+        coefficient_anchor_gates=coefficient_anchor_gates,
+        args=args,
+    )
     log_rows = []
     epoch_summaries = []
     early_stop_hits = 0
@@ -170,7 +194,6 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         epoch_log_start = len(log_rows)
         epoch_start_gates = gate_manager.gate_values()
         for row in rows:
-            optimizer.zero_grad(set_to_none=True)
             prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
             best_response_only = args.ppo_loss_weight == 0.0 and (
                 float(args.best_response_loss_weight) != 0.0 or float(args.pairwise_loss_weight) != 0.0
@@ -210,18 +233,12 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     length_normalize=bool(args.length_normalize_logprob),
                     positive_reward_threshold=args.positive_reward_threshold,
                     max_pairwise_pairs_per_row=args.max_pairwise_pairs_per_row,
+                    loss_scale=update_batcher.loss_scale,
                 )
                 if objective_stats["processed"] < 1:
-                    optimizer.zero_grad(set_to_none=True)
                     continue
                 prior_loss = _gate_prior_loss(torch, gate_manager) * prior_weight
-                prior_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(gate_manager.parameters(), float(config["optimizer"]["grad_clip_norm"]))
-                grad_norm_value = float(grad_norm.detach().cpu().item())
-                skipped_step = grad_norm_value <= float(args.min_grad_norm_for_step)
-                if not skipped_step:
-                    optimizer.step()
-                    _project_after_optimizer_step_(torch, gate_manager, train_coefficients, coefficient_anchor_gates, args)
+                (prior_loss * update_batcher.loss_scale).backward()
                 log_rows.append(
                     {
                         "step": step,
@@ -235,16 +252,20 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "loss": objective_stats["loss"] + float(prior_loss.detach().cpu().item()),
                         "policy_loss": 0.0,
                         "kl_loss": 0.0,
+                        "clip_frac": 0.0,
+                        "approx_kl": 0.0,
                         "best_response_loss": objective_stats["best_response_loss"],
                         "pairwise_loss": objective_stats["pairwise_loss"],
                         "retention_loss": 0.0,
-                        "grad_norm": grad_norm_value,
-                        "skipped_step": skipped_step,
+                        "grad_norm": 0.0,
+                        "skipped_step": False,
                         "mean_reward": sum(rewards) / len(rewards),
                         "frontier_weight": frontier_weight,
-                        "gates": gate_manager.gate_values(),
+                        "loss_granularity": str(args.loss_granularity),
+                        "gates": {},
                     }
                 )
+                update_batcher.add(log_rows, len(log_rows) - 1)
                 continue
             advantage_values, advantage_source = _row_advantage_values(
                 valid_samples,
@@ -272,18 +293,13 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     beta_kl=float(config["loss"]["beta_kl"]),
                     eps_clip=float(config["loss"]["eps_clip"]),
                     length_normalize_policy_logprob=bool(args.length_normalize_policy_logprob),
+                    loss_granularity=str(args.loss_granularity),
+                    loss_scale=update_batcher.loss_scale,
                 )
                 if objective_stats["processed"] < 2:
-                    optimizer.zero_grad(set_to_none=True)
                     continue
                 prior_loss = _gate_prior_loss(torch, gate_manager) * prior_weight
-                prior_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(gate_manager.parameters(), float(config["optimizer"]["grad_clip_norm"]))
-                grad_norm_value = float(grad_norm.detach().cpu().item())
-                skipped_step = grad_norm_value <= float(args.min_grad_norm_for_step)
-                if not skipped_step:
-                    optimizer.step()
-                    _project_after_optimizer_step_(torch, gate_manager, train_coefficients, coefficient_anchor_gates, args)
+                (prior_loss * update_batcher.loss_scale).backward()
                 loss_total = objective_stats["loss"] + float(prior_loss.detach().cpu().item())
                 log_rows.append(
                     {
@@ -298,25 +314,31 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "loss": loss_total,
                         "policy_loss": objective_stats["policy_loss"],
                         "kl_loss": objective_stats["kl_loss"],
+                        "clip_frac": objective_stats["clip_frac"],
+                        "approx_kl": objective_stats["approx_kl"],
                         "best_response_loss": 0.0,
                         "pairwise_loss": 0.0,
                         "retention_loss": 0.0,
-                        "grad_norm": grad_norm_value,
-                        "skipped_step": skipped_step,
+                        "grad_norm": 0.0,
+                        "skipped_step": False,
                         "mean_reward": sum(rewards) / len(rewards),
                         "frontier_weight": frontier_weight,
                         "advantage_source": advantage_source,
                         "advantage_task_scale": advantage_task_scale,
                         "mean_abs_advantage": _mean_abs([float(value) for value in advantages.detach().cpu().tolist()]),
-                        "gates": gate_manager.gate_values(),
+                        "loss_granularity": str(args.loss_granularity),
+                        "gates": {},
                     }
                 )
+                update_batcher.add(log_rows, len(log_rows) - 1)
                 continue
             policy_loss_total = 0.0
             kl_loss_total = 0.0
+            clip_frac_total = 0.0
+            approx_kl_total = 0.0
             logp_entries = []
             for sample_idx, sample in enumerate(valid_samples):
-                logp = _sample_response_logprob_tensor(
+                entry = _sample_response_logprob_entry(
                     torch,
                     model,
                     tokenizer,
@@ -324,41 +346,68 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     sample=sample,
                     device=device,
                     max_length=args.max_logprob_tokens,
+                    loss_granularity=str(args.loss_granularity),
                 )
-                if logp is None:
+                if entry is None:
                     continue
-                old_logp = torch.tensor(float(sample["old_logprob"]), dtype=torch.float32, device=device)
-                current = logp.float()
-                logp_entries.append(
+                entry.update(
                     {
                         "sample_idx": sample_idx,
                         "sample": sample,
-                        "current": current,
-                        "old": old_logp,
                         "reward": float(sample.get("reward", 0.0)),
                         "length": int(sample.get("length", 0) or 0),
                     }
                 )
+                logp_entries.append(entry)
             if len(logp_entries) < 2:
-                optimizer.zero_grad(set_to_none=True)
                 continue
             denominator = float(len(logp_entries))
             loss_tensor = logp_entries[0]["current"].new_tensor(0.0)
             for entry in logp_entries:
                 sample_idx = int(entry["sample_idx"])
                 advantage = advantages[sample_idx]
-                current = _entry_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
-                old_logp = _entry_old_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
                 if args.ppo_loss_weight != 0.0:
-                    ratio = torch.exp((current - old_logp).clamp(-20.0, 20.0))
-                    clipped = torch.clamp(ratio, 1.0 - float(config["loss"]["eps_clip"]), 1.0 + float(config["loss"]["eps_clip"]))
-                    policy_loss = -torch.minimum(ratio * advantage, clipped * advantage) / denominator
+                    if args.loss_granularity == "token":
+                        policy_loss = clipped_grpo_token_loss(
+                            torch,
+                            current_logprobs=entry["current_logprobs"],
+                            old_logprobs=entry["old_logprobs"],
+                            response_mask=entry["response_mask"],
+                            advantage=advantage,
+                            clip_epsilon=float(config["loss"]["eps_clip"]),
+                        ) / denominator
+                    else:
+                        current = _entry_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+                        old_logp = _entry_old_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+                        ratio = torch.exp((current - old_logp).clamp(-20.0, 20.0))
+                        clipped = torch.clamp(ratio, 1.0 - float(config["loss"]["eps_clip"]), 1.0 + float(config["loss"]["eps_clip"]))
+                        policy_loss = -torch.minimum(ratio * advantage, clipped * advantage) / denominator
                     loss_tensor = loss_tensor + task_weight * float(args.ppo_loss_weight) * policy_loss
                     policy_loss_total += task_weight * float(args.ppo_loss_weight) * float(policy_loss.detach().cpu().item())
-                log_ratio = (old_logp - current).clamp(-20.0, 20.0)
-                kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
+                if args.loss_granularity == "token":
+                    kl_loss = reverse_kl_token_penalty(
+                        torch,
+                        current_logprobs=entry["current_logprobs"],
+                        old_logprobs=entry["old_logprobs"],
+                        response_mask=entry["response_mask"],
+                    ) / denominator
+                else:
+                    current = _entry_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+                    old_logp = _entry_old_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+                    log_ratio = (old_logp - current).clamp(-20.0, 20.0)
+                    kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
                 loss_tensor = loss_tensor + task_weight * float(config["loss"]["beta_kl"]) * kl_loss
                 kl_loss_total += task_weight * float(kl_loss.detach().cpu().item())
+                metrics = _entry_policy_metrics(
+                    torch,
+                    entry,
+                    entry["sample"],
+                    length_normalize=bool(args.length_normalize_policy_logprob),
+                    loss_granularity=str(args.loss_granularity),
+                    eps_clip=float(config["loss"]["eps_clip"]),
+                )
+                clip_frac_total += metrics["clip_frac"] / denominator
+                approx_kl_total += metrics["approx_kl"] / denominator
             best_response_loss = _best_response_loss(
                 torch,
                 logp_entries,
@@ -376,14 +425,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             loss_tensor = loss_tensor + task_weight * float(args.pairwise_loss_weight) * pairwise_loss
             prior_loss = _gate_prior_loss(torch, gate_manager) * prior_weight
             loss_tensor = loss_tensor + prior_loss
-            loss_tensor.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(gate_manager.parameters(), float(config["optimizer"]["grad_clip_norm"]))
-            grad_norm_value = float(grad_norm.detach().cpu().item())
-            skipped_step = grad_norm_value <= float(args.min_grad_norm_for_step)
-            if not skipped_step:
-                optimizer.step()
-                _project_after_optimizer_step_(torch, gate_manager, train_coefficients, coefficient_anchor_gates, args)
             loss_total = float(loss_tensor.detach().cpu().item())
+            (loss_tensor * update_batcher.loss_scale).backward()
             log_rows.append(
                 {
                     "step": step,
@@ -397,22 +440,26 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     "loss": loss_total,
                     "policy_loss": policy_loss_total,
                     "kl_loss": kl_loss_total,
+                    "clip_frac": clip_frac_total,
+                    "approx_kl": approx_kl_total,
                     "best_response_loss": task_weight * float(args.best_response_loss_weight) * float(best_response_loss.detach().cpu().item()),
                     "pairwise_loss": task_weight * float(args.pairwise_loss_weight) * float(pairwise_loss.detach().cpu().item()),
                     "retention_loss": 0.0,
-                    "grad_norm": grad_norm_value,
-                    "skipped_step": skipped_step,
+                    "grad_norm": 0.0,
+                    "skipped_step": False,
                     "mean_reward": sum(rewards) / len(rewards),
                     "frontier_weight": frontier_weight,
                     "advantage_source": advantage_source,
                     "advantage_task_scale": advantage_task_scale,
                     "mean_abs_advantage": _mean_abs([float(value) for value in advantages.detach().cpu().tolist()]),
-                    "gates": gate_manager.gate_values(),
+                    "loss_granularity": str(args.loss_granularity),
+                    "gates": {},
                 }
             )
+            update_batcher.add(log_rows, len(log_rows) - 1)
+        update_batcher.flush(log_rows)
         if args.use_retention and retention_weight > 0.0:
             for row in retention_rows:
-                optimizer.zero_grad(set_to_none=True)
                 prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
                 valid_samples = _objective_samples(row["samples"], require_old_logprob=True)
                 if not valid_samples:
@@ -443,18 +490,11 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     log_ratio = (old_logp - current).clamp(-20.0, 20.0)
                     kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
                     sample_loss = task_weight * retention_weight * kl_loss
-                    sample_loss.backward()
+                    (sample_loss * update_batcher.loss_scale).backward()
                     retention_loss_total += float(sample_loss.detach().cpu().item())
                     processed += 1
                 if processed < 1:
-                    optimizer.zero_grad(set_to_none=True)
                     continue
-                grad_norm = torch.nn.utils.clip_grad_norm_(gate_manager.parameters(), float(config["optimizer"]["grad_clip_norm"]))
-                grad_norm_value = float(grad_norm.detach().cpu().item())
-                skipped_step = grad_norm_value <= float(args.min_grad_norm_for_step)
-                if not skipped_step:
-                    optimizer.step()
-                    _project_after_optimizer_step_(torch, gate_manager, train_coefficients, coefficient_anchor_gates, args)
                 log_rows.append(
                     {
                         "step": step,
@@ -468,14 +508,18 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "loss": retention_loss_total,
                         "policy_loss": 0.0,
                         "kl_loss": retention_loss_total / retention_weight if retention_weight else 0.0,
+                        "clip_frac": 0.0,
+                        "approx_kl": 0.0,
                         "retention_loss": retention_loss_total,
-                        "grad_norm": grad_norm_value,
-                        "skipped_step": skipped_step,
+                        "grad_norm": 0.0,
+                        "skipped_step": False,
                         "mean_reward": sum(rewards) / len(rewards),
                         "frontier_weight": 0.0,
-                        "gates": gate_manager.gate_values(),
+                        "gates": {},
                     }
                 )
+                update_batcher.add(log_rows, len(log_rows) - 1)
+            update_batcher.flush(log_rows)
         epoch_rows = log_rows[epoch_log_start:]
         epoch_end_gates = gate_manager.gate_values()
         epoch_grad_max = max((float(item.get("grad_norm", 0.0)) for item in epoch_rows), default=0.0)
@@ -488,6 +532,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "updates": len(epoch_rows),
             "grad_norm_max": epoch_grad_max,
             "gate_delta_max": epoch_gate_delta_max,
+            "clip_frac_mean": _mean([float(item.get("clip_frac", 0.0)) for item in epoch_rows]),
+            "approx_kl_mean": _mean([float(item.get("approx_kl", 0.0)) for item in epoch_rows]),
             "gates": epoch_end_gates,
         }
         epoch_summaries.append(epoch_summary)
@@ -513,8 +559,14 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         "kept_frontier_rows": len(rows),
         "raw_frontier_task_counts": raw_frontier_task_counts,
         "frontier_task_counts": frontier_task_counts,
+        "frontier_order": {
+            "order": str(args.frontier_order),
+            "seed": _frontier_shuffle_seed(args),
+        },
         "retention_rows": len(retention_rows),
         "updates": len(log_rows),
+        "optimizer_steps": update_batcher.optimizer_steps,
+        "skipped_optimizer_steps": update_batcher.skipped_optimizer_steps,
         "installed_modules": installed,
         "gate_parameterization": gate_parameterization,
         "device_map": args.device_map,
@@ -530,6 +582,9 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "weight_decay": weight_decay,
             "prior_loss_weight": prior_weight,
             "min_grad_norm_for_step": float(args.min_grad_norm_for_step),
+            "update_batch_size": int(args.update_batch_size),
+            "batch_loss_reduction": str(args.batch_loss_reduction),
+            "loss_granularity": str(args.loss_granularity),
             "max_coefficient_delta_from_init": args.max_coefficient_delta_from_init,
             "early_stop_grad_norm": args.early_stop_grad_norm,
             "early_stop_gate_delta": args.early_stop_gate_delta,
@@ -607,6 +662,7 @@ def _fill_missing_old_logprobs(
     *,
     device,
     max_logprob_tokens: int,
+    fill_token_logprobs: bool = False,
 ) -> int:
     filled = 0
     model.eval()
@@ -614,9 +670,28 @@ def _fill_missing_old_logprobs(
         for row in rows:
             prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
             for sample in row.get("samples", []):
-                if sample.get("old_logprob") is not None:
+                needs_sequence_logprob = sample.get("old_logprob") is None
+                needs_token_logprobs = bool(fill_token_logprobs) and not _sample_has_token_logprobs(sample)
+                if not needs_sequence_logprob and not needs_token_logprobs:
                     continue
                 if not sample.get("text"):
+                    continue
+                if fill_token_logprobs:
+                    payload = _sample_response_token_logprob_payload(
+                        torch,
+                        model,
+                        tokenizer,
+                        prompt_text=prompt_text,
+                        sample=sample,
+                        device=device,
+                        max_length=max_logprob_tokens,
+                    )
+                    if payload is None:
+                        continue
+                    sample.update(payload)
+                    sample["old_logprob"] = float(payload["old_logprob"])
+                    sample["old_logprob_max_length"] = int(max_logprob_tokens)
+                    filled += 1
                     continue
                 logp = _sample_response_logprob_tensor(
                     torch,
@@ -634,6 +709,14 @@ def _fill_missing_old_logprobs(
                 filled += 1
     model.train()
     return filled
+
+
+def _sample_has_token_logprobs(sample: dict) -> bool:
+    return (
+        isinstance(sample.get("response_token_ids"), list)
+        and isinstance(sample.get("old_logprobs"), list)
+        and isinstance(sample.get("response_mask"), list)
+    )
 
 
 def _sample_response_logprob_tensor(torch, model, tokenizer, *, prompt_text: str, sample: dict, device, max_length: int):
@@ -671,6 +754,199 @@ def _sample_response_logprob_tensor(torch, model, tokenizer, *, prompt_text: str
     return total
 
 
+def _sample_response_logprob_entry(
+    torch,
+    model,
+    tokenizer,
+    *,
+    prompt_text: str,
+    sample: dict,
+    device,
+    max_length: int,
+    loss_granularity: str,
+) -> dict | None:
+    if loss_granularity != "token":
+        logp = _sample_response_logprob_tensor(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            sample=sample,
+            device=device,
+            max_length=max_length,
+        )
+        if logp is None:
+            return None
+        old_logp = torch.tensor(float(sample["old_logprob"]), dtype=torch.float32, device=device)
+        return {"current": logp.float(), "old": old_logp}
+    token_details = _sample_response_token_logprob_details(
+        torch,
+        model,
+        tokenizer,
+        prompt_text=prompt_text,
+        sample=sample,
+        device=device,
+        max_length=max_length,
+    )
+    if token_details is None:
+        return None
+    old_logprobs = sample.get("old_logprobs")
+    response_mask = sample.get("response_mask")
+    if not isinstance(old_logprobs, list) or not isinstance(response_mask, list):
+        return None
+    current_logprobs = token_details["logprobs"].float()
+    if len(old_logprobs) != int(current_logprobs.numel()) or len(response_mask) != int(current_logprobs.numel()):
+        raise ValueError(
+            "token-level logprob length mismatch: "
+            f"sample={sample.get('sample_id')} current={int(current_logprobs.numel())} "
+            f"old={len(old_logprobs)} mask={len(response_mask)}"
+        )
+    old_tensor = torch.tensor([float(value) for value in old_logprobs], dtype=torch.float32, device=current_logprobs.device)
+    mask_tensor = torch.tensor([float(value) for value in response_mask], dtype=torch.float32, device=current_logprobs.device)
+    current_sum = (current_logprobs * mask_tensor).sum()
+    old_sum = (old_tensor * mask_tensor).sum()
+    return {
+        "current": current_sum,
+        "old": old_sum,
+        "current_logprobs": current_logprobs,
+        "old_logprobs": old_tensor,
+        "response_mask": mask_tensor,
+    }
+
+
+def _sample_response_token_logprob_details(torch, model, tokenizer, *, prompt_text: str, sample: dict, device, max_length: int):
+    trajectory = sample.get("trajectory")
+    if not isinstance(trajectory, list) or not trajectory:
+        response_token_ids = sample.get("response_token_ids")
+        if isinstance(response_token_ids, list) and response_token_ids:
+            return response_logprob_tensor_details_from_token_ids(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=prompt_text,
+                response_token_ids=[int(value) for value in response_token_ids],
+                device=device,
+                max_length=max_length,
+            )
+        return response_logprob_tensor_details_from_text(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            response_text=str(sample["text"]),
+            device=device,
+            max_length=max_length,
+        )
+    logprob_tensors = []
+    token_ids = []
+    response_mask = []
+    for turn in trajectory:
+        if not isinstance(turn, dict):
+            continue
+        turn_prompt = str(turn.get("prompt_text") or "")
+        turn_text = str(turn.get("text") or "")
+        if not turn_prompt or not turn_text:
+            continue
+        turn_token_ids = turn.get("response_token_ids")
+        if isinstance(turn_token_ids, list) and turn_token_ids:
+            details = response_logprob_tensor_details_from_token_ids(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=turn_prompt,
+                response_token_ids=[int(value) for value in turn_token_ids],
+                device=device,
+                max_length=max_length,
+            )
+        else:
+            details = response_logprob_tensor_details_from_text(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=turn_prompt,
+                response_text=turn_text,
+                device=device,
+                max_length=max_length,
+            )
+        if details is None:
+            continue
+        logprob_tensors.append(details["logprobs"].float())
+        token_ids.extend(details["response_token_ids"])
+        response_mask.extend(details["response_mask"])
+    if not logprob_tensors:
+        return None
+    return {
+        "response_token_ids": token_ids,
+        "logprobs": torch.cat(logprob_tensors),
+        "response_mask": response_mask,
+    }
+
+
+def _sample_response_token_logprob_payload(torch, model, tokenizer, *, prompt_text: str, sample: dict, device, max_length: int) -> dict | None:
+    trajectory = sample.get("trajectory")
+    if not isinstance(trajectory, list) or not trajectory:
+        details = response_logprob_tensor_details_from_text(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            response_text=str(sample["text"]),
+            device=device,
+            max_length=max_length,
+        )
+        return _token_logprob_payload_from_details(details)
+    token_ids = []
+    old_logprobs = []
+    response_mask = []
+    total_logprob = 0.0
+    for turn in trajectory:
+        if not isinstance(turn, dict):
+            continue
+        turn_prompt = str(turn.get("prompt_text") or "")
+        turn_text = str(turn.get("text") or "")
+        if not turn_prompt or not turn_text:
+            continue
+        details = response_logprob_tensor_details_from_text(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=turn_prompt,
+            response_text=turn_text,
+            device=device,
+            max_length=max_length,
+        )
+        turn_payload = _token_logprob_payload_from_details(details)
+        if turn_payload is None:
+            return None
+        turn.update(turn_payload)
+        turn["old_logprob"] = float(turn_payload["old_logprob"])
+        turn["old_logprob_max_length"] = int(max_length)
+        token_ids.extend(turn_payload["response_token_ids"])
+        old_logprobs.extend(turn_payload["old_logprobs"])
+        response_mask.extend(turn_payload["response_mask"])
+        total_logprob += float(turn_payload["old_logprob"])
+    if not token_ids:
+        return None
+    return {
+        "response_token_ids": token_ids,
+        "old_logprobs": old_logprobs,
+        "response_mask": response_mask,
+        "old_logprob": total_logprob,
+    }
+
+
+def _token_logprob_payload_from_details(details: dict | None) -> dict | None:
+    if details is None:
+        return None
+    logprobs = [float(value) for value in details["logprobs"].detach().float().cpu().tolist()]
+    return {
+        "response_token_ids": [int(value) for value in details["response_token_ids"]],
+        "old_logprobs": logprobs,
+        "response_mask": [int(value) for value in details["response_mask"]],
+        "old_logprob": float(sum(logprobs)),
+    }
+
+
 def _normalize_gate_parameterization(value: str) -> str:
     aliases = {
         "layer_band": "layer-band",
@@ -694,6 +970,84 @@ def _gate_prior_loss(torch, gate_manager):
     return gate_initialization_prior(torch, gate_manager)
 
 
+class _UpdateBatcher:
+    """Accumulate row-level losses and apply one optimizer step per mini-batch."""
+
+    def __init__(
+        self,
+        *,
+        torch,
+        optimizer,
+        gate_manager,
+        grad_clip_norm: float,
+        min_grad_norm_for_step: float,
+        update_batch_size: int,
+        batch_loss_reduction: str,
+        train_coefficients: set[str],
+        coefficient_anchor_gates: dict[str, float],
+        args: argparse.Namespace,
+    ) -> None:
+        self.torch = torch
+        self.optimizer = optimizer
+        self.gate_manager = gate_manager
+        self.grad_clip_norm = float(grad_clip_norm)
+        self.min_grad_norm_for_step = float(min_grad_norm_for_step)
+        self.update_batch_size = max(1, int(update_batch_size))
+        self.batch_loss_reduction = str(batch_loss_reduction)
+        self.train_coefficients = train_coefficients
+        self.coefficient_anchor_gates = coefficient_anchor_gates
+        self.args = args
+        self.pending_log_indices: list[int] = []
+        self.optimizer_steps = 0
+        self.skipped_optimizer_steps = 0
+        self.optimizer.zero_grad(set_to_none=True)
+
+    @property
+    def loss_scale(self) -> float:
+        if self.batch_loss_reduction == "sum":
+            return 1.0
+        return 1.0 / float(self.update_batch_size)
+
+    @property
+    def pending(self) -> int:
+        return len(self.pending_log_indices)
+
+    def add(self, log_rows: list[dict], log_index: int) -> None:
+        self.pending_log_indices.append(int(log_index))
+        if self.pending >= self.update_batch_size:
+            self.flush(log_rows)
+
+    def flush(self, log_rows: list[dict]) -> None:
+        if not self.pending_log_indices:
+            return
+        grad_norm = self.torch.nn.utils.clip_grad_norm_(self.gate_manager.parameters(), self.grad_clip_norm)
+        grad_norm_value = float(grad_norm.detach().cpu().item())
+        skipped_step = grad_norm_value <= self.min_grad_norm_for_step
+        if not skipped_step:
+            self.optimizer.step()
+            _project_after_optimizer_step_(
+                self.torch,
+                self.gate_manager,
+                self.train_coefficients,
+                self.coefficient_anchor_gates,
+                self.args,
+            )
+            self.optimizer_steps += 1
+        else:
+            self.skipped_optimizer_steps += 1
+        gates = self.gate_manager.gate_values()
+        for index in self.pending_log_indices:
+            log_rows[index]["grad_norm"] = grad_norm_value
+            log_rows[index]["skipped_step"] = skipped_step
+            log_rows[index]["gates"] = gates
+            log_rows[index]["optimizer_step_index"] = self.optimizer_steps
+            log_rows[index]["update_batch_size"] = self.update_batch_size
+            log_rows[index]["batch_loss_reduction"] = self.batch_loss_reduction
+            log_rows[index]["batch_loss_scale"] = self.loss_scale
+        self.pending_log_indices.clear()
+        self.optimizer.zero_grad(set_to_none=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/gated_grpo.yaml")
@@ -709,6 +1063,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--max-gated-modules", type=int, default=None, help="Maximum gated Linear modules to install. Default None means all mergeable modules; use 1 only for smoke tests.")
     parser.add_argument("--max-steps", type=int, default=1)
+    parser.add_argument(
+        "--update-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of kept frontier/retention rows to accumulate before one optimizer.step(). "
+            "Default 1 preserves the legacy row-by-row native updater."
+        ),
+    )
+    parser.add_argument(
+        "--batch-loss-reduction",
+        choices=["mean", "sum"],
+        default="mean",
+        help="Scale accumulated row losses by 1/update_batch_size for mean, or leave them unscaled for sum.",
+    )
+    parser.add_argument(
+        "--loss-granularity",
+        choices=["sequence", "token"],
+        default="sequence",
+        help=(
+            "Use legacy sequence-sum PPO/GRPO or token-level PPO/GRPO. "
+            "token requires samples to contain old_logprobs and response_mask."
+        ),
+    )
     parser.add_argument("--max-logprob-tokens", type=int, default=3072)
     parser.add_argument(
         "--fill-missing-old-logprob",
@@ -735,6 +1113,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-weight", action="append", default=[], help="Per-task loss weight, e.g. memory=2.0. Repeatable.")
     parser.add_argument("--frontier-task-quota", action="append", default=[], help="Max kept frontier rows per task, e.g. memory=64. Repeatable.")
     parser.add_argument("--max-frontier-rows-per-task", type=int, default=None, help="Shared cap for kept frontier rows per task.")
+    parser.add_argument(
+        "--frontier-order",
+        choices=["as-is", "shuffle", "task-interleaved"],
+        default="as-is",
+        help=(
+            "Order kept frontier rows before update. as-is preserves rollout order; "
+            "shuffle randomly shuffles all rows; task-interleaved shuffles within each task "
+            "then round-robins tasks to reduce same-task optimizer batches."
+        ),
+    )
+    parser.add_argument(
+        "--frontier-shuffle-seed",
+        type=int,
+        default=None,
+        help="Seed for --frontier-order shuffle modes. Default 0 for standalone updater calls.",
+    )
     parser.add_argument("--category-weight", action="append", default=[], help="Per-category loss weight, e.g. tool:live_parallel=2.0. Repeatable.")
     parser.add_argument("--source-weight", action="append", default=[], help="Per-row-source loss weight, e.g. bfcl_success_anchor_frontier=0.2. Repeatable.")
     parser.add_argument(
@@ -806,6 +1200,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.rollouts and not args.replay_buffer and not args.retention_only_replay_buffer:
         parser.error("at least one --rollouts, --replay-buffer, or --retention-only-replay-buffer input is required")
+    if int(args.update_batch_size) < 1:
+        parser.error("--update-batch-size must be >= 1")
     return args
 
 
@@ -874,6 +1270,38 @@ def _limit_frontier_rows(
         else:
             selected_by_task[task] = {id(row) for row in task_rows[: int(limit)]}
     return [row for row in rows if id(row) in selected_by_task.get(str(row.get("task")), set())]
+
+
+def _frontier_shuffle_seed(args: argparse.Namespace) -> int:
+    value = getattr(args, "frontier_shuffle_seed", None)
+    return 0 if value is None else int(value)
+
+
+def _order_frontier_rows(rows: list[dict], *, order: str, seed: int) -> list[dict]:
+    if order == "as-is":
+        return rows
+    ordered = list(rows)
+    rng = random.Random(int(seed))
+    if order == "shuffle":
+        rng.shuffle(ordered)
+        return ordered
+    if order != "task-interleaved":
+        raise ValueError(f"Unknown frontier order: {order}")
+
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in ordered:
+        grouped[str(row.get("task"))].append(row)
+    for task_rows in grouped.values():
+        rng.shuffle(task_rows)
+    preferred = ["tool", "memory", "code"]
+    task_order = [task for task in preferred if task in grouped]
+    task_order.extend(sorted(task for task in grouped if task not in set(task_order)))
+    interleaved = []
+    while any(grouped[task] for task in task_order):
+        for task in task_order:
+            if grouped[task]:
+                interleaved.append(grouped[task].pop(0))
+    return interleaved
 
 
 def _row_advantage_values(
@@ -956,6 +1384,11 @@ def _mean_abs(values) -> float:
     return float(sum(items) / len(items)) if items else 0.0
 
 
+def _mean(values) -> float:
+    items = [float(value) for value in values]
+    return float(sum(items) / len(items)) if items else 0.0
+
+
 def _parse_train_coefficients(items: list[str]) -> set[str]:
     coefficients: set[str] = set()
     valid_experts = {"tool", "memory", "code", "*"}
@@ -1004,6 +1437,7 @@ def _backward_incremental_best_response_losses(
     length_normalize: bool,
     positive_reward_threshold: float | None,
     max_pairwise_pairs_per_row: int = 0,
+    loss_scale: float = 1.0,
 ) -> dict[str, float]:
     positives, negatives = _positive_and_negative_samples(valid_samples, positive_reward_threshold)
     if not positives:
@@ -1027,7 +1461,7 @@ def _backward_incremental_best_response_losses(
             if logp is None:
                 continue
             loss = task_weight * best_response_loss_weight * (-_sample_score(logp.float(), sample, length_normalize=length_normalize)) / denominator
-            loss.backward()
+            (loss * float(loss_scale)).backward()
             value = float(loss.detach().cpu().item())
             total_loss += value
             best_response_total += value
@@ -1064,7 +1498,7 @@ def _backward_incremental_best_response_losses(
             negative_score = _sample_score(negative_logp.float(), negative, length_normalize=length_normalize)
             pair_loss = torch.nn.functional.softplus(negative_score - positive_score + float(pairwise_margin))
             loss = task_weight * pairwise_loss_weight * pair_loss / denominator
-            loss.backward()
+            (loss * float(loss_scale)).backward()
             value = float(loss.detach().cpu().item())
             total_loss += value
             pairwise_total += value
@@ -1092,14 +1526,13 @@ def _backward_incremental_grpo_losses(
     beta_kl: float,
     eps_clip: float,
     length_normalize_policy_logprob: bool,
+    loss_granularity: str = "sequence",
+    loss_scale: float = 1.0,
 ) -> dict[str, float]:
     denominator = float(len(valid_samples))
-    processed = 0
-    loss_total = 0.0
-    policy_loss_total = 0.0
-    kl_loss_total = 0.0
+    entries = []
     for sample_idx, sample in enumerate(valid_samples):
-        logp = _sample_response_logprob_tensor(
+        entry = _sample_response_logprob_entry(
             torch,
             model,
             tokenizer,
@@ -1107,35 +1540,82 @@ def _backward_incremental_grpo_losses(
             sample=sample,
             device=device,
             max_length=max_logprob_tokens,
+            loss_granularity=loss_granularity,
         )
-        if logp is None:
+        if entry is None:
             continue
-        current_raw = logp.float()
-        old_logp_raw = torch.tensor(float(sample["old_logprob"]), dtype=torch.float32, device=current_raw.device)
-        current = _sample_score(current_raw, sample, length_normalize=length_normalize_policy_logprob)
-        old_logp = _sample_score(old_logp_raw, sample, length_normalize=length_normalize_policy_logprob)
-        sample_loss = current_raw.new_tensor(0.0)
+        entries.append((sample_idx, sample, entry))
+    if len(entries) < 2:
+        return {
+            "processed": float(len(entries)),
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "kl_loss": 0.0,
+            "clip_frac": 0.0,
+            "approx_kl": 0.0,
+        }
+
+    loss_total = 0.0
+    policy_loss_total = 0.0
+    kl_loss_total = 0.0
+    clip_frac_total = 0.0
+    approx_kl_total = 0.0
+    for sample_idx, sample, entry in entries:
+        sample_loss = entry["current"].new_tensor(0.0)
         if ppo_loss_weight != 0.0:
-            advantage = advantages[sample_idx].to(current.device)
-            ratio = torch.exp((current - old_logp).clamp(-20.0, 20.0))
-            clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
-            policy_loss = -torch.minimum(ratio * advantage, clipped * advantage) / denominator
+            advantage = advantages[sample_idx].to(entry["current"].device)
+            if loss_granularity == "token":
+                policy_loss = clipped_grpo_token_loss(
+                    torch,
+                    current_logprobs=entry["current_logprobs"],
+                    old_logprobs=entry["old_logprobs"],
+                    response_mask=entry["response_mask"],
+                    advantage=advantage,
+                    clip_epsilon=eps_clip,
+                ) / denominator
+            else:
+                current = _sample_score(entry["current"], sample, length_normalize=length_normalize_policy_logprob)
+                old_logp = _sample_score(entry["old"], sample, length_normalize=length_normalize_policy_logprob)
+                ratio = torch.exp((current - old_logp).clamp(-20.0, 20.0))
+                clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip)
+                policy_loss = -torch.minimum(ratio * advantage, clipped * advantage) / denominator
             weighted_policy = task_weight * ppo_loss_weight * policy_loss
             sample_loss = sample_loss + weighted_policy
             policy_loss_total += float(weighted_policy.detach().cpu().item())
-        log_ratio = (old_logp - current).clamp(-20.0, 20.0)
-        kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
+        if loss_granularity == "token":
+            kl_loss = reverse_kl_token_penalty(
+                torch,
+                current_logprobs=entry["current_logprobs"],
+                old_logprobs=entry["old_logprobs"],
+                response_mask=entry["response_mask"],
+            ) / denominator
+        else:
+            current = _sample_score(entry["current"], sample, length_normalize=length_normalize_policy_logprob)
+            old_logp = _sample_score(entry["old"], sample, length_normalize=length_normalize_policy_logprob)
+            log_ratio = (old_logp - current).clamp(-20.0, 20.0)
+            kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
         weighted_kl = task_weight * beta_kl * kl_loss
         sample_loss = sample_loss + weighted_kl
         kl_loss_total += float(weighted_kl.detach().cpu().item())
-        sample_loss.backward()
+        metrics = _entry_policy_metrics(
+            torch,
+            entry,
+            sample,
+            length_normalize=length_normalize_policy_logprob,
+            loss_granularity=loss_granularity,
+            eps_clip=eps_clip,
+        )
+        clip_frac_total += metrics["clip_frac"] / denominator
+        approx_kl_total += metrics["approx_kl"] / denominator
+        (sample_loss * float(loss_scale)).backward()
         loss_total += float(sample_loss.detach().cpu().item())
-        processed += 1
     return {
-        "processed": float(processed),
+        "processed": float(len(entries)),
         "loss": loss_total,
         "policy_loss": policy_loss_total,
         "kl_loss": kl_loss_total,
+        "clip_frac": clip_frac_total,
+        "approx_kl": approx_kl_total,
     }
 
 
@@ -1231,6 +1711,38 @@ def _entry_old_score(entry: dict, *, length_normalize: bool):
     if not length_normalize:
         return old
     return old / max(int(entry.get("length", 0) or 0), 1)
+
+
+def _entry_policy_metrics(
+    torch,
+    entry: dict,
+    sample: dict,
+    *,
+    length_normalize: bool,
+    loss_granularity: str,
+    eps_clip: float,
+) -> dict[str, float]:
+    if loss_granularity == "token":
+        current = entry["current_logprobs"].detach().float()
+        old = entry["old_logprobs"].detach().to(current.device).float()
+        mask = entry["response_mask"].detach().to(current.device).float()
+        denominator = mask.sum().clamp_min(1.0)
+        ratio = torch.exp((current - old).clamp(-20.0, 20.0))
+        clipped = ((ratio < 1.0 - float(eps_clip)) | (ratio > 1.0 + float(eps_clip))).float()
+        clip_frac = (clipped * mask).sum() / denominator
+        approx_kl = ((old - current) * mask).sum() / denominator
+        return {
+            "clip_frac": float(clip_frac.cpu().item()),
+            "approx_kl": float(approx_kl.cpu().item()),
+        }
+    current = _entry_score(entry, length_normalize=length_normalize).detach().float()
+    old = _entry_old_score(entry, length_normalize=length_normalize).detach().float()
+    ratio = torch.exp((current - old).clamp(-20.0, 20.0))
+    clipped = bool((ratio < 1.0 - float(eps_clip)).cpu().item() or (ratio > 1.0 + float(eps_clip)).cpu().item())
+    return {
+        "clip_frac": 1.0 if clipped else 0.0,
+        "approx_kl": float((old - current).cpu().item()),
+    }
 
 
 def _project_trainable_coefficients_(torch, gate_manager, train_coefficients: set[str], anchor_gate_values: dict[str, float]) -> None:

@@ -92,11 +92,54 @@ def clipped_grpo_sequence_loss(
     return -torch.minimum(ratio * advantage.float(), clipped * advantage.float())
 
 
+def clipped_grpo_token_loss(
+    torch: Any,
+    *,
+    current_logprobs: Any,
+    old_logprobs: Any,
+    response_mask: Any,
+    advantage: Any,
+    clip_epsilon: float,
+):
+    """Token-level PPO/GRPO clipped surrogate with a scalar group advantage.
+
+    This matches the VeRL-style contract: the group-level sample advantage is
+    broadcast to every response token selected by ``response_mask``.  The return
+    value is a masked mean over tokens for one sample.
+    """
+
+    current = current_logprobs.float()
+    old = old_logprobs.to(current.device).float()
+    mask = response_mask.to(current.device).float()
+    adv = advantage.to(current.device).float()
+    ratio = torch.exp((current - old).clamp(-20.0, 20.0))
+    clipped = torch.clamp(ratio, 1.0 - float(clip_epsilon), 1.0 + float(clip_epsilon))
+    token_loss = -torch.minimum(ratio * adv, clipped * adv)
+    return masked_token_mean(torch, token_loss, mask)
+
+
 def reverse_kl_sequence_penalty(torch: Any, *, current_logp: Any, old_logp: Any):
     """Sequence-level reverse-KL surrogate used by the existing OP-VEC updater."""
 
     log_ratio = (old_logp.float() - current_logp.float()).clamp(-20.0, 20.0)
     return torch.exp(log_ratio) - log_ratio - 1.0
+
+
+def reverse_kl_token_penalty(torch: Any, *, current_logprobs: Any, old_logprobs: Any, response_mask: Any):
+    """Masked token-level reverse-KL surrogate."""
+
+    current = current_logprobs.float()
+    old = old_logprobs.to(current.device).float()
+    mask = response_mask.to(current.device).float()
+    log_ratio = (old - current).clamp(-20.0, 20.0)
+    token_kl = torch.exp(log_ratio) - log_ratio - 1.0
+    return masked_token_mean(torch, token_kl, mask)
+
+
+def masked_token_mean(torch: Any, values: Any, mask: Any):
+    mask = mask.to(values.device).float()
+    denominator = mask.sum().clamp_min(1.0)
+    return (values * mask).sum() / denominator
 
 
 def gate_initialization_prior(torch: Any, gate_manager: Any):

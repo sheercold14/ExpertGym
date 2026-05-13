@@ -10,7 +10,9 @@ set -euo pipefail
 # - official task rewards only; no behavior-span shaping
 # - true old_logprob collection; no --skip-logprob
 
-cd /mnt/cache/wuruixiao/users/lsc/AgentMerging/worktree/OnPolicyMerge_gated_grpo
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
 
 export PY="${PY:-/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python}"
 export ROOT="${ROOT:-/tmp/shared-storage/OnPolicy}"
@@ -45,6 +47,9 @@ PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
 MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.15}"
 TASK_NORMALIZE_ADVANTAGES="${TASK_NORMALIZE_ADVANTAGES:-0}"
 LENGTH_NORMALIZE_POLICY_LOGPROB="${LENGTH_NORMALIZE_POLICY_LOGPROB:-0}"
+UPDATE_BATCH_SIZE="${UPDATE_BATCH_SIZE:-1}"
+BATCH_LOSS_REDUCTION="${BATCH_LOSS_REDUCTION:-mean}"
+LOSS_GRANULARITY="${LOSS_GRANULARITY:-sequence}"
 
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.95}"
@@ -111,6 +116,9 @@ echo "[run] bake output: $BAKE_OUTPUT"
   --top-p "$TOP_P" \
   --seed "$SEED_VALUE" \
   --lr "$LR" \
+  --update-batch-size "$UPDATE_BATCH_SIZE" \
+  --batch-loss-reduction "$BATCH_LOSS_REDUCTION" \
+  --loss-granularity "$LOSS_GRANULARITY" \
   --prior-loss-weight "$PRIOR_LOSS_WEIGHT" \
   --max-coefficient-delta-from-init "$MAX_COEFF_DELTA" \
   --behavior-span-reward-weight 0.0 \

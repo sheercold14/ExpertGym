@@ -51,7 +51,13 @@ def main() -> None:
         updates = iter_dir / "gate_updates.jsonl"
 
         collect_cmd = _collect_command(args, rollouts=rollouts, gate_checkpoint=gate_checkpoint, iteration=iteration)
-        update_cmd = _update_command(args, rollouts=rollouts, updates=updates, gate_checkpoint=gate_checkpoint)
+        update_cmd = _update_command(
+            args,
+            rollouts=rollouts,
+            updates=updates,
+            gate_checkpoint=gate_checkpoint,
+            iteration=iteration,
+        )
 
         if args.dry_run:
             print("[dry-run]", _fmt_cmd(collect_cmd))
@@ -170,10 +176,19 @@ def _collect_command(args: argparse.Namespace, *, rollouts: Path, gate_checkpoin
         cmd.append("--disable-gates")
     if args.behavior_span_reward_weight is not None:
         cmd += ["--behavior-span-reward-weight", str(args.behavior_span_reward_weight)]
+    if args.store_token_logprobs or args.loss_granularity == "token":
+        cmd.append("--store-token-logprobs")
     return cmd
 
 
-def _update_command(args: argparse.Namespace, *, rollouts: Path, updates: Path, gate_checkpoint: str | None) -> list[str]:
+def _update_command(
+    args: argparse.Namespace,
+    *,
+    rollouts: Path,
+    updates: Path,
+    gate_checkpoint: str | None,
+    iteration: int,
+) -> list[str]:
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts/train/opvec_update_gates_from_rollouts.py"),
@@ -211,6 +226,16 @@ def _update_command(args: argparse.Namespace, *, rollouts: Path, updates: Path, 
         args.torch_dtype,
         "--gate-parameterization",
         args.gate_parameterization,
+        "--update-batch-size",
+        str(args.update_batch_size),
+        "--batch-loss-reduction",
+        args.batch_loss_reduction,
+        "--loss-granularity",
+        args.loss_granularity,
+        "--frontier-order",
+        args.frontier_order,
+        "--frontier-shuffle-seed",
+        str(args.frontier_shuffle_seed if args.frontier_shuffle_seed is not None else int(args.seed + iteration - 1)),
     ]
     if args.recompute_frontier:
         cmd.append("--recompute-frontier")
@@ -298,9 +323,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-model", default=None)
     parser.add_argument("--disable-gates", action="store_true")
     parser.add_argument("--behavior-span-reward-weight", type=float, default=None)
+    parser.add_argument("--store-token-logprobs", action="store_true")
     parser.add_argument("--progress-every", type=int, default=10)
 
     parser.add_argument("--update-epochs", type=int, default=1, help="GRPO epochs over each collected on-policy rollout file")
+    parser.add_argument("--update-batch-size", type=int, default=1)
+    parser.add_argument("--batch-loss-reduction", choices=["mean", "sum"], default="mean")
+    parser.add_argument("--loss-granularity", choices=["sequence", "token"], default="sequence")
+    parser.add_argument("--frontier-order", choices=["as-is", "shuffle", "task-interleaved"], default="as-is")
+    parser.add_argument("--frontier-shuffle-seed", type=int, default=None)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--prior-loss-weight", type=float, default=0.01)

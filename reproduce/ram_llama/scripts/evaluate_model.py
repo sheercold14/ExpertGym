@@ -387,6 +387,13 @@ def get_search_query(text: str) -> str | None:
     return matches[-1].strip() if matches else None
 
 
+INVALID_SEARCH_ACTION_FEEDBACK = (
+    "\nMy previous action is invalid. "
+    "If I want to search, I should put the query between <search> and </search>. "
+    "If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n"
+)
+
+
 def retrieve_google(query: str, topk: int) -> str:
     api_key = os.environ.get("SER_API_KEY") or os.environ.get("SERPAPI_API_KEY")
     if not api_key:
@@ -402,6 +409,47 @@ def retrieve_google(query: str, topk: int) -> str:
     for i, item in enumerate(results, 1):
         text = " ".join(str(item.get(k, "")) for k in ("title", "snippet") if item.get(k))
         docs.append(f"Doc {i}: {text}")
+    return "\n".join(docs) if docs else "No information available"
+
+
+def load_api_key_from_file(path: str, field: str = "key") -> str | None:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    value = data.get(field)
+    return str(value).strip() if value else None
+
+
+def retrieve_serper(query: str, topk: int) -> str:
+    api_key = os.environ.get("SERPER_API_KEY")
+    key_file = os.environ.get("SERPER_API_KEY_FILE")
+    if not api_key and key_file:
+        api_key = load_api_key_from_file(key_file)
+    if not api_key:
+        return "No information available"
+    payload = {"q": query, "num": topk}
+    try:
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("organic", [])[:topk]
+    except Exception:
+        return "No information available"
+    docs = []
+    for i, item in enumerate(results, 1):
+        parts = []
+        if item.get("title"):
+            parts.append(str(item["title"]))
+        if item.get("snippet"):
+            parts.append(str(item["snippet"]))
+        if item.get("link"):
+            parts.append(str(item["link"]))
+        docs.append(f"Doc {i}: {' '.join(parts)}")
     return "\n".join(docs) if docs else "No information available"
 
 
@@ -470,17 +518,97 @@ def retrieve_local_context(query: str, item: EvalItem, topk: int) -> str:
     return "\n".join(f"Doc {i}: {text}" for i, (_, text) in enumerate(scored[:topk], 1))
 
 
+def normalize_search_query(query: str) -> str:
+    return " ".join(query.lower().strip().split())
+
+
+def clean_search_query(query: str) -> str:
+    query = query.strip()
+    match = re.fullmatch(r"(?is)query\s*=\s*(.+)", query)
+    if match:
+        query = match.group(1).strip()
+    if len(query) >= 2 and query[0] == query[-1] and query[0] in {"'", '"'}:
+        query = query[1:-1].strip()
+    return query
+
+
+def search_cache_key(query: str, args: argparse.Namespace) -> str:
+    query = clean_search_query(query)
+    payload = {
+        "backend": args.search_backend,
+        "query": normalize_search_query(query),
+        "topk": args.search_topk,
+        "search_url": args.search_url if args.search_backend == "wiki" else None,
+        "exa_search_type": args.exa_search_type if args.search_backend == "exa" else None,
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+def load_search_cache(args: argparse.Namespace) -> dict[str, str]:
+    if hasattr(args, "_search_cache"):
+        return args._search_cache
+    cache: dict[str, str] = {}
+    cache_path = getattr(args, "search_cache_path", None)
+    if cache_path:
+        path = Path(cache_path)
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    key = row.get("key")
+                    info = row.get("information")
+                    if key and isinstance(info, str):
+                        cache[key] = info
+    args._search_cache = cache
+    return cache
+
+
+def save_search_cache(args: argparse.Namespace, key: str, info: str) -> None:
+    cache_path = getattr(args, "search_cache_path", None)
+    if not cache_path:
+        return
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"key": key, "information": info}, ensure_ascii=False) + "\n")
+
+
 def retrieve_for_search(query: str, item: EvalItem, args: argparse.Namespace) -> str:
+    args._last_search_cache_hit = False
+    query_for_backend = clean_search_query(query)
+    args._last_search_query = query_for_backend
+    cache_path = getattr(args, "search_cache_path", None)
+    key = search_cache_key(query_for_backend, args) if cache_path else None
+    if key:
+        cache = load_search_cache(args)
+        if key in cache:
+            args._last_search_cache_hit = True
+            info = cache[key]
+            max_chars = getattr(args, "search_info_max_chars", 0)
+            if max_chars and len(info) > max_chars:
+                return info[:max_chars] + "\n[truncated]"
+            return info
+
     if args.search_backend == "google":
-        info = retrieve_google(query, args.search_topk)
+        info = retrieve_google(query_for_backend, args.search_topk)
+    elif args.search_backend == "serper":
+        info = retrieve_serper(query_for_backend, args.search_topk)
     elif args.search_backend == "exa":
-        info = retrieve_exa(query, args.search_topk, args.exa_search_type)
+        info = retrieve_exa(query_for_backend, args.search_topk, args.exa_search_type)
     elif args.search_backend == "wiki":
-        info = retrieve_wiki(query, args.search_topk, args.search_url)
+        info = retrieve_wiki(query_for_backend, args.search_topk, args.search_url)
     elif args.search_backend == "local_context":
-        info = retrieve_local_context(query, item, args.search_topk)
+        info = retrieve_local_context(query_for_backend, item, args.search_topk)
     else:
         info = "No information available"
+    if key:
+        load_search_cache(args)[key] = info
+        save_search_cache(args, key, info)
     max_chars = getattr(args, "search_info_max_chars", 0)
     if max_chars and len(info) > max_chars:
         return info[:max_chars] + "\n[truncated]"
@@ -563,10 +691,24 @@ def generate_zerosearch(tokenizer: Any, model: Any, item: EvalItem, args: argpar
         final_text_parts.append(generated)
         prompt += generated
         query = get_search_query(generated)
-        if not query or extract_answer_tag(generated) is not None:
+        if extract_answer_tag(generated) is not None:
+            break
+        if not query:
+            if getattr(args, "zerosearch_invalid_feedback", False) and turn < args.search_max_turns:
+                prompt += INVALID_SEARCH_ACTION_FEEDBACK
+                final_text_parts.append(INVALID_SEARCH_ACTION_FEEDBACK)
+                continue
             break
         info = retrieve_for_search(query, item, args)
-        trace.append({"turn": str(turn), "query": query, "information": info})
+        trace.append(
+            {
+                "turn": str(turn),
+                "query": query,
+                "backend_query": getattr(args, "_last_search_query", query),
+                "information": info,
+                "cache_hit": str(bool(getattr(args, "_last_search_cache_hit", False))),
+            }
+        )
         search_text = f"\n\n<information>{info}</information>\n\n"
         prompt += search_text
         final_text_parts.append(search_text)
@@ -662,11 +804,13 @@ def main() -> None:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--search-mode", choices=["static", "zerosearch"], default="static")
-    parser.add_argument("--search-backend", choices=["none", "google", "exa", "wiki", "local_context"], default="none")
+    parser.add_argument("--search-backend", choices=["none", "google", "serper", "exa", "wiki", "local_context"], default="none")
     parser.add_argument("--search-url", default="http://localhost:6002/retrieve")
     parser.add_argument("--search-topk", type=int, default=5)
     parser.add_argument("--search-max-turns", type=int, default=5)
     parser.add_argument("--search-info-max-chars", type=int, default=3500)
+    parser.add_argument("--search-cache-path", default=None)
+    parser.add_argument("--zerosearch-invalid-feedback", action="store_true")
     parser.add_argument("--exa-search-type", choices=["auto", "fast", "instant", "deep-lite", "deep"], default="auto")
     args = parser.parse_args()
     args.model_name = args.model_name or Path(args.model).name.replace("/", "__")

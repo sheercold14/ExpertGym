@@ -13,6 +13,7 @@ from evaluate_model import (
     DEFAULT_EVAL_ROOT,
     DEFAULT_OUTPUT_ROOT,
     EvalItem,
+    INVALID_SEARCH_ACTION_FEEDBACK,
     build_chat_prompt,
     build_zerosearch_prompt,
     extract_answer_tag,
@@ -90,11 +91,26 @@ def generate_zerosearch(
             prompts[i] += text
             final_parts[i].append(text)
             query = get_search_query(text)
-            if not query or extract_answer_tag(text) is not None or turn >= args.search_max_turns:
+            if extract_answer_tag(text) is not None or turn >= args.search_max_turns:
+                finished[i] = True
+                continue
+            if not query:
+                if args.zerosearch_invalid_feedback:
+                    prompts[i] += INVALID_SEARCH_ACTION_FEEDBACK
+                    final_parts[i].append(INVALID_SEARCH_ACTION_FEEDBACK)
+                    continue
                 finished[i] = True
                 continue
             info = retrieve_for_search(query, items[i], args)
-            traces[i].append({"turn": str(turn), "query": query, "information": info})
+            traces[i].append(
+                {
+                    "turn": str(turn),
+                    "query": query,
+                    "backend_query": getattr(args, "_last_search_query", query),
+                    "information": info,
+                    "cache_hit": str(bool(getattr(args, "_last_search_cache_hit", False))),
+                }
+            )
             info_text = f"\n\n<information>{info}</information>\n\n"
             prompts[i] += info_text
             final_parts[i].append(info_text)
@@ -206,11 +222,13 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--search-mode", choices=["static", "zerosearch"], default="static")
-    parser.add_argument("--search-backend", choices=["none", "google", "exa", "wiki", "local_context"], default="none")
+    parser.add_argument("--search-backend", choices=["none", "google", "serper", "exa", "wiki", "local_context"], default="none")
     parser.add_argument("--search-url", default="http://localhost:6002/retrieve")
     parser.add_argument("--search-topk", type=int, default=5)
     parser.add_argument("--search-max-turns", type=int, default=5)
     parser.add_argument("--search-info-max-chars", type=int, default=3500)
+    parser.add_argument("--search-cache-path", default=None)
+    parser.add_argument("--zerosearch-invalid-feedback", action="store_true")
     parser.add_argument("--exa-search-type", choices=["auto", "fast", "instant", "deep-lite", "deep"], default="auto")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()

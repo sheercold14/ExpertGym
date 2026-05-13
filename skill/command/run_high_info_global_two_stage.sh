@@ -8,7 +8,9 @@ set -euo pipefail
 #   stage B: fixed expert-recovery rows, PPO disabled, best-response/pairwise only;
 #   guard: fixed heldout prompts summarized before the next iteration.
 
-cd /mnt/cache/wuruixiao/users/lsc/AgentMerging/worktree/OnPolicyMerge_gated_grpo
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
 
 export PY="${PY:-/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python}"
 export ROOT="${ROOT:-/tmp/shared-storage/OnPolicy}"

@@ -18,6 +18,7 @@ from opvec.config import load_config, write_json
 from opvec.data.io import read_jsonl, write_jsonl
 from opvec.data.prompt_filters import filter_memory_records, parse_memory_kind_filter
 from opvec.data.prompt_sampler import task_balanced_sample
+from opvec.data.schema import make_gate_id, validate_rollout_row
 from opvec.modeling.bake import load_gate_values
 from opvec.modeling.logprob import render_chat_prompt
 from opvec.rewards.router import RewardRouter
@@ -87,18 +88,21 @@ def collect_vllm_rollouts(config: dict, args: argparse.Namespace) -> dict:
         max_tokens=int(args.max_new_tokens),
         temperature=0.0 if args.greedy else float(args.temperature),
         top_p=1.0 if args.greedy else float(args.top_p),
+        logprobs=1 if args.store_token_logprobs else None,
         skip_special_tokens=True,
     )
     memory_update_sampling_params = SamplingParams(
         max_tokens=int(args.memory_update_max_new_tokens or args.max_new_tokens),
         temperature=0.0 if args.greedy else float(args.temperature),
         top_p=1.0 if args.greedy else float(args.top_p),
+        logprobs=1 if args.store_token_logprobs else None,
         skip_special_tokens=True,
     )
     memory_final_sampling_params = SamplingParams(
         max_tokens=int(args.memory_final_max_new_tokens or args.max_new_tokens),
         temperature=0.0 if args.greedy else float(args.temperature),
         top_p=1.0 if args.greedy else float(args.top_p),
+        logprobs=1 if args.store_token_logprobs else None,
         skip_special_tokens=True,
     )
     llm = LLM(
@@ -136,6 +140,7 @@ def collect_vllm_rollouts(config: dict, args: argparse.Namespace) -> dict:
                 config=config,
                 gate_values=gate_values,
             )
+            validate_rollout_row(row)
             rollout_rows.append(row)
             if stream_handle is not None:
                 stream_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -169,7 +174,13 @@ def collect_vllm_rollouts(config: dict, args: argparse.Namespace) -> dict:
         "gate_checkpoint": args.gate_checkpoint,
         "gate_values": gate_values,
         "policy_id": args.policy_id,
-        "old_logprob": "missing; fill in update with --fill-missing-old-logprob",
+        "old_logprob": (
+            "stored from vLLM generation token logprobs"
+            if args.store_token_logprobs
+            else "missing; fill in update with --fill-missing-old-logprob"
+        ),
+        "store_token_logprobs": bool(args.store_token_logprobs),
+        "token_logprob_samples": _token_logprob_sample_count(rollout_rows),
         "tensor_parallel_size": int(args.tensor_parallel_size),
         "gpu_memory_utilization": float(args.gpu_memory_utilization),
         "max_model_len": int(args.max_model_len),
@@ -222,15 +233,18 @@ def collect_one_prompt_vllm(
         )
     prompt_text = render_chat_prompt(tokenizer, prompt_record.get("messages"), prompt_record.get("prompt", ""))
     prompt_ids = _prompt_token_ids(tokenizer, prompt_text, args.max_prompt_tokens)
-    texts = _vllm_generate_texts(
+    generated = _vllm_generate_samples(
         llm,
         [prompt_ids for _ in range(args.samples_per_prompt)],
         sampling_params,
         batch_size=args.vllm_batch_size,
+        store_token_logprobs=args.store_token_logprobs,
     )
+    texts = [item["text"] for item in generated]
     samples = []
-    for sample_idx, response_text in enumerate(texts):
-        scored = router.score(prompt_record, response_text)
+    scored_outputs = router.batch_score(prompt_record, texts)
+    for sample_idx, (generated_item, scored) in enumerate(zip(generated, scored_outputs)):
+        response_text = str(generated_item["text"])
         scored = _apply_behavior_span_mix(
             scored,
             behavior_span_weight=float(
@@ -243,10 +257,11 @@ def collect_one_prompt_vllm(
             {
                 "sample_id": f"{prompt_record['prompt_id']}__k{sample_idx}",
                 "text": response_text,
-                "old_logprob": None,
+                "old_logprob": generated_item.get("old_logprob"),
                 "old_logprob_max_length": None,
-                "length": _token_len(tokenizer, response_text),
+                "length": len(generated_item.get("response_token_ids", [])) or _token_len(tokenizer, response_text),
                 **scored,
+                **_token_payload_fields(generated_item),
             }
         )
     keep, skip_reason, frontier = should_keep_frontier(
@@ -261,6 +276,9 @@ def collect_one_prompt_vllm(
         "policy_id": args.policy_id,
         "gate_checkpoint": args.gate_checkpoint,
         "gate_values": gate_values,
+        "gate_id": make_gate_id(gate_values, args.gate_checkpoint),
+        "group_id": prompt_record.get("group_id") or prompt_record["prompt_id"],
+        "seed": int(args.seed if args.seed is not None else config["run"]["seed"]),
         "installed_modules": [],
         "prompt_id": prompt_record["prompt_id"],
         "task": prompt_record["task"],
@@ -301,22 +319,25 @@ def collect_one_memagent_trajectory_vllm(
             prompt_text = render_chat_prompt(tokenizer, [{"role": "user", "content": user_text}], user_text)
             prompt_texts.append(prompt_text)
         first_prompt_text = first_prompt_text or prompt_texts[0]
-        texts = _vllm_generate_texts(
+        generated = _vllm_generate_samples(
             llm,
             [_prompt_token_ids(tokenizer, prompt_text, args.max_prompt_tokens) for prompt_text in prompt_texts],
             update_sampling_params,
             batch_size=args.vllm_batch_size,
+            store_token_logprobs=args.store_token_logprobs,
         )
-        for sample_idx, response_text in enumerate(texts):
-            response_len = _token_len(tokenizer, response_text)
+        for sample_idx, generated_item in enumerate(generated):
+            response_text = str(generated_item["text"])
+            response_len = len(generated_item.get("response_token_ids", [])) or _token_len(tokenizer, response_text)
             turns_by_sample[sample_idx].append(
                 {
                     "turn": chunk_idx,
                     "kind": "memory_update",
                     "prompt_text": prompt_texts[sample_idx],
                     "text": response_text,
-                    "old_logprob": None,
+                    "old_logprob": generated_item.get("old_logprob"),
                     "length": response_len,
+                    **_token_payload_fields(generated_item),
                 }
             )
             total_lengths[sample_idx] += response_len
@@ -327,15 +348,19 @@ def collect_one_memagent_trajectory_vllm(
         prompt_text = render_chat_prompt(tokenizer, [{"role": "user", "content": user_text}], user_text)
         final_prompt_texts.append(prompt_text)
     first_prompt_text = first_prompt_text or final_prompt_texts[0]
-    final_texts = _vllm_generate_texts(
+    final_generated = _vllm_generate_samples(
         llm,
         [_prompt_token_ids(tokenizer, prompt_text, args.max_prompt_tokens) for prompt_text in final_prompt_texts],
         final_sampling_params,
         batch_size=args.vllm_batch_size,
+        store_token_logprobs=args.store_token_logprobs,
     )
+    final_texts = [item["text"] for item in final_generated]
     samples = []
-    for sample_idx, final_text in enumerate(final_texts):
-        final_len = _token_len(tokenizer, final_text)
+    scored_outputs = router.batch_score(prompt_record, final_texts)
+    for sample_idx, (generated_item, scored) in enumerate(zip(final_generated, scored_outputs)):
+        final_text = str(generated_item["text"])
+        final_len = len(generated_item.get("response_token_ids", [])) or _token_len(tokenizer, final_text)
         total_lengths[sample_idx] += final_len
         turns_by_sample[sample_idx].append(
             {
@@ -343,11 +368,11 @@ def collect_one_memagent_trajectory_vllm(
                 "kind": "final_answer",
                 "prompt_text": final_prompt_texts[sample_idx],
                 "text": final_text,
-                "old_logprob": None,
+                "old_logprob": generated_item.get("old_logprob"),
                 "length": final_len,
+                **_token_payload_fields(generated_item),
             }
         )
-        scored = router.score(prompt_record, final_text)
         scored = _apply_behavior_span_mix(
             scored,
             behavior_span_weight=float(
@@ -356,15 +381,17 @@ def collect_one_memagent_trajectory_vllm(
                 else config.get("reward", {}).get("behavior_span_weight", 0.0)
             ),
         )
+        sample_payload = _aggregate_trajectory_token_payload(turns_by_sample[sample_idx])
         samples.append(
             {
                 "sample_id": f"{prompt_record['prompt_id']}__k{sample_idx}",
                 "text": final_text,
-                "old_logprob": None,
+                "old_logprob": sample_payload.get("old_logprob"),
                 "old_logprob_max_length": None,
                 "length": total_lengths[sample_idx],
                 "trajectory": turns_by_sample[sample_idx],
                 **scored,
+                **_token_payload_fields(sample_payload),
             }
         )
     keep, skip_reason, frontier = should_keep_frontier(
@@ -379,6 +406,9 @@ def collect_one_memagent_trajectory_vllm(
         "policy_id": args.policy_id,
         "gate_checkpoint": args.gate_checkpoint,
         "gate_values": gate_values,
+        "gate_id": make_gate_id(gate_values, args.gate_checkpoint),
+        "group_id": prompt_record.get("group_id") or prompt_record["prompt_id"],
+        "seed": int(args.seed if args.seed is not None else config["run"]["seed"]),
         "installed_modules": [],
         "prompt_id": prompt_record["prompt_id"],
         "task": prompt_record["task"],
@@ -393,13 +423,105 @@ def collect_one_memagent_trajectory_vllm(
     }
 
 
-def _vllm_generate_texts(llm, prompt_token_ids_list: list[list[int]], sampling_params, *, batch_size: int) -> list[str]:
-    texts = []
+def _vllm_generate_samples(
+    llm,
+    prompt_token_ids_list: list[list[int]],
+    sampling_params,
+    *,
+    batch_size: int,
+    store_token_logprobs: bool,
+) -> list[dict]:
+    samples = []
     for start in range(0, len(prompt_token_ids_list), batch_size):
         prompts = [{"prompt_token_ids": token_ids} for token_ids in prompt_token_ids_list[start : start + batch_size]]
         outputs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
-        texts.extend(output.outputs[0].text if output.outputs else "" for output in outputs)
-    return texts
+        for output in outputs:
+            completion = output.outputs[0] if output.outputs else None
+            samples.append(_vllm_completion_payload(completion, store_token_logprobs=store_token_logprobs))
+    return samples
+
+
+def _vllm_completion_payload(completion, *, store_token_logprobs: bool) -> dict:
+    if completion is None:
+        return {"text": "", "old_logprob": None}
+    payload = {"text": str(getattr(completion, "text", "") or "")}
+    if store_token_logprobs:
+        token_payload = _vllm_token_logprob_payload(completion)
+        if token_payload is not None:
+            payload.update(token_payload)
+    return payload
+
+
+def _vllm_token_logprob_payload(completion) -> dict | None:
+    token_ids = [int(token_id) for token_id in list(getattr(completion, "token_ids", []) or [])]
+    if not token_ids:
+        return None
+    logprobs_by_position = getattr(completion, "logprobs", None)
+    if logprobs_by_position is None:
+        raise ValueError("vLLM did not return token logprobs; set SamplingParams(logprobs=1).")
+    if len(logprobs_by_position) != len(token_ids):
+        raise ValueError(f"vLLM token/logprob length mismatch: tokens={len(token_ids)} logprobs={len(logprobs_by_position)}")
+    old_logprobs = [
+        _sampled_token_logprob(position_logprobs, token_id)
+        for position_logprobs, token_id in zip(logprobs_by_position, token_ids)
+    ]
+    return {
+        "response_token_ids": token_ids,
+        "old_logprobs": old_logprobs,
+        "response_mask": [1 for _ in token_ids],
+        "old_logprob": float(sum(old_logprobs)),
+    }
+
+
+def _sampled_token_logprob(position_logprobs, token_id: int) -> float:
+    if position_logprobs is None:
+        raise ValueError(f"Missing vLLM logprob entry for sampled token_id={token_id}")
+    if isinstance(position_logprobs, dict):
+        entry = position_logprobs.get(int(token_id))
+        if entry is None:
+            entry = position_logprobs.get(str(token_id))
+        if entry is None and len(position_logprobs) == 1:
+            entry = next(iter(position_logprobs.values()))
+        if entry is None:
+            available = list(position_logprobs.keys())[:8]
+            raise ValueError(f"Sampled token_id={token_id} not found in vLLM logprobs; available={available}")
+        return _logprob_value(entry)
+    return _logprob_value(position_logprobs)
+
+
+def _logprob_value(entry) -> float:
+    if hasattr(entry, "logprob"):
+        return float(entry.logprob)
+    if isinstance(entry, dict) and "logprob" in entry:
+        return float(entry["logprob"])
+    if isinstance(entry, (tuple, list)) and entry:
+        return float(entry[0])
+    return float(entry)
+
+
+def _token_payload_fields(payload: dict) -> dict:
+    keys = ("response_token_ids", "old_logprobs", "response_mask")
+    return {key: payload[key] for key in keys if key in payload}
+
+
+def _aggregate_trajectory_token_payload(turns: list[dict]) -> dict:
+    token_ids = []
+    old_logprobs = []
+    response_mask = []
+    for turn in turns:
+        if not all(key in turn for key in ("response_token_ids", "old_logprobs", "response_mask")):
+            continue
+        token_ids.extend(int(value) for value in turn["response_token_ids"])
+        old_logprobs.extend(float(value) for value in turn["old_logprobs"])
+        response_mask.extend(int(value) for value in turn["response_mask"])
+    if not token_ids:
+        return {"old_logprob": None}
+    return {
+        "response_token_ids": token_ids,
+        "old_logprobs": old_logprobs,
+        "response_mask": response_mask,
+        "old_logprob": float(sum(old_logprobs)),
+    }
 
 
 def _prompt_token_ids(tokenizer, prompt_text: str, max_prompt_tokens: int) -> list[int]:
@@ -424,6 +546,15 @@ def _task_counts(rows: list[dict]) -> dict[str, int]:
         task = str(row.get("task"))
         counts[task] = counts.get(task, 0) + 1
     return counts
+
+
+def _token_logprob_sample_count(rows: list[dict]) -> int:
+    count = 0
+    for row in rows:
+        for sample in row.get("samples", []):
+            if all(key in sample for key in ("response_token_ids", "old_logprobs", "response_mask")):
+                count += 1
+    return count
 
 
 def parse_args() -> argparse.Namespace:
@@ -455,6 +586,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--greedy", action="store_true")
+    parser.add_argument("--store-token-logprobs", action="store_true", help="Ask vLLM to store sampled response token ids and old token logprobs.")
     parser.add_argument("--stream-output", action="store_true")
     parser.add_argument("--progress-every", type=int, default=0)
     parser.add_argument("--gate-checkpoint", default=None)

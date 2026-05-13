@@ -15,10 +15,16 @@ SEARCH_URL="${SEARCH_URL:-http://localhost:6002/retrieve}"
 SEARCH_TOPK="${SEARCH_TOPK:-5}"
 SEARCH_MAX_TURNS="${SEARCH_MAX_TURNS:-5}"
 SEARCH_INFO_MAX_CHARS="${SEARCH_INFO_MAX_CHARS:-3500}"
+SEARCH_CACHE_PATH="${SEARCH_CACHE_PATH:-${RESULT_ROOT}/${RUN_ID}/search_cache_${SEARCH_BACKEND}_top${SEARCH_TOPK}.jsonl}"
+ZEROSEARCH_INVALID_FEEDBACK="${ZEROSEARCH_INVALID_FEEDBACK:-0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-1.0}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
+
+if [ "${SEARCH_BACKEND}" = "serper" ] && [ -z "${SERPER_API_KEY:-}" ] && [ -z "${SERPER_API_KEY_FILE:-}" ]; then
+  export SERPER_API_KEY_FILE="/mnt/cache/wuruixiao/users/lsc/Agent/api/serper.json"
+fi
 
 ARGS=(
   reproduce/ram_llama/scripts/evaluate_model_vllm.py
@@ -33,6 +39,7 @@ ARGS=(
   --search-topk "${SEARCH_TOPK}"
   --search-max-turns "${SEARCH_MAX_TURNS}"
   --search-info-max-chars "${SEARCH_INFO_MAX_CHARS}"
+  --search-cache-path "${SEARCH_CACHE_PATH}"
   --max-new-tokens "${MAX_NEW_TOKENS}"
   --temperature "${TEMPERATURE}"
   --top-p "${TOP_P}"
@@ -43,6 +50,10 @@ ARGS=(
 
 if [ -n "${MAX_SAMPLES}" ]; then
   ARGS+=(--max-samples "${MAX_SAMPLES}")
+fi
+
+if [ "${ZEROSEARCH_INVALID_FEEDBACK}" = "1" ]; then
+  ARGS+=(--zerosearch-invalid-feedback)
 fi
 
 CUDA_VISIBLE_DEVICES="${GPU}" "${PY}" "${ARGS[@]}"

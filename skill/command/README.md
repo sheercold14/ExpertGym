@@ -1,7 +1,7 @@
 ---
 title: OP-VEC Gated-GRPO 启动命令
-project: OnPolicyMerge_gated_grpo
-date: 2026-05-11
+project: ExpertGym
+date: 2026-05-12
 tags:
   - gated-grpo
   - opvec
@@ -13,7 +13,7 @@ tags:
 
 ## 0. 当前清理后的主干
 
-这个 worktree 只保留 gated_grpo 训练主干：
+当前独立仓库只保留 gated_grpo 训练主干和必要文档：
 
 ```text
 configs/gated_grpo.yaml                  # native loop 主配置
@@ -35,7 +35,7 @@ tests/                                   # gated_grpo 相关最小测试
 ## 1. 环境变量
 
 ```bash
-cd /mnt/cache/wuruixiao/users/lsc/AgentMerging/worktree/OnPolicyMerge_gated_grpo
+cd /mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym
 
 export PY=/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python
 export ROOT=/tmp/shared-storage/OnPolicy
@@ -43,6 +43,25 @@ export ONPOLICY_STORAGE_ROOT=$ROOT
 
 export MODE=$ROOT/modes/opvec4/mode_manifest.json
 export SEED=$ROOT/data/source_reward/source_reward_t80_m80_c80_seed20260508.jsonl
+```
+
+## 1.1 Sequence vs Token Loss Smoke
+
+先用同一份 10-prompt rollout 对照 legacy sequence loss 和 token-level loss：
+
+```bash
+PY=/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+GPU_LIST=0,1,2,3 \
+NUM_PROMPTS=10 \
+SAMPLES_PER_PROMPT=4 \
+UPDATE_BATCH_SIZE=4 \
+skill/command/run_smoke_sequence_vs_token.sh
+```
+
+只检查命令拼接：
+
+```bash
+DRY_RUN=1 skill/command/run_smoke_sequence_vs_token.sh
 ```
 
 如果使用多卡加载模型，后续命令里再加：
@@ -231,11 +250,16 @@ MAX_MEMORY_PER_GPU=55GiB \
 CPU_MAX_MEMORY=200GiB \
 TASK_NORMALIZE_ADVANTAGES=1 \
 LENGTH_NORMALIZE_POLICY_LOGPROB=1 \
+LOSS_GRANULARITY=token \
+UPDATE_BATCH_SIZE=4 \
+STORE_TOKEN_LOGPROBS=auto \
 RUN_NAME=plan1_tasknorm_lenavg_one_iter \
 bash skill/command/run_official_gated_grpo_global_vllm_one_iter.sh
 ```
 
 2026-05-11 修复了 update 阶段的 delta 安装显存峰值：`device_map=auto` 时 delta 先 CPU load，再注册到目标 GPU buffer，避免 GPU 上临时双份 delta。
+
+2026-05-12 vLLM 路径支持在 rollout 阶段直接保存 sampled token 的 `old_logprobs`。`LOSS_GRANULARITY=token` 时 launcher 默认打开 `--store-token-logprobs`，update 阶段只需重算 current logprob，不再为完整样本重复 old-policy forward。`MAX_LOGPROB_TOKENS` 默认跟随 `MAX_MODEL_LEN`，避免 old vLLM context 和 current HF scoring context 不一致。
 
 注意：vLLM 路径生成快，但 gate update 仍在 HF/torch 里做；588 个 gate 暂时不能直接在 vLLM 里动态更新。
 
