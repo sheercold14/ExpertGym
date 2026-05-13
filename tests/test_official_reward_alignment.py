@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from opvec.rewards.simple import MemoryRewardAdapter, ToolRewardAdapter
+from opvec.train.frontier import frontier_stats
 
 
 COLLECT_PATH = Path(__file__).resolve().parents[1] / "scripts/train/opvec_collect_hf_rollouts.py"
@@ -36,8 +37,21 @@ class OfficialRewardAlignmentTest(unittest.TestCase):
 
         self.assertEqual(result["reward"], 4.0)
         self.assertEqual(result["task_reward"], 4.0)
+        self.assertEqual(result["reward_train"], 1.0)
         self.assertTrue(result["success"])
         self.assertEqual(result["details"]["toolrl_score_range"], [-3.0, 4.0])
+
+    def test_frontier_stats_use_train_reward_scale(self):
+        stats = frontier_stats(
+            [
+                {"reward": 4.0, "reward_train": 1.0, "success": True},
+                {"reward": -2.0, "reward_train": 1.0 / 7.0, "success": False},
+            ]
+        )
+
+        self.assertEqual(stats["reward_field"], "reward_train")
+        self.assertAlmostEqual(stats["mean_reward"], 4.0 / 7.0)
+        self.assertAlmostEqual(stats["mean_raw_reward"], 1.0)
 
     def test_toolrl_correctness_uses_first_tool_call_block_like_official(self):
         reference = (

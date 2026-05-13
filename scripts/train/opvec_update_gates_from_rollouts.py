@@ -206,15 +206,13 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                 args.max_logprob_tokens,
                 require_match=not best_response_only,
             )
-            rewards = [float(sample["reward"]) for sample in valid_samples]
+            task_name = str(row.get("task", ""))
+            rewards = [_sample_train_reward(sample, task=task_name) for sample in valid_samples]
             category = _row_category(row)
             source = str(row.get("source") or "")
             source_weight = source_weights.get(source, 1.0)
             task_weight = task_weights.get(str(row.get("task")), 1.0) * category_weights.get(category, 1.0) * source_weight
-            frontier_weight = policy_frontier_weight(
-                row.get("frontier", {}),
-                min_reward_std=float(config["frontier"]["min_reward_std"]),
-            )
+            frontier_weight = _policy_frontier_multiplier(row, config, args)
             if args.ppo_loss_weight == 0.0 and (
                 float(args.best_response_loss_weight) != 0.0 or float(args.pairwise_loss_weight) != 0.0
             ):
@@ -224,6 +222,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     tokenizer,
                     prompt_text=prompt_text,
                     valid_samples=valid_samples,
+                    task=task_name,
                     device=device,
                     max_logprob_tokens=args.max_logprob_tokens,
                     task_weight=task_weight,
@@ -261,6 +260,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "skipped_step": False,
                         "mean_reward": sum(rewards) / len(rewards),
                         "frontier_weight": frontier_weight,
+                        "reward_field": "reward_train",
                         "loss_granularity": str(args.loss_granularity),
                         "gates": {},
                     }
@@ -323,6 +323,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "skipped_step": False,
                         "mean_reward": sum(rewards) / len(rewards),
                         "frontier_weight": frontier_weight,
+                        "reward_field": "reward_train",
                         "advantage_source": advantage_source,
                         "advantage_task_scale": advantage_task_scale,
                         "mean_abs_advantage": _mean_abs([float(value) for value in advantages.detach().cpu().tolist()]),
@@ -354,7 +355,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     {
                         "sample_idx": sample_idx,
                         "sample": sample,
-                        "reward": float(sample.get("reward", 0.0)),
+                        "reward": _sample_train_reward(sample, task=task_name),
+                        "raw_reward": float(sample.get("reward", 0.0)),
                         "length": int(sample.get("length", 0) or 0),
                     }
                 )
@@ -449,6 +451,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     "skipped_step": False,
                     "mean_reward": sum(rewards) / len(rewards),
                     "frontier_weight": frontier_weight,
+                    "reward_field": "reward_train",
                     "advantage_source": advantage_source,
                     "advantage_task_scale": advantage_task_scale,
                     "mean_abs_advantage": _mean_abs([float(value) for value in advantages.detach().cpu().tolist()]),
@@ -468,7 +471,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                 retention_loss_total = 0.0
                 processed = 0
                 denominator = float(len(valid_samples))
-                rewards = [float(sample.get("reward", 0.0)) for sample in valid_samples]
+                task_name = str(row.get("task", ""))
+                rewards = [_sample_train_reward(sample, task=task_name) for sample in valid_samples]
                 category = _row_category(row)
                 source = str(row.get("source") or "")
                 source_weight = source_weights.get(source, 1.0)
@@ -595,6 +599,9 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         "source_weights": source_weights,
         "advantage_normalization": {
             "task_normalize_advantages": bool(args.task_normalize_advantages),
+            "advantage_normalization": str(args.advantage_normalization),
+            "reward_field": "reward_train",
+            "use_frontier_weight": bool(args.use_frontier_weight),
             "advantage_field": args.advantage_field,
             "advantage_field_apply_frontier_weight": bool(args.advantage_field_apply_frontier_weight),
             "task_scales": advantage_task_scales,
@@ -1174,6 +1181,17 @@ def parse_args() -> argparse.Namespace:
         help="Rescale row-normalized GRPO advantages so each task has the same mean absolute advantage over kept frontier rows.",
     )
     parser.add_argument(
+        "--advantage-normalization",
+        choices=["centered", "zscore"],
+        default="centered",
+        help="How to convert reward_train values to row advantages. centered subtracts row mean only; zscore also divides by row std.",
+    )
+    parser.add_argument(
+        "--use-frontier-weight",
+        action="store_true",
+        help="Multiply policy advantages by row frontier_weight. Default off; frontier filtering still uses frontier stats.",
+    )
+    parser.add_argument(
         "--advantage-field",
         default=None,
         help=(
@@ -1183,12 +1201,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--advantage-field-frontier-weight",
+        dest="advantage_field_apply_frontier_weight",
+        action="store_true",
+        help="Multiply --advantage-field values by row frontier_weight.",
+    )
+    parser.add_argument(
         "--no-advantage-field-frontier-weight",
         dest="advantage_field_apply_frontier_weight",
         action="store_false",
         help="Do not multiply --advantage-field values by row frontier_weight.",
     )
-    parser.set_defaults(advantage_field_apply_frontier_weight=True)
+    parser.set_defaults(advantage_field_apply_frontier_weight=False)
     parser.add_argument("--positive-reward-threshold", type=float, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--device-map", default=None, help="Optional HF device_map, e.g. auto, for multi-GPU sharding.")
@@ -1198,6 +1222,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-parameterization", choices=["global", "layer-band", "parameter", "global-parameter"], default="global")
     parser.add_argument("--init-gate-checkpoint", default=None)
     args = parser.parse_args()
+    if args.advantage_field and args.advantage_field_apply_frontier_weight:
+        args.use_frontier_weight = True
     if not args.rollouts and not args.replay_buffer and not args.retention_only_replay_buffer:
         parser.error("at least one --rollouts, --replay-buffer, or --retention-only-replay-buffer input is required")
     if int(args.update_batch_size) < 1:
@@ -1330,12 +1356,37 @@ def _row_advantage_values(
             source = f"field:{args.advantage_field}"
         return values, source
     return (
-        group_relative_advantages(
+        _reward_advantages(
             rewards,
             frontier_weight=frontier_weight,
+            normalization=str(args.advantage_normalization),
             epsilon=float(config["loss"]["advantage_eps"]),
         ),
-        "group_relative_reward",
+        f"group_relative_reward:{args.advantage_normalization}",
+    )
+
+
+def _reward_advantages(
+    rewards: list[float],
+    *,
+    frontier_weight: float,
+    normalization: str,
+    epsilon: float,
+) -> list[float]:
+    if normalization == "zscore":
+        return group_relative_advantages(rewards, frontier_weight=frontier_weight, epsilon=epsilon)
+    if normalization != "centered":
+        raise ValueError(f"Unknown advantage normalization: {normalization}")
+    avg = _mean(rewards)
+    return [float(frontier_weight) * (float(value) - avg) for value in rewards]
+
+
+def _policy_frontier_multiplier(row: dict, config: dict, args: argparse.Namespace) -> float:
+    if not bool(args.use_frontier_weight):
+        return 1.0
+    return policy_frontier_weight(
+        row.get("frontier", {}),
+        min_reward_std=float(config["frontier"]["min_reward_std"]),
     )
 
 
@@ -1347,11 +1398,9 @@ def _advantage_task_scales(rows: list[dict], config: dict, args: argparse.Namesp
         samples = _objective_samples(row.get("samples", []), require_old_logprob=False)
         if len(samples) < 2:
             continue
-        rewards = [float(sample.get("reward", 0.0)) for sample in samples]
-        frontier_weight = policy_frontier_weight(
-            row.get("frontier", {}),
-            min_reward_std=float(config["frontier"]["min_reward_std"]),
-        )
+        task_name = str(row.get("task", ""))
+        rewards = [_sample_train_reward(sample, task=task_name) for sample in samples]
+        frontier_weight = _policy_frontier_multiplier(row, config, args)
         advantages, _ = _row_advantage_values(
             samples,
             rewards,
@@ -1387,6 +1436,17 @@ def _mean_abs(values) -> float:
 def _mean(values) -> float:
     items = [float(value) for value in values]
     return float(sum(items) / len(items)) if items else 0.0
+
+
+def _sample_train_reward(sample: dict, *, task: str | None = None) -> float:
+    if "reward_train" in sample:
+        return float(sample.get("reward_train", 0.0))
+    raw = float(sample.get("reward", 0.0))
+    details = sample.get("details") if isinstance(sample.get("details"), dict) else {}
+    score_range = details.get("toolrl_score_range") if isinstance(details, dict) else None
+    if task == "tool" or score_range == [-3.0, 4.0]:
+        return max(0.0, min((raw + 3.0) / 7.0, 1.0))
+    return max(0.0, min(raw, 1.0))
 
 
 def _parse_train_coefficients(items: list[str]) -> set[str]:
@@ -1428,6 +1488,7 @@ def _backward_incremental_best_response_losses(
     *,
     prompt_text: str,
     valid_samples: list[dict],
+    task: str | None,
     device: str,
     max_logprob_tokens: int,
     task_weight: float,
@@ -1439,7 +1500,7 @@ def _backward_incremental_best_response_losses(
     max_pairwise_pairs_per_row: int = 0,
     loss_scale: float = 1.0,
 ) -> dict[str, float]:
-    positives, negatives = _positive_and_negative_samples(valid_samples, positive_reward_threshold)
+    positives, negatives = _positive_and_negative_samples(valid_samples, positive_reward_threshold, task=task)
     if not positives:
         return {"processed": 0, "loss": 0.0, "best_response_loss": 0.0, "pairwise_loss": 0.0}
     processed = 0
@@ -1619,12 +1680,17 @@ def _backward_incremental_grpo_losses(
     }
 
 
-def _positive_and_negative_samples(samples: list[dict], positive_reward_threshold: float | None) -> tuple[list[dict], list[dict]]:
-    best_reward = max(float(sample.get("reward", 0.0)) for sample in samples)
+def _positive_and_negative_samples(
+    samples: list[dict],
+    positive_reward_threshold: float | None,
+    *,
+    task: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    best_reward = max(_sample_train_reward(sample, task=task) for sample in samples)
     threshold = best_reward - 1e-8 if positive_reward_threshold is None else float(positive_reward_threshold)
-    positives = [sample for sample in samples if float(sample.get("reward", 0.0)) >= threshold]
+    positives = [sample for sample in samples if _sample_train_reward(sample, task=task) >= threshold]
     negative_cutoff = best_reward if positive_reward_threshold is None else threshold
-    negatives = [sample for sample in samples if float(sample.get("reward", 0.0)) < negative_cutoff]
+    negatives = [sample for sample in samples if _sample_train_reward(sample, task=task) < negative_cutoff]
     return positives, negatives
 
 

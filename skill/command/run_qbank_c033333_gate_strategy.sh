@@ -38,6 +38,10 @@ Rollout / vLLM:
   TENSOR_PARALLEL_SIZE=1
   GPU_MEMORY_UTILIZATION=0.82
   MAX_NEW_TOKENS=1024
+  TOOL_MAX_NEW_TOKENS=512
+  CODE_MAX_NEW_TOKENS=4096
+  MEMORY_UPDATE_MAX_NEW_TOKENS=2048
+  MEMORY_FINAL_MAX_NEW_TOKENS=2048
   MAX_PROMPT_TOKENS=8192
   MAX_MODEL_LEN=12288
   MAX_LOGPROB_TOKENS=$MAX_MODEL_LEN
@@ -52,7 +56,9 @@ Update / objective:
   BATCH_LOSS_REDUCTION=mean|sum
   LOSS_GRANULARITY=token|sequence
   STORE_TOKEN_LOGPROBS=0|1|auto        recommended 0; avoids vLLM-old/HF-current mismatch
-  TASK_NORMALIZE_ADVANTAGES=0|1
+  TASK_NORMALIZE_ADVANTAGES=0|1          default 0; keep per-prompt GRPO normalization, do not rescale across tasks
+  ADVANTAGE_NORMALIZATION=centered|zscore default centered; centered subtracts row mean without dividing by row std
+  USE_FRONTIER_WEIGHT=0|1                default 0; keep frontier filtering but do not scale advantages by frontier weight
   LENGTH_NORMALIZE_POLICY_LOGPROB=0|1
   LENGTH_NORMALIZE_LOGPROB=0|1
   LR=                                  default depends on STRATEGY
@@ -72,6 +78,9 @@ Frontier / task balance:
   FRONTIER_MEMORY_QUOTA=32
   FRONTIER_CODE_QUOTA=32
   MAX_FRONTIER_ROWS_PER_TASK=
+  USE_RETENTION=0|1                   default 0; all-success rows become KL retention rows when enabled
+  RETENTION_LOSS_WEIGHT=              recommended 0.05 when USE_RETENTION=1
+  MAX_RETENTION_ROWS=                 recommended 64 when USE_RETENTION=1
   TASK_WEIGHT_TOOL=1.0
   TASK_WEIGHT_MEMORY=1.0
   TASK_WEIGHT_CODE=1.0
@@ -136,6 +145,10 @@ TASKS="${TASKS:-}"
 MEMORY_KIND="${MEMORY_KIND:-}"
 PROMPT_ID="${PROMPT_ID:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+TOOL_MAX_NEW_TOKENS="${TOOL_MAX_NEW_TOKENS:-512}"
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-4096}"
+MEMORY_UPDATE_MAX_NEW_TOKENS="${MEMORY_UPDATE_MAX_NEW_TOKENS:-2048}"
+MEMORY_FINAL_MAX_NEW_TOKENS="${MEMORY_FINAL_MAX_NEW_TOKENS:-2048}"
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-8192}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-12288}"
 MAX_LOGPROB_TOKENS="${MAX_LOGPROB_TOKENS:-$MAX_MODEL_LEN}"
@@ -153,22 +166,22 @@ SEED_VALUE="${SEED_VALUE:-20260512}"
 
 case "$STRATEGY" in
   global)
-    LR="${LR:-0.003}"
+    LR="${LR:-0.03}"
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.01}"
     MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.2}"
     ;;
   layer-band)
-    LR="${LR:-0.002}"
+    LR="${LR:-0.02}"
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
     MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.1}"
     ;;
   parameter)
-    LR="${LR:-0.001}"
+    LR="${LR:-0.01}"
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
     MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.1}"
     ;;
   global-parameter)
-    LR="${LR:-0.0015}"
+    LR="${LR:-0.015}"
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
     MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.1}"
     ;;
@@ -185,7 +198,9 @@ LOSS_GRANULARITY="${LOSS_GRANULARITY:-token}"
 FRONTIER_ORDER="${FRONTIER_ORDER:-task-interleaved}"
 FRONTIER_SHUFFLE_SEED="${FRONTIER_SHUFFLE_SEED:-}"
 STORE_TOKEN_LOGPROBS="${STORE_TOKEN_LOGPROBS:-0}"
-TASK_NORMALIZE_ADVANTAGES="${TASK_NORMALIZE_ADVANTAGES:-1}"
+TASK_NORMALIZE_ADVANTAGES="${TASK_NORMALIZE_ADVANTAGES:-0}"
+ADVANTAGE_NORMALIZATION="${ADVANTAGE_NORMALIZATION:-centered}"
+USE_FRONTIER_WEIGHT="${USE_FRONTIER_WEIGHT:-0}"
 LENGTH_NORMALIZE_POLICY_LOGPROB="${LENGTH_NORMALIZE_POLICY_LOGPROB:-1}"
 LENGTH_NORMALIZE_LOGPROB="${LENGTH_NORMALIZE_LOGPROB:-0}"
 PPO_LOSS_WEIGHT="${PPO_LOSS_WEIGHT:-1.0}"
@@ -199,11 +214,14 @@ FRONTIER_TOOL_QUOTA="${FRONTIER_TOOL_QUOTA:-32}"
 FRONTIER_MEMORY_QUOTA="${FRONTIER_MEMORY_QUOTA:-32}"
 FRONTIER_CODE_QUOTA="${FRONTIER_CODE_QUOTA:-32}"
 MAX_FRONTIER_ROWS_PER_TASK="${MAX_FRONTIER_ROWS_PER_TASK:-}"
+USE_RETENTION="${USE_RETENTION:-0}"
+RETENTION_LOSS_WEIGHT="${RETENTION_LOSS_WEIGHT:-}"
+MAX_RETENTION_ROWS="${MAX_RETENTION_ROWS:-}"
 TASK_WEIGHT_TOOL="${TASK_WEIGHT_TOOL:-1.0}"
 TASK_WEIGHT_MEMORY="${TASK_WEIGHT_MEMORY:-1.0}"
 TASK_WEIGHT_CODE="${TASK_WEIGHT_CODE:-1.0}"
 ADVANTAGE_FIELD="${ADVANTAGE_FIELD:-}"
-ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT="${ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT:-1}"
+ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT="${ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT:-0}"
 TRAIN_COEFFICIENTS="${TRAIN_COEFFICIENTS:-}"
 TOOL_MIN_MARGIN_OVER_MEMORY="${TOOL_MIN_MARGIN_OVER_MEMORY:-0.0}"
 TOOL_MIN_MARGIN_OVER_CODE="${TOOL_MIN_MARGIN_OVER_CODE:-0.0}"
@@ -234,6 +252,10 @@ esac
 case "$STORE_TOKEN_LOGPROBS" in
   0|1|true|false|yes|no|auto) ;;
   *) echo "[error] STORE_TOKEN_LOGPROBS must be 0, 1, true, false, yes, no, or auto; got $STORE_TOKEN_LOGPROBS" >&2; exit 2 ;;
+esac
+case "$ADVANTAGE_NORMALIZATION" in
+  centered|zscore) ;;
+  *) echo "[error] ADVANTAGE_NORMALIZATION must be centered or zscore, got $ADVANTAGE_NORMALIZATION" >&2; exit 2 ;;
 esac
 
 is_truthy() {
@@ -267,6 +289,10 @@ fi
 OBJECTIVE_ARGS=()
 if [[ "$TASK_NORMALIZE_ADVANTAGES" == "1" || "$TASK_NORMALIZE_ADVANTAGES" == "true" || "$TASK_NORMALIZE_ADVANTAGES" == "yes" ]]; then
   OBJECTIVE_ARGS+=(--task-normalize-advantages)
+fi
+OBJECTIVE_ARGS+=(--advantage-normalization "$ADVANTAGE_NORMALIZATION")
+if is_truthy "$USE_FRONTIER_WEIGHT"; then
+  OBJECTIVE_ARGS+=(--use-frontier-weight)
 fi
 if is_truthy "$LENGTH_NORMALIZE_LOGPROB"; then
   OBJECTIVE_ARGS+=(--length-normalize-logprob)
@@ -304,8 +330,20 @@ fi
 if [[ -n "$MAX_FRONTIER_ROWS_PER_TASK" ]]; then
   UPDATE_EXTRA_ARGS+=(--max-frontier-rows-per-task "$MAX_FRONTIER_ROWS_PER_TASK")
 fi
+if is_truthy "$USE_RETENTION"; then
+  UPDATE_EXTRA_ARGS+=(--use-retention)
+fi
+if [[ -n "$RETENTION_LOSS_WEIGHT" ]]; then
+  UPDATE_EXTRA_ARGS+=(--retention-loss-weight "$RETENTION_LOSS_WEIGHT")
+fi
+if [[ -n "$MAX_RETENTION_ROWS" ]]; then
+  UPDATE_EXTRA_ARGS+=(--max-retention-rows "$MAX_RETENTION_ROWS")
+fi
 if [[ -n "$ADVANTAGE_FIELD" ]]; then
   UPDATE_EXTRA_ARGS+=(--advantage-field "$ADVANTAGE_FIELD")
+  if is_truthy "$ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT"; then
+    UPDATE_EXTRA_ARGS+=(--advantage-field-frontier-weight)
+  fi
   if ! is_truthy "$ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT"; then
     UPDATE_EXTRA_ARGS+=(--no-advantage-field-frontier-weight)
   fi
@@ -356,8 +394,11 @@ echo "[run] run_dir=$RUN_DIR"
 echo "[run] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[run] lr=$LR prior=$PRIOR_LOSS_WEIGHT max_delta=$MAX_COEFF_DELTA"
 echo "[run] loss_granularity=$LOSS_GRANULARITY update_batch_size=$UPDATE_BATCH_SIZE store_token_logprobs=$STORE_TOKEN_LOGPROBS"
+echo "[run] task_normalize_advantages=$TASK_NORMALIZE_ADVANTAGES advantage_normalization=$ADVANTAGE_NORMALIZATION use_frontier_weight=$USE_FRONTIER_WEIGHT advantage_field_frontier_weight=$ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT"
 echo "[run] frontier_order=$FRONTIER_ORDER frontier_shuffle_seed=${FRONTIER_SHUFFLE_SEED:-auto}"
 echo "[run] task_weights=tool:$TASK_WEIGHT_TOOL,memory:$TASK_WEIGHT_MEMORY,code:$TASK_WEIGHT_CODE quotas=tool:$FRONTIER_TOOL_QUOTA,memory:$FRONTIER_MEMORY_QUOTA,code:$FRONTIER_CODE_QUOTA"
+echo "[run] retention=$USE_RETENTION retention_loss_weight=${RETENTION_LOSS_WEIGHT:-none} max_retention_rows=${MAX_RETENTION_ROWS:-none}"
+echo "[run] tokens=default:$MAX_NEW_TOKENS,tool:$TOOL_MAX_NEW_TOKENS,code:$CODE_MAX_NEW_TOKENS,memory_update:$MEMORY_UPDATE_MAX_NEW_TOKENS,memory_final:$MEMORY_FINAL_MAX_NEW_TOKENS"
 echo "[run] rollout_shards=$ROLLOUT_SHARDS rollout_gpus=$ROLLOUT_GPUS vllm_batch_size=$ROLLOUT_BATCH_SIZE"
 
 "$PY" scripts/modes/build_constant_gate_checkpoint.py \
@@ -381,6 +422,10 @@ echo "[run] rollout_shards=$ROLLOUT_SHARDS rollout_gpus=$ROLLOUT_GPUS vllm_batch
   --gate-parameterization "$STRATEGY" \
   --init-gate-checkpoint "$INIT_GATE" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
+  --tool-max-new-tokens "$TOOL_MAX_NEW_TOKENS" \
+  --code-max-new-tokens "$CODE_MAX_NEW_TOKENS" \
+  --memory-update-max-new-tokens "$MEMORY_UPDATE_MAX_NEW_TOKENS" \
+  --memory-final-max-new-tokens "$MEMORY_FINAL_MAX_NEW_TOKENS" \
   --max-prompt-tokens "$MAX_PROMPT_TOKENS" \
   --max-logprob-tokens "$MAX_LOGPROB_TOKENS" \
   --max-model-len "$MAX_MODEL_LEN" \

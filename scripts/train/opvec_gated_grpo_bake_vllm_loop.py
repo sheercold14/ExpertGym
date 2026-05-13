@@ -198,6 +198,14 @@ def _collect_command(
         "--progress-every",
         str(args.progress_every),
     ]
+    if args.tool_max_new_tokens is not None:
+        cmd += ["--tool-max-new-tokens", str(args.tool_max_new_tokens)]
+    if args.code_max_new_tokens is not None:
+        cmd += ["--code-max-new-tokens", str(args.code_max_new_tokens)]
+    if args.memory_update_max_new_tokens is not None:
+        cmd += ["--memory-update-max-new-tokens", str(args.memory_update_max_new_tokens)]
+    if args.memory_final_max_new_tokens is not None:
+        cmd += ["--memory-final-max-new-tokens", str(args.memory_final_max_new_tokens)]
     if prompt_offset:
         cmd += ["--prompt-offset", str(prompt_offset)]
     if args.seed_manifest:
@@ -378,6 +386,12 @@ def _update_command(
         cmd += ["--frontier-task-quota", item]
     if args.max_frontier_rows_per_task is not None:
         cmd += ["--max-frontier-rows-per-task", str(args.max_frontier_rows_per_task)]
+    if args.use_retention:
+        cmd.append("--use-retention")
+    if args.max_retention_rows is not None:
+        cmd += ["--max-retention-rows", str(args.max_retention_rows)]
+    if args.retention_loss_weight is not None:
+        cmd += ["--retention-loss-weight", str(args.retention_loss_weight)]
     if args.recompute_frontier:
         cmd.append("--recompute-frontier")
     if args.length_normalize_logprob:
@@ -386,8 +400,13 @@ def _update_command(
         cmd.append("--length-normalize-policy-logprob")
     if args.task_normalize_advantages:
         cmd.append("--task-normalize-advantages")
+    cmd += ["--advantage-normalization", args.advantage_normalization]
+    if args.use_frontier_weight:
+        cmd.append("--use-frontier-weight")
     if args.advantage_field:
         cmd += ["--advantage-field", args.advantage_field]
+        if args.advantage_field_apply_frontier_weight:
+            cmd.append("--advantage-field-frontier-weight")
         if not args.advantage_field_apply_frontier_weight:
             cmd.append("--no-advantage-field-frontier-weight")
     for item in args.train_coefficient or []:
@@ -563,6 +582,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-id", default=None)
     parser.add_argument("--use-manifest-order", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--tool-max-new-tokens", type=int, default=None)
+    parser.add_argument("--code-max-new-tokens", type=int, default=None)
+    parser.add_argument("--memory-update-max-new-tokens", type=int, default=None)
+    parser.add_argument("--memory-final-max-new-tokens", type=int, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=8192)
     parser.add_argument("--max-logprob-tokens", type=int, default=8192)
     parser.add_argument("--max-model-len", type=int, default=12288)
@@ -611,13 +634,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-weight", action="append", default=[])
     parser.add_argument("--frontier-task-quota", action="append", default=[])
     parser.add_argument("--max-frontier-rows-per-task", type=int, default=None)
+    parser.add_argument("--use-retention", action="store_true")
+    parser.add_argument("--max-retention-rows", type=int, default=None)
+    parser.add_argument("--retention-loss-weight", type=float, default=None)
     parser.add_argument("--recompute-frontier", action="store_true")
     parser.add_argument("--length-normalize-logprob", action="store_true")
     parser.add_argument("--length-normalize-policy-logprob", action="store_true")
     parser.add_argument("--task-normalize-advantages", action="store_true")
+    parser.add_argument("--advantage-normalization", choices=["centered", "zscore"], default="centered")
+    parser.add_argument("--use-frontier-weight", action="store_true")
     parser.add_argument("--advantage-field", default=None)
+    parser.add_argument("--advantage-field-frontier-weight", dest="advantage_field_apply_frontier_weight", action="store_true")
     parser.add_argument("--no-advantage-field-frontier-weight", dest="advantage_field_apply_frontier_weight", action="store_false")
-    parser.set_defaults(advantage_field_apply_frontier_weight=True)
+    parser.set_defaults(advantage_field_apply_frontier_weight=False)
     parser.add_argument("--train-coefficient", action="append", default=[])
     parser.add_argument("--tool-min-margin-over-memory", type=float, default=0.0)
     parser.add_argument("--tool-min-margin-over-code", type=float, default=0.0)

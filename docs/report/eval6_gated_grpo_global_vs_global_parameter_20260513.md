@@ -16,7 +16,7 @@
 | 模型 | Tool 平均 Acc | Memory 平均 F1 | Memory 平均 EM | Code 平均 Acc | Code BoN 平均 Acc | 状态 |
 |---|---:|---:|---:|---:|---:|---|
 | Global | 0.7952 | 0.6897 | 0.5566 | 0.3536 | 0.3978 | 完整 |
-| Global-Parameter | 0.7965 | 0.7029 | 0.5781 | - | - | Code 未完整 |
+| Global-Parameter | 0.7965 | 0.7029 | 0.5781 | 0.3345 | 0.3910 | 完整 |
 
 ## Tool/BFCL
 
@@ -44,23 +44,22 @@
 |---|---|---:|---:|---:|---:|---:|---:|
 | Global | LiveBench | 0.4004 | 0.5103 | 0.2892 | 0.3234 | 0.4453 | 0.5798 |
 | Global | LiveCodeBench | 0.3068 | 0.4578 | 0.3684 | 0.4006 | 0.3503 | 0.5191 |
-| Global-Parameter | LiveBench | 0.3770 | 0.4851 | 0.3660 | 0.4024 | 0.3828 | 0.5122 |
-| Global-Parameter | LiveCodeBench | - | - | - | - | - | - |
+| Global-Parameter | LiveBench | 0.3691 | 0.4944 | 0.3447 | 0.3823 | 0.4219 | 0.5573 |
+| Global-Parameter | LiveCodeBench | 0.2999 | 0.4570 | 0.4110 | 0.4309 | 0.3601 | 0.5312 |
 
 ## 未完成项
 
 | 项目 | 状态 | 证据 |
 |---|---|---|
-| Global-Parameter CURE full summary | 未生成 | 缺少 `eval6-code-cure-full/opvec_qbank_c033333_global_parameter_i20_20260513_010649/eval6-20260502-125748/summary.json` |
-| Global-Parameter LiveCodeBench | 未生成 | 结果目录仅有 `LiveBench.txt` |
+| 无 | 全部完成 | `Global` 与 `Global-Parameter` 均已生成 Tool、Memory、Code summary |
 
 ## 结论
 
-Global-Parameter 在 Tool 与 Memory 上略优于 Global；Global 的 Code/CURE 完整结果优于 Global-Parameter 当前已完成的 LiveBench 部分。Global-Parameter 的 Code 结果不完整，不能与 Global 做完整 Code 平均对比。
+Global-Parameter 在 Tool 与 Memory 上略优于 Global；Global 在 Code/CURE 上更好。两者完整对比后，Global-Parameter 的收益主要体现在 Tool/Memory，小幅牺牲 Code。
 
 ## 结果文件
 
 | 模型 | Tool | Memory | Code |
 |---|---|---|---|
 | Global | `eval-batch/eval6-20260502-125748/logs/opvec_qbank_c033333_global_i20_20260513_010649.bfcl.log` | `eval6-memory-hotpotqa/opvec_qbank_c033333_global_i20_20260513_010649/eval6-20260502-125748/summary.json` | `eval6-code-cure-full/opvec_qbank_c033333_global_i20_20260513_010649/eval6-20260502-125748/summary.json` |
-| Global-Parameter | `eval-batch/eval6-20260502-125748/logs/opvec_qbank_c033333_global_parameter_i20_20260513_010649.bfcl.log` | `eval6-memory-hotpotqa/opvec_qbank_c033333_global_parameter_i20_20260513_010649/eval6-20260502-125748/summary.json` | `eval6-code-cure-full/opvec_qbank_c033333_global_parameter_i20_20260513_010649/eval6-20260502-125748/results/LiveBench.txt` |
+| Global-Parameter | `eval-batch/eval6-20260502-125748/logs/opvec_qbank_c033333_global_parameter_i20_20260513_010649.bfcl.log` | `eval6-memory-hotpotqa/opvec_qbank_c033333_global_parameter_i20_20260513_010649/eval6-20260502-125748/summary.json` | `eval6-code-cure-full/opvec_qbank_c033333_global_parameter_i20_20260513_010649/eval6-20260502-125748/summary.json` |

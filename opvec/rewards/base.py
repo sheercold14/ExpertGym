@@ -10,6 +10,7 @@ from typing import Any, Protocol
 class RewardResult:
     reward: float
     task_reward: float
+    reward_train: float | None = None
     contract_reward: float = 0.0
     cost_penalty: float = 0.0
     success: bool = False
@@ -20,6 +21,7 @@ class RewardResult:
         return {
             "reward": float(self.reward),
             "task_reward": float(self.task_reward),
+            "reward_train": float(self.reward if self.reward_train is None else self.reward_train),
             "contract_reward": float(self.contract_reward),
             "cost_penalty": float(self.cost_penalty),
             "success": bool(self.success),

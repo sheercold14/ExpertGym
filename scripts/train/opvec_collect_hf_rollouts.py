@@ -634,6 +634,7 @@ def _uses_parameter_names(gate_parameterization: str) -> bool:
 
 def _apply_behavior_span_mix(scored: dict, *, behavior_span_weight: float) -> dict:
     weight = max(0.0, min(float(behavior_span_weight), 0.25))
+    train_reward = _clamp01(float(scored.get("reward_train", scored.get("task_reward", scored.get("reward", 0.0)))))
     if weight <= 0.0:
         details = dict(scored.get("details", {}))
         details["reward_definition"] = details.get("reward_definition", "official_task_reward")
@@ -643,20 +644,21 @@ def _apply_behavior_span_mix(scored: dict, *, behavior_span_weight: float) -> di
             **scored,
             "reward": float(scored.get("task_reward", scored.get("reward", 0.0))),
             "task_reward": float(scored.get("task_reward", scored.get("reward", 0.0))),
+            "reward_train": train_reward,
             "behavior_span_reward": details["behavior_span_reward"],
             "details": details,
         }
-    task_reward = _clamp01(float(scored.get("task_reward", scored.get("reward", 0.0))))
     span_reward = _behavior_span_reward(scored)
-    mixed = (1.0 - weight) * task_reward + weight * span_reward
+    mixed = (1.0 - weight) * train_reward + weight * span_reward
     details = dict(scored.get("details", {}))
-    details["reward_definition"] = "reward=(1-w)*task_reward+w*behavior_span_reward"
+    details["reward_definition"] = "reward_train=(1-w)*normalized_task_reward+w*behavior_span_reward"
     details["behavior_span_weight"] = weight
     details["behavior_span_reward"] = span_reward
     return {
         **scored,
         "reward": float(mixed),
-        "task_reward": task_reward,
+        "task_reward": float(scored.get("task_reward", scored.get("reward", 0.0))),
+        "reward_train": float(mixed),
         "behavior_span_reward": span_reward,
         "details": details,
     }

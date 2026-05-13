@@ -132,3 +132,126 @@
 
 - `skill/command/run_qbank_c033333_gate_strategy.sh`
   - Added `FRONTIER_ORDER` and `FRONTIER_SHUFFLE_SEED` environment overrides.
+
+## 2026-05-13 Per-Task Rollout Tokens And Task-Normalize Default
+
+Context:
+
+- Code/CURE alignment review showed that current Code rollout used the shared `MAX_NEW_TOKENS=1024`, while CURE official optimization/evaluation allows much longer code generations.
+- Cross-task `TASK_NORMALIZE_ADVANTAGES=1` can erase real differences in Tool/Memory/Code signal strength after each task's raw reward has already been put on a comparable scale.
+- We keep per-prompt GRPO normalization intact, but stop rescaling advantages across tasks by default in the qbank command.
+
+Changes:
+
+- `scripts/train/opvec_collect_vllm_rollouts.py`
+  - Added `--tool-max-new-tokens` and `--code-max-new-tokens`.
+  - Non-Memory rollout now selects `SamplingParams` by `prompt_record["task"]`.
+  - Memory continues to use `--memory-update-max-new-tokens` and `--memory-final-max-new-tokens`.
+  - Rollout summaries now record `max_new_tokens`, `tool_max_new_tokens`, and `code_max_new_tokens`.
+
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - Added passthrough for:
+    - `--tool-max-new-tokens`
+    - `--code-max-new-tokens`
+    - `--memory-update-max-new-tokens`
+    - `--memory-final-max-new-tokens`
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - Added environment overrides:
+    - `TOOL_MAX_NEW_TOKENS`, default `512`
+    - `CODE_MAX_NEW_TOKENS`, default `4096`
+    - `MEMORY_UPDATE_MAX_NEW_TOKENS`, default `2048`
+    - `MEMORY_FINAL_MAX_NEW_TOKENS`, default `2048`
+  - Kept `MAX_NEW_TOKENS=1024` as the generic fallback.
+  - Changed `TASK_NORMALIZE_ADVANTAGES` default from `1` to `0`.
+  - Added startup logging for per-task token limits.
+
+Recommended command shape:
+
+```bash
+STRATEGY=global \
+NUM_ITERS=20 \
+NUM_PROMPTS=100 \
+SAMPLES_PER_PROMPT=4 \
+TOOL_MAX_NEW_TOKENS=512 \
+CODE_MAX_NEW_TOKENS=4096 \
+MEMORY_UPDATE_MAX_NEW_TOKENS=2048 \
+MEMORY_FINAL_MAX_NEW_TOKENS=2048 \
+TASK_NORMALIZE_ADVANTAGES=0 \
+bash skill/command/run_qbank_c033333_gate_strategy.sh
+```
+
+Semantics:
+
+- `TASK_NORMALIZE_ADVANTAGES=0` does not disable GRPO's within-prompt advantage normalization.
+- It only disables the extra cross-task mean-absolute-advantage rescaling.
+- Tool, Memory, and Code reward should therefore be kept on comparable per-sample scales before GRPO.
+- If a future self-compare field such as `reward_delta_vs_baseline` is used, prefer:
+
+```bash
+ADVANTAGE_FIELD=reward_delta_vs_baseline \
+ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT=0 \
+TASK_NORMALIZE_ADVANTAGES=0
+```
+
+Validation:
+
+- `python -m py_compile scripts/train/opvec_collect_vllm_rollouts.py scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+- `bash -n skill/command/run_qbank_c033333_gate_strategy.sh`
+
+## 2026-05-13 KL Retention Control Launcher
+
+Context:
+
+- In qbank Gated-GRPO runs, Tool rows can quickly become all-success and then leave the GRPO frontier.
+- All-success rows have no group-relative reward gradient, but they are still useful as behavior-preservation data while Memory/Code frontier rows continue to move the shared gate.
+- This change keeps the original qbank launcher defaults unchanged and adds an explicit retention-control launcher for clean A/B comparison against the previous run.
+
+Changes:
+
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - Added passthrough arguments to the updater:
+    - `--use-retention`
+    - `--retention-loss-weight`
+    - `--max-retention-rows`
+  - These map directly to the existing retention implementation in `scripts/train/opvec_update_gates_from_rollouts.py`.
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - Added optional environment variables, all defaulting to no behavior change:
+    - `USE_RETENTION=0`
+    - `RETENTION_LOSS_WEIGHT=`
+    - `MAX_RETENTION_ROWS=`
+  - When enabled, the script forwards the corresponding retention arguments to the bake-vLLM loop.
+  - Existing task weights, learning rates, update epochs, frontier quotas, and rollout defaults are not changed.
+
+- `skill/command/run_qbank_c033333_gate_strategy_retention.sh`
+  - Added a small wrapper for A/B experiments.
+  - Defaults:
+    - `USE_RETENTION=1`
+    - `RETENTION_LOSS_WEIGHT=0.05`
+    - `MAX_RETENTION_ROWS=64`
+  - It delegates to `run_qbank_c033333_gate_strategy.sh`, so all other training parameters remain inherited from the base launcher unless explicitly overridden by the caller.
+
+Semantics:
+
+- Retention rows are all-success rollout rows.
+- They do not contribute GRPO reward-policy gradient.
+- They add a KL-to-old-policy preservation term:
+
+```text
+loss_retention = task_weight * retention_loss_weight * reverse_kl_surrogate(current_gate, rollout_gate)
+```
+
+- This is a local behavior-preservation constraint for the current iteration, not a fixed KL-to-base or KL-to-1/3 reference.
+
+Recommended initial coefficient:
+
+- Use `RETENTION_LOSS_WEIGHT=0.05` first.
+- Increase to `0.1` only if all-success Tool behavior still degrades while `retention_loss` remains small.
+- Avoid starting much larger than `0.1`, because retention should protect already-correct behavior without overwhelming Memory/Code frontier gradients.
+
+Validation:
+
+- `python -m py_compile scripts/train/opvec_gated_grpo_bake_vllm_loop.py scripts/train/opvec_update_gates_from_rollouts.py`
+- `bash -n skill/command/run_qbank_c033333_gate_strategy.sh`
+- `bash -n skill/command/run_qbank_c033333_gate_strategy_retention.sh`

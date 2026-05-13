@@ -51,6 +51,7 @@ class ToolRewardAdapter:
         return RewardResult(
             reward=score,
             task_reward=score,
+            reward_train=_tool_train_reward(score),
             contract_reward=0.1 if parseable else 0.0,
             success=success,
             details={
@@ -61,6 +62,7 @@ class ToolRewardAdapter:
                 "toolrl_correctness_raw": correctness_raw,
                 "toolrl_raw_total": score,
                 "toolrl_score_range": [-3.0, 4.0],
+                "reward_train_definition": "clip((toolrl_raw_total + 3) / 7, 0, 1)",
                 "parseable": parseable,
                 "prediction_calls": len(pred_calls),
                 "reference_calls": len(ref_calls),
@@ -215,6 +217,10 @@ def adapter_for_task(task: str):
     if task == "code":
         return CodeRewardAdapter()
     raise ValueError(f"Unknown task: {task}")
+
+
+def _tool_train_reward(raw_score: float) -> float:
+    return max(0.0, min((float(raw_score) + 3.0) / 7.0, 1.0))
 
 
 def _extract_tool_payloads_strict(text: str) -> list[dict[str, Any]]:

@@ -245,6 +245,9 @@ def _update_command(
         cmd.append("--length-normalize-policy-logprob")
     if args.task_normalize_advantages:
         cmd.append("--task-normalize-advantages")
+    cmd += ["--advantage-normalization", args.advantage_normalization]
+    if args.use_frontier_weight:
+        cmd.append("--use-frontier-weight")
     if args.positive_reward_threshold is not None:
         cmd += ["--positive-reward-threshold", str(args.positive_reward_threshold)]
     if args.max_coefficient_delta_from_init is not None:
@@ -343,6 +346,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--length-normalize-logprob", action="store_true")
     parser.add_argument("--length-normalize-policy-logprob", action="store_true")
     parser.add_argument("--task-normalize-advantages", action="store_true")
+    parser.add_argument("--advantage-normalization", choices=["centered", "zscore"], default="centered")
+    parser.add_argument("--use-frontier-weight", action="store_true")
     parser.add_argument("--positive-reward-threshold", type=float, default=None)
     parser.add_argument("--min-grad-norm-for-step", type=float, default=0.0)
     parser.add_argument("--max-coefficient-delta-from-init", type=float, default=0.20)

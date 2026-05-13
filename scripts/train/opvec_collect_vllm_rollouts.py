@@ -84,27 +84,14 @@ def collect_vllm_rollouts(config: dict, args: argparse.Namespace) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
-    sampling_params = SamplingParams(
-        max_tokens=int(args.max_new_tokens),
-        temperature=0.0 if args.greedy else float(args.temperature),
-        top_p=1.0 if args.greedy else float(args.top_p),
-        logprobs=1 if args.store_token_logprobs else None,
-        skip_special_tokens=True,
-    )
-    memory_update_sampling_params = SamplingParams(
-        max_tokens=int(args.memory_update_max_new_tokens or args.max_new_tokens),
-        temperature=0.0 if args.greedy else float(args.temperature),
-        top_p=1.0 if args.greedy else float(args.top_p),
-        logprobs=1 if args.store_token_logprobs else None,
-        skip_special_tokens=True,
-    )
-    memory_final_sampling_params = SamplingParams(
-        max_tokens=int(args.memory_final_max_new_tokens or args.max_new_tokens),
-        temperature=0.0 if args.greedy else float(args.temperature),
-        top_p=1.0 if args.greedy else float(args.top_p),
-        logprobs=1 if args.store_token_logprobs else None,
-        skip_special_tokens=True,
-    )
+    default_sampling_params = _sampling_params(args, int(args.max_new_tokens))
+    task_sampling_params = {
+        "default": default_sampling_params,
+        "tool": _sampling_params(args, int(args.tool_max_new_tokens or args.max_new_tokens)),
+        "code": _sampling_params(args, int(args.code_max_new_tokens or args.max_new_tokens)),
+    }
+    memory_update_sampling_params = _sampling_params(args, int(args.memory_update_max_new_tokens or args.max_new_tokens))
+    memory_final_sampling_params = _sampling_params(args, int(args.memory_final_max_new_tokens or args.max_new_tokens))
     llm = LLM(
         model=model_path,
         tokenizer=model_path,
@@ -130,7 +117,7 @@ def collect_vllm_rollouts(config: dict, args: argparse.Namespace) -> dict:
             row = collect_one_prompt_vllm(
                 llm=llm,
                 tokenizer=tokenizer,
-                sampling_params=sampling_params,
+                sampling_params_by_task=task_sampling_params,
                 memory_update_sampling_params=memory_update_sampling_params,
                 memory_final_sampling_params=memory_final_sampling_params,
                 router=router,
@@ -168,6 +155,9 @@ def collect_vllm_rollouts(config: dict, args: argparse.Namespace) -> dict:
         "greedy": bool(args.greedy),
         "temperature": float(args.temperature),
         "top_p": float(args.top_p),
+        "max_new_tokens": int(args.max_new_tokens),
+        "tool_max_new_tokens": int(args.tool_max_new_tokens or args.max_new_tokens),
+        "code_max_new_tokens": int(args.code_max_new_tokens or args.max_new_tokens),
         "seed": seed,
         "prompt_offset": int(args.prompt_offset),
         "policy_model": model_path,
@@ -206,7 +196,7 @@ def collect_one_prompt_vllm(
     *,
     llm,
     tokenizer,
-    sampling_params,
+    sampling_params_by_task,
     memory_update_sampling_params,
     memory_final_sampling_params,
     router: RewardRouter,
@@ -231,6 +221,8 @@ def collect_one_prompt_vllm(
             gate_values=gate_values,
             trajectory=trajectory,
         )
+    task = str(prompt_record.get("task") or "")
+    sampling_params = sampling_params_by_task.get(task, sampling_params_by_task["default"])
     prompt_text = render_chat_prompt(tokenizer, prompt_record.get("messages"), prompt_record.get("prompt", ""))
     prompt_ids = _prompt_token_ids(tokenizer, prompt_text, args.max_prompt_tokens)
     generated = _vllm_generate_samples(
@@ -575,6 +567,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-manifest-order", action="store_true", help="Use the manifest rows directly instead of task-balanced resampling.")
     parser.add_argument("--samples-per-prompt", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--tool-max-new-tokens", type=int, default=None)
+    parser.add_argument("--code-max-new-tokens", type=int, default=None)
     parser.add_argument("--memory-update-max-new-tokens", type=int, default=None)
     parser.add_argument("--memory-final-max-new-tokens", type=int, default=None)
     parser.add_argument("--max-prompt-tokens", type=int, default=8192)
@@ -593,6 +587,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-gate-values", action="store_true", help="Use when --policy-model is a static non-gated baseline.")
     parser.add_argument("--behavior-span-reward-weight", type=float, default=None)
     return parser.parse_args()
+
+
+def _sampling_params(args: argparse.Namespace, max_tokens: int):
+    from vllm import SamplingParams
+
+    return SamplingParams(
+        max_tokens=int(max_tokens),
+        temperature=0.0 if args.greedy else float(args.temperature),
+        top_p=1.0 if args.greedy else float(args.top_p),
+        logprobs=1 if args.store_token_logprobs else None,
+        skip_special_tokens=True,
+    )
 
 
 if __name__ == "__main__":
