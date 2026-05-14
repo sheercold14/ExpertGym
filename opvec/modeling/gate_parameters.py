@@ -237,6 +237,48 @@ class TorchParameterCoefficientManager:
         return getattr(self.module, name)
 
 
+class TorchGlobalCoefficientManager:
+    """nn.Module that learns exactly one direct coefficient per expert."""
+
+    def __init__(
+        self,
+        torch_module: Any,
+        init_values: Mapping[str, float],
+        *,
+        coefficient_bounds: tuple[float, float] = (-0.50, 1.50),
+    ):
+        nn = torch_module.nn
+        initial = _initial_global_coefficients(init_values)
+
+        class _Manager(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.raw_coefficients = nn.Parameter(torch_module.tensor(initial, dtype=torch_module.float32))
+                self.register_buffer(
+                    "initial_coefficients",
+                    torch_module.tensor(initial, dtype=torch_module.float32),
+                )
+
+            def effective_gates(self):
+                return {expert: self.raw_coefficients[index] for index, expert in enumerate(EXPERT_NAMES)}
+
+            def expert_coefficients(self, *, param_name: str | None = None):
+                return self.effective_gates()
+
+            def gate_values(self):
+                detached = self.raw_coefficients.detach().cpu()
+                return {expert: float(detached[index].item()) for index, expert in enumerate(EXPERT_NAMES)}
+
+            def project_(self):
+                with torch_module.no_grad():
+                    self.raw_coefficients.clamp_(float(coefficient_bounds[0]), float(coefficient_bounds[1]))
+
+        self.module = _Manager()
+
+    def __getattr__(self, name: str):
+        return getattr(self.module, name)
+
+
 class TorchGlobalParameterCoefficientManager:
     """Learn global expert strengths plus small parameter-specific residuals."""
 
@@ -392,6 +434,21 @@ def make_torch_gate_manager(
             config.get("gate_bounds", {}).get("common", (-0.50, 1.50)),
         )
     )
+    if parameterization in {
+        "global-coefficient",
+        "global_coefficient",
+        "global-coefficients",
+        "global_coefficients",
+        "global-direct",
+        "global_direct",
+        "expert-coefficient",
+        "expert_coefficient",
+    }:
+        return TorchGlobalCoefficientManager(
+            torch_module,
+            config.get("initial_gates", {}),
+            coefficient_bounds=coefficient_bounds,  # type: ignore[arg-type]
+        ).module
     if parameterization in {"parameter", "param", "param-coefficients", "parameter-coefficients"}:
         return TorchParameterCoefficientManager(
             torch_module,
@@ -461,6 +518,14 @@ def _initial_parameter_coefficients(init_values: Mapping[str, float], param_name
             row.append(float(init_values.get(f"{param_name}::{expert}", fallback[expert])))
         rows.append(row)
     return rows
+
+
+def _initial_global_coefficients(init_values: Mapping[str, float]) -> list[float]:
+    fallback = _fallback_expert_coefficients(init_values)
+    values = []
+    for expert in EXPERT_NAMES:
+        values.append(float(init_values.get(expert, init_values.get(f"global.{expert}", fallback[expert]))))
+    return values
 
 
 def _initial_global_parameter_coefficients(

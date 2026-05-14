@@ -50,12 +50,15 @@ def build_constant_gate_checkpoint(
     include_bias: bool = False,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     parameterization = normalize_parameterization(parameterization)
-    gates: dict[str, float] = {
-        "common": value,
-        "tool_residual": 0.0,
-        "memory_residual": 0.0,
-        "code_residual": 0.0,
-    }
+    if parameterization == "global-coefficient":
+        gates: dict[str, float] = {expert: value for expert in EXPERT_NAMES}
+    else:
+        gates = {
+            "common": value,
+            "tool_residual": 0.0,
+            "memory_residual": 0.0,
+            "code_residual": 0.0,
+        }
     param_names: list[str] = []
     band_names: list[str] = []
 
@@ -97,9 +100,16 @@ def normalize_parameterization(value: str) -> str:
         "global_param": "global-parameter",
         "global-residual": "global-parameter",
         "global_residual": "global-parameter",
+        "global_coefficient": "global-coefficient",
+        "global-coefficients": "global-coefficient",
+        "global_coefficients": "global-coefficient",
+        "global-direct": "global-coefficient",
+        "global_direct": "global-coefficient",
+        "expert-coefficient": "global-coefficient",
+        "expert_coefficient": "global-coefficient",
     }
     normalized = aliases.get(str(value), str(value))
-    if normalized not in {"global", "layer-band", "parameter", "global-parameter"}:
+    if normalized not in {"global", "layer-band", "parameter", "global-parameter", "global-coefficient"}:
         raise ValueError(f"Unknown gate parameterization: {value}")
     return normalized
 
@@ -120,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gate-parameterization",
         default="global",
-        choices=["global", "layer-band", "parameter", "global-parameter"],
+        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
     )
     parser.add_argument("--include-bias", action="store_true")
     return parser.parse_args()

@@ -41,6 +41,8 @@ class UpdateGatesObjectivesTest(unittest.TestCase):
             min_grad_norm_for_step=0.0,
             update_batch_size=2,
             batch_loss_reduction="mean",
+            optimizer_step_scope="batch",
+            loss_normalizer=2,
             train_coefficients=set(),
             coefficient_anchor_gates={},
             args=Namespace(
@@ -62,6 +64,53 @@ class UpdateGatesObjectivesTest(unittest.TestCase):
         self.assertEqual(log_rows[0]["optimizer_step_index"], 1)
         self.assertEqual(log_rows[1]["optimizer_step_index"], 1)
         self.assertAlmostEqual(log_rows[0]["batch_loss_scale"], 0.5, places=6)
+
+    def test_update_batcher_can_defer_optimizer_step_to_epoch(self):
+        class TinyGateManager(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+            def gate_values(self):
+                return {"weight": float(self.weight.detach().item())}
+
+            def project_(self):
+                pass
+
+        manager = TinyGateManager()
+        optimizer = torch.optim.SGD(manager.parameters(), lr=1.0)
+        batcher = update_gates_module._UpdateBatcher(
+            torch=torch,
+            optimizer=optimizer,
+            gate_manager=manager,
+            grad_clip_norm=10.0,
+            min_grad_norm_for_step=0.0,
+            update_batch_size=2,
+            batch_loss_reduction="mean",
+            optimizer_step_scope="epoch",
+            loss_normalizer=4,
+            train_coefficients=set(),
+            coefficient_anchor_gates={},
+            args=Namespace(
+                max_coefficient_delta_from_init=None,
+                tool_min_margin_over_memory=0.0,
+                tool_min_margin_over_code=0.0,
+            ),
+        )
+        log_rows = [{"prompt_id": str(idx)} for idx in range(4)]
+        for idx in range(4):
+            (manager.weight * batcher.loss_scale).backward()
+            batcher.add(log_rows, idx)
+        self.assertAlmostEqual(float(manager.weight.detach().item()), 1.0, places=6)
+        self.assertEqual(batcher.optimizer_steps, 0)
+
+        batcher.flush(log_rows, force=True)
+
+        self.assertAlmostEqual(float(manager.weight.detach().item()), 0.0, places=6)
+        self.assertEqual(batcher.optimizer_steps, 1)
+        self.assertAlmostEqual(log_rows[0]["batch_loss_scale"], 0.25, places=6)
+        self.assertEqual(log_rows[0]["optimizer_step_scope"], "epoch")
+        self.assertEqual(log_rows[-1]["optimizer_step_index"], 1)
 
     def test_pairwise_best_response_loss_pushes_positive_above_negative(self):
         positive = torch.tensor(-2.0, requires_grad=True)
@@ -424,6 +473,42 @@ class UpdateGatesObjectivesTest(unittest.TestCase):
             [(positive["sample_id"], negative["sample_id"]) for positive, negative in pairs],
             [("p_high", "n_low"), ("p_high", "n_mid")],
         )
+
+    def test_best_response_nll_gives_nonzero_gradient_for_success_sample(self):
+        original = update_gates_module._sample_response_logprob_tensor
+        logp = torch.tensor(0.5, requires_grad=True)
+
+        def fake_logprob(*args, **kwargs):
+            return logp
+
+        update_gates_module._sample_response_logprob_tensor = fake_logprob
+        try:
+            stats = update_gates_module._backward_incremental_best_response_losses(
+                torch,
+                model=None,
+                tokenizer=None,
+                prompt_text="prompt",
+                valid_samples=[
+                    {"sample_id": "ok", "text": "good", "reward_train": 1.0, "length": 4},
+                    {"sample_id": "bad", "text": "bad", "reward_train": 0.0, "length": 4},
+                ],
+                task="tool",
+                device="cpu",
+                max_logprob_tokens=32,
+                task_weight=1.0,
+                best_response_loss_weight=0.2,
+                pairwise_loss_weight=0.0,
+                pairwise_margin=0.0,
+                length_normalize=False,
+                positive_reward_threshold=1.0,
+                max_pairwise_pairs_per_row=0,
+                loss_scale=1.0,
+            )
+        finally:
+            update_gates_module._sample_response_logprob_tensor = original
+
+        self.assertEqual(stats["processed"], 1.0)
+        self.assertLess(float(logp.grad.item()), 0.0)
 
 
 if __name__ == "__main__":

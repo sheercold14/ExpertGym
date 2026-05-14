@@ -134,6 +134,39 @@ class GatedLinearTest(unittest.TestCase):
         self.assertIsNotNone(gates.raw_coefficients.grad)
         self.assertGreater(float(gates.raw_coefficients.grad[:, 0].abs().sum().item()), 0.0)
 
+    def test_global_coefficients_are_three_direct_trainable_values(self):
+        import torch
+
+        from opvec.modeling.gate_parameters import TorchGlobalCoefficientManager
+        from opvec.modeling.gated_linear import GatedLinear
+
+        base = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            base.weight.zero_()
+        deltas = {
+            "tool": torch.ones_like(base.weight),
+            "memory": torch.ones_like(base.weight) * 2.0,
+            "code": torch.ones_like(base.weight) * 3.0,
+        }
+        gates = TorchGlobalCoefficientManager(
+            torch,
+            {
+                "tool": 0.1,
+                "memory": 0.2,
+                "code": 0.3,
+            },
+        ).module
+        wrapped = GatedLinear(torch, base, deltas, gates).module
+
+        x = torch.ones(1, 1)
+        self.assertEqual(tuple(gates.raw_coefficients.shape), (3,))
+        self.assertAlmostEqual(float(wrapped(x).item()), 1.4, places=6)
+        self.assertEqual(set(gates.gate_values()), {"tool", "memory", "code"})
+
+        wrapped(x).sum().backward()
+        self.assertIsNotNone(gates.raw_coefficients.grad)
+        self.assertGreater(float(gates.raw_coefficients.grad.abs().sum().item()), 0.0)
+
     def test_global_parameter_coefficients_use_global_plus_residual(self):
         import torch
 

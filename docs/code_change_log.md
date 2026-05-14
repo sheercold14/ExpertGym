@@ -133,6 +133,53 @@
 - `skill/command/run_qbank_c033333_gate_strategy.sh`
   - Added `FRONTIER_ORDER` and `FRONTIER_SHUFFLE_SEED` environment overrides.
 
+## 2026-05-13 Epoch-Scope Gate Optimizer Step
+
+Context:
+
+- Direct global coefficient experiments showed that small mini-batch optimizer steps can be order-sensitive: early frontier rows pushed coefficients up, while later rows pulled them back after the gate had already moved.
+- We need a controlled mode where mini-batches are only gradient-accumulation chunks, and the gate is updated once from the whole selected frontier set.
+
+Changes:
+
+- `scripts/train/opvec_update_gates_from_rollouts.py`
+  - Added `--optimizer-step-scope {batch,epoch}`.
+  - `batch` preserves previous behavior: `optimizer.step()` after every `--update-batch-size` processed rows.
+  - `epoch` defers `optimizer.step()` until the end of each update epoch, so all frontier/retention/OPD rows contribute to one accumulated gradient.
+  - With `--batch-loss-reduction mean`, `epoch` scales each row by the planned epoch row count rather than by `update_batch_size`, so the result is independent of chunk size.
+  - Update logs and summaries now record `optimizer_step_scope` and `loss_normalizer`.
+
+- `scripts/train/opvec_gated_grpo_loop.py`
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - Added passthrough for `--optimizer-step-scope`.
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - Added `OPTIMIZER_STEP_SCOPE=batch|epoch`; default is `batch`.
+
+## 2026-05-14 Gate Optimizer Choice And Persistent State
+
+Context:
+
+- Epoch-scope accumulation fixes order-sensitive mini-batch updates, but a freshly initialized AdamW with one optimizer step per rollout iteration behaves like a sign step: each active coefficient moves by roughly `LR`.
+- To preserve gradient magnitude information and test more standard optimization dynamics, the gate updater needs optimizer choice and cross-iteration optimizer state.
+
+Changes:
+
+- `scripts/train/opvec_update_gates_from_rollouts.py`
+  - Added `--optimizer {adamw,sgd}`.
+  - Added `--sgd-momentum` and `--sgd-nesterov`.
+  - Added `--optimizer-state-in` and `--optimizer-state-out` for loading/saving `torch.optim` state dictionaries.
+  - Update summaries now record optimizer name, SGD settings, state in/out paths, and whether a state checkpoint was loaded.
+
+- `scripts/train/opvec_gated_grpo_loop.py`
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - Added passthrough for optimizer settings.
+  - Added `--persist-optimizer-state` so each outer rollout/update iteration saves `gate_updates.optimizer.pt` and reloads it in the next iteration.
+  - Added `--optimizer-state-checkpoint` for resuming from an existing optimizer state.
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - Added `OPTIMIZER`, `SGD_MOMENTUM`, `SGD_NESTEROV`, `PERSIST_OPTIMIZER_STATE`, and `OPTIMIZER_STATE_CHECKPOINT`.
+
 ## 2026-05-13 Per-Task Rollout Tokens And Task-Normalize Default
 
 Context:
@@ -255,3 +302,121 @@ Validation:
 - `python -m py_compile scripts/train/opvec_gated_grpo_bake_vllm_loop.py scripts/train/opvec_update_gates_from_rollouts.py`
 - `bash -n skill/command/run_qbank_c033333_gate_strategy.sh`
 - `bash -n skill/command/run_qbank_c033333_gate_strategy_retention.sh`
+
+## 2026-05-13 Global Direct Coefficient Summary Support
+
+Context:
+
+- The codebase already has `global-coefficient` / `global-direct` support in the gate manager and checkpoint builders.
+- This parameterization learns exactly three direct coefficients: `tool`, `memory`, and `code`, without `common + residual` decomposition.
+- The qbank launcher accepts `STRATEGY=global-coefficient`.
+
+Change:
+
+- `scripts/eval/summarize_gate_strategy_run.py`
+  - Fixed `_effective_coefficients()` so gate checkpoints containing direct keys `tool`, `memory`, `code` are summarized as three global expert coefficients.
+  - Without this, summaries would fall back to the legacy `common + *_residual` interpretation and report incorrect coefficient movement for `global-coefficient` runs.
+
+Validation:
+
+- `python -m py_compile scripts/eval/summarize_gate_strategy_run.py`
+
+## 2026-05-14 Dynamic OPD From Current All-Fail Prompts
+
+Context:
+
+- The fixed OPD buffer used by the previous paper96 runs was not restricted to the exact 96 prompts in the current calibration manifest.
+- For the next experiment, OPD should target only prompts that the current policy fails on in the current rollout, while reusing same-prompt expert trajectories.
+
+Changes:
+
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - Added per-iteration dynamic OPD construction.
+  - New args:
+    - `--dynamic-opd-expert-rollout`
+    - `--dynamic-opd-tasks`
+    - `--dynamic-opd-current-max-success`
+    - `--dynamic-opd-positive-threshold`
+    - `--dynamic-opd-max-positives-per-row`
+    - `--dynamic-opd-max-negatives-per-row`
+    - `--dynamic-opd-per-task`
+  - Each iteration now optionally builds:
+
+```text
+iter_xxx/opd_distill_from_allfail.jsonl
+```
+
+  - The update step reads the merged rollout plus this single per-iteration OPD file; it does not read shard files.
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - Added environment passthrough for dynamic OPD expert rollout paths and selection controls.
+
+- `skill/command/run_paper96_dynamic_opd_gc_20260514.sh`
+  - Added a reproducible launcher for the D experiment:
+    - 96 balanced prompts.
+    - `global-coefficient`.
+    - GPUs `2,3`.
+    - Offline expert rollouts over the same 96 prompts.
+    - Per-iteration OPD rows selected from current policy all-fail prompts.
+
+Validation:
+
+- `python -m py_compile scripts/train/opvec_gated_grpo_bake_vllm_loop.py scripts/data/build_opd_distill_from_expert_rollouts.py`
+- `bash -n skill/command/run_qbank_c033333_gate_strategy.sh skill/command/run_paper96_dynamic_opd_gc_20260514.sh`
+- `DRY_RUN=1` verified that the loop emits dynamic OPD builder commands before gate update.
+
+## 2026-05-14 Retention NLL Preservation
+
+Context:
+
+- Paper96 dynamic OPD ABCD showed that the legacy KL retention did not prevent Tool collapse.
+- Inspection found retention rows had `retention_loss=0.0` and `kl_loss=0.0` because epoch-scope updates compute KL before the optimizer step, when current policy equals the rollout policy.
+- For all-success rows, we need a preservation objective with non-zero gradient before the step.
+
+Changes:
+
+- `scripts/train/opvec_update_gates_from_rollouts.py`
+  - Added `--retention-objective {kl,nll}`.
+  - Legacy default remains `kl` for old run compatibility.
+  - `nll` mode applies best-response NLL to retention/all-success rows:
+
+```text
+L_retention_nll = - retention_loss_weight * mean log pi_gate(y_success | x)
+```
+
+  - Added `--retention-positive-reward-threshold`, default `1.0`.
+  - NLL retention no longer fills unused old logprobs for retention rows; KL retention still does.
+  - Summary now records `retention_objective` and `retention_positive_reward_threshold`.
+
+- `scripts/train/opvec_gated_grpo_loop.py`
+  - Passes `--retention-objective` and `--retention-positive-reward-threshold` through to the updater.
+
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - Same passthrough for the vLLM bake/rollout loop.
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - Added env controls:
+    - `RETENTION_OBJECTIVE=kl|nll`
+    - `RETENTION_POSITIVE_REWARD_THRESHOLD=1.0`
+  - Logs the active retention objective at launch.
+
+- `skill/command/run_paper96_dynamic_opd_nolen_abcd_20260514.sh`
+  - Protected B/D variants now use:
+
+```text
+USE_RETENTION=1
+RETENTION_OBJECTIVE=nll
+RETENTION_LOSS_WEIGHT=0.05
+RETENTION_POSITIVE_REWARD_THRESHOLD=1.0
+MAX_RETENTION_ROWS_PER_TASK=8
+MAX_RETENTION_ROWS=24
+```
+
+Validation:
+
+- `python -m py_compile scripts/train/opvec_update_gates_from_rollouts.py scripts/train/opvec_gated_grpo_loop.py scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+- `bash -n skill/command/run_qbank_c033333_gate_strategy.sh skill/command/run_paper96_dynamic_opd_nolen_abcd_20260514.sh`
+- `PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_update_gates_objectives.py`
+  - 18 tests passed.
+- `DRY_RUN=1 RUN_TAG=20260514_nll_dry NUM_ITERS=1 NUM_PROMPTS=2 SAMPLES_PER_PROMPT=2 bash skill/command/run_paper96_dynamic_opd_nolen_abcd_20260514.sh`
+  - Verified B/D update commands include `--use-retention --retention-objective nll`; protected variants now use `RETENTION_LOSS_WEIGHT=0.05`.

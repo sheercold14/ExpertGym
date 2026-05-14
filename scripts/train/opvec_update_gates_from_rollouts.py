@@ -46,12 +46,16 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         config = {**config, "initial_gates": load_gate_values(args.init_gate_checkpoint)}
     rows = []
     retention_rows = []
+    opd_rows = []
+    opd_all_success_rows = []
     for replay_path in args.replay_buffer or []:
         payload = json.loads(Path(replay_path).read_text(encoding="utf-8"))
         queues = payload.get("queues", {})
         rows.extend(queues.get(QUEUE_FRONTIER, []))
         if args.use_retention:
             retention_rows.extend(queues.get(QUEUE_RETENTION, []))
+        if args.use_opd_all_success:
+            opd_all_success_rows.extend(queues.get(QUEUE_RETENTION, []))
     for replay_path in args.retention_only_replay_buffer or []:
         payload = json.loads(Path(replay_path).read_text(encoding="utf-8"))
         queues = payload.get("queues", {})
@@ -60,6 +64,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
     raw_rows = []
     for rollout_path in args.rollouts or []:
         raw_rows.extend(read_jsonl(rollout_path))
+    for rollout_path in args.opd_distill_rollout or []:
+        opd_rows.extend(read_jsonl(rollout_path))
     for row in raw_rows:
         if args.recompute_frontier:
             queue, row = classify_rollout_row(
@@ -69,8 +75,13 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             )
             if args.use_retention and queue == QUEUE_RETENTION:
                 retention_rows.append(row)
-        elif args.use_retention and _is_retention_candidate(row):
-            retention_rows.append(row)
+            if args.use_opd_all_success and queue == QUEUE_RETENTION:
+                opd_all_success_rows.append(row)
+        elif _is_retention_candidate(row):
+            if args.use_retention:
+                retention_rows.append(row)
+            if args.use_opd_all_success:
+                opd_all_success_rows.append(row)
         if row.get("keep_for_policy_loss"):
             rows.append(row)
     raw_frontier_task_counts = _task_counts(rows)
@@ -89,10 +100,16 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         seed=_frontier_shuffle_seed(args),
     )
     frontier_task_counts = _task_counts(rows)
+    if args.max_retention_rows_per_task is not None:
+        retention_rows = _limit_rows_per_task(retention_rows, int(args.max_retention_rows_per_task))
     if args.max_retention_rows is not None:
         retention_rows = retention_rows[: args.max_retention_rows]
-    if not rows:
-        raise SystemExit("No kept frontier rows found in rollout/replay-buffer inputs")
+    if args.max_opd_distill_rows is not None:
+        opd_rows = opd_rows[: args.max_opd_distill_rows]
+    if args.max_opd_all_success_rows is not None:
+        opd_all_success_rows = opd_all_success_rows[: args.max_opd_all_success_rows]
+    if not rows and not opd_rows and not opd_all_success_rows and not (args.use_retention and retention_rows):
+        raise SystemExit("No kept frontier, retention, or OPD distill rows found in rollout/replay-buffer inputs")
     device = args.device
     dtype = getattr(torch, args.torch_dtype)
     tokenizer = AutoTokenizer.from_pretrained(config["models"]["base"], trust_remote_code=True)
@@ -143,7 +160,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             max_logprob_tokens=args.max_logprob_tokens,
             fill_token_logprobs=args.loss_granularity == "token",
         )
-        if args.use_retention and retention_rows:
+        if args.use_retention and retention_rows and args.retention_objective == "kl":
             filled_old_logprobs += _fill_missing_old_logprobs(
                 torch,
                 model,
@@ -158,7 +175,23 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
     weight_decay = float(
         args.weight_decay if args.weight_decay is not None else config["optimizer"].get("weight_decay", 0.0)
     )
-    optimizer = torch.optim.AdamW(gate_manager.parameters(), lr=float(args.lr or config["optimizer"]["lr"]), weight_decay=weight_decay)
+    optimizer = _make_optimizer(
+        torch,
+        gate_manager,
+        optimizer_name=str(args.optimizer),
+        lr=float(args.lr or config["optimizer"]["lr"]),
+        weight_decay=weight_decay,
+        sgd_momentum=float(args.sgd_momentum),
+        sgd_nesterov=bool(args.sgd_nesterov),
+    )
+    optimizer_state_loaded = False
+    if args.optimizer_state_in:
+        state_path = Path(args.optimizer_state_in)
+        if state_path.exists():
+            optimizer.load_state_dict(torch.load(state_path, map_location=device))
+            optimizer_state_loaded = True
+        else:
+            raise SystemExit(f"--optimizer-state-in not found: {state_path}")
     retention_weight = float(args.retention_loss_weight if args.retention_loss_weight is not None else config["loss"].get("lambda_retention", 0.0))
     prior_weight = float(args.prior_loss_weight if args.prior_loss_weight is not None else config["loss"].get("lambda_prior", 0.0))
     task_weights = _merged_float_mapping(config.get("calibration", {}).get("task_loss_weight", {}), args.task_weight)
@@ -182,6 +215,15 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         min_grad_norm_for_step=float(args.min_grad_norm_for_step),
         update_batch_size=int(args.update_batch_size),
         batch_loss_reduction=str(args.batch_loss_reduction),
+        optimizer_step_scope=str(args.optimizer_step_scope),
+        loss_normalizer=_planned_optimizer_loss_normalizer(
+            args=args,
+            frontier_rows=rows,
+            retention_rows=retention_rows,
+            opd_rows=opd_rows,
+            opd_all_success_rows=opd_all_success_rows,
+            retention_weight=retention_weight,
+        ),
         train_coefficients=train_coefficients,
         coefficient_anchor_gates=coefficient_anchor_gates,
         args=args,
@@ -461,44 +503,202 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             )
             update_batcher.add(log_rows, len(log_rows) - 1)
         update_batcher.flush(log_rows)
+        if opd_rows and (float(args.opd_loss_weight) != 0.0 or float(args.opd_pairwise_loss_weight) != 0.0):
+            for row in opd_rows:
+                prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+                valid_samples = _objective_samples(row.get("samples", []), require_old_logprob=False)
+                if len(valid_samples) < 2:
+                    continue
+                task_name = str(row.get("task", ""))
+                rewards = [_sample_train_reward(sample, task=task_name) for sample in valid_samples]
+                category = _row_category(row)
+                source = str(row.get("source") or "opd_distill")
+                source_weight = source_weights.get(source, 1.0)
+                task_weight = task_weights.get(str(row.get("task")), 1.0) * category_weights.get(category, 1.0) * source_weight
+                objective_stats = _backward_incremental_best_response_losses(
+                    torch,
+                    model,
+                    tokenizer,
+                    prompt_text=prompt_text,
+                    valid_samples=valid_samples,
+                    task=task_name,
+                    device=device,
+                    max_logprob_tokens=args.max_logprob_tokens,
+                    task_weight=task_weight,
+                    best_response_loss_weight=float(args.opd_loss_weight),
+                    pairwise_loss_weight=float(args.opd_pairwise_loss_weight),
+                    pairwise_margin=float(args.opd_pairwise_margin),
+                    length_normalize=bool(args.length_normalize_logprob),
+                    positive_reward_threshold=args.opd_positive_reward_threshold,
+                    max_pairwise_pairs_per_row=args.max_opd_pairwise_pairs_per_row,
+                    loss_scale=update_batcher.loss_scale,
+                )
+                if objective_stats["processed"] < 1:
+                    continue
+                prior_loss = _gate_prior_loss(torch, gate_manager) * prior_weight
+                (prior_loss * update_batcher.loss_scale).backward()
+                log_rows.append(
+                    {
+                        "step": step,
+                        "prompt_id": row.get("prompt_id", ""),
+                        "task": row.get("task", ""),
+                        "category": category,
+                        "source": source,
+                        "source_weight": source_weight,
+                        "task_weight": task_weight,
+                        "queue": "opd_distill",
+                        "loss": objective_stats["loss"] + float(prior_loss.detach().cpu().item()),
+                        "policy_loss": 0.0,
+                        "kl_loss": 0.0,
+                        "clip_frac": 0.0,
+                        "approx_kl": 0.0,
+                        "best_response_loss": objective_stats["best_response_loss"],
+                        "pairwise_loss": objective_stats["pairwise_loss"],
+                        "retention_loss": 0.0,
+                        "grad_norm": 0.0,
+                        "skipped_step": False,
+                        "mean_reward": sum(rewards) / len(rewards),
+                        "frontier_weight": 0.0,
+                        "reward_field": "reward_train",
+                        "opd_positive_reward_threshold": args.opd_positive_reward_threshold,
+                        "loss_granularity": "sequence",
+                        "gates": {},
+                    }
+                )
+                update_batcher.add(log_rows, len(log_rows) - 1)
+            update_batcher.flush(log_rows)
+        if args.use_opd_all_success and opd_all_success_rows and float(args.opd_all_success_loss_weight) != 0.0:
+            for row in opd_all_success_rows:
+                prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+                valid_samples = _objective_samples(row.get("samples", []), require_old_logprob=False)
+                if not valid_samples:
+                    continue
+                task_name = str(row.get("task", ""))
+                rewards = [_sample_train_reward(sample, task=task_name) for sample in valid_samples]
+                category = _row_category(row)
+                source = str(row.get("source") or "opd_all_success")
+                source_weight = source_weights.get(source, 1.0)
+                task_weight = task_weights.get(str(row.get("task")), 1.0) * category_weights.get(category, 1.0) * source_weight
+                objective_stats = _backward_incremental_best_response_losses(
+                    torch,
+                    model,
+                    tokenizer,
+                    prompt_text=prompt_text,
+                    valid_samples=valid_samples,
+                    task=task_name,
+                    device=device,
+                    max_logprob_tokens=args.max_logprob_tokens,
+                    task_weight=task_weight,
+                    best_response_loss_weight=float(args.opd_all_success_loss_weight),
+                    pairwise_loss_weight=0.0,
+                    pairwise_margin=0.0,
+                    length_normalize=bool(args.length_normalize_logprob),
+                    positive_reward_threshold=args.opd_all_success_positive_reward_threshold,
+                    max_pairwise_pairs_per_row=0,
+                    loss_scale=update_batcher.loss_scale,
+                )
+                if objective_stats["processed"] < 1:
+                    continue
+                prior_loss = _gate_prior_loss(torch, gate_manager) * prior_weight
+                (prior_loss * update_batcher.loss_scale).backward()
+                log_rows.append(
+                    {
+                        "step": step,
+                        "prompt_id": row.get("prompt_id", ""),
+                        "task": row.get("task", ""),
+                        "category": category,
+                        "source": source,
+                        "source_weight": source_weight,
+                        "task_weight": task_weight,
+                        "queue": "opd_all_success",
+                        "loss": objective_stats["loss"] + float(prior_loss.detach().cpu().item()),
+                        "policy_loss": 0.0,
+                        "kl_loss": 0.0,
+                        "clip_frac": 0.0,
+                        "approx_kl": 0.0,
+                        "best_response_loss": objective_stats["best_response_loss"],
+                        "pairwise_loss": 0.0,
+                        "retention_loss": 0.0,
+                        "grad_norm": 0.0,
+                        "skipped_step": False,
+                        "mean_reward": sum(rewards) / len(rewards),
+                        "frontier_weight": 0.0,
+                        "reward_field": "reward_train",
+                        "opd_positive_reward_threshold": args.opd_all_success_positive_reward_threshold,
+                        "loss_granularity": "sequence",
+                        "gates": {},
+                    }
+                )
+                update_batcher.add(log_rows, len(log_rows) - 1)
+            update_batcher.flush(log_rows)
         if args.use_retention and retention_weight > 0.0:
             for row in retention_rows:
                 prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
-                valid_samples = _objective_samples(row["samples"], require_old_logprob=True)
+                valid_samples = _objective_samples(row["samples"], require_old_logprob=args.retention_objective == "kl")
                 if not valid_samples:
                     continue
-                _validate_logprob_lengths(valid_samples, args.max_logprob_tokens)
-                retention_loss_total = 0.0
-                processed = 0
-                denominator = float(len(valid_samples))
+                if args.retention_objective == "kl":
+                    _validate_logprob_lengths(valid_samples, args.max_logprob_tokens)
                 task_name = str(row.get("task", ""))
                 rewards = [_sample_train_reward(sample, task=task_name) for sample in valid_samples]
                 category = _row_category(row)
                 source = str(row.get("source") or "")
                 source_weight = source_weights.get(source, 1.0)
                 task_weight = task_weights.get(str(row.get("task")), 1.0) * category_weights.get(category, 1.0) * source_weight
-                for sample in valid_samples:
-                    logp = _sample_response_logprob_tensor(
+                if args.retention_objective == "nll":
+                    objective_stats = _backward_incremental_best_response_losses(
                         torch,
                         model,
                         tokenizer,
                         prompt_text=prompt_text,
-                        sample=sample,
+                        valid_samples=valid_samples,
+                        task=task_name,
                         device=device,
-                        max_length=args.max_logprob_tokens,
+                        max_logprob_tokens=args.max_logprob_tokens,
+                        task_weight=task_weight,
+                        best_response_loss_weight=retention_weight,
+                        pairwise_loss_weight=0.0,
+                        pairwise_margin=0.0,
+                        length_normalize=bool(args.length_normalize_logprob),
+                        positive_reward_threshold=args.retention_positive_reward_threshold,
+                        max_pairwise_pairs_per_row=0,
+                        loss_scale=update_batcher.loss_scale,
                     )
-                    if logp is None:
+                    if objective_stats["processed"] < 1:
                         continue
-                    old_logp = torch.tensor(float(sample["old_logprob"]), dtype=torch.float32, device=device)
-                    current = logp.float()
-                    log_ratio = (old_logp - current).clamp(-20.0, 20.0)
-                    kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
-                    sample_loss = task_weight * retention_weight * kl_loss
-                    (sample_loss * update_batcher.loss_scale).backward()
-                    retention_loss_total += float(sample_loss.detach().cpu().item())
-                    processed += 1
-                if processed < 1:
-                    continue
+                    retention_loss_total = objective_stats["loss"]
+                    kl_loss_total = 0.0
+                    best_response_loss_total = objective_stats["best_response_loss"]
+                else:
+                    retention_loss_total = 0.0
+                    kl_loss_total = 0.0
+                    processed = 0
+                    denominator = float(len(valid_samples))
+                    for sample in valid_samples:
+                        logp = _sample_response_logprob_tensor(
+                            torch,
+                            model,
+                            tokenizer,
+                            prompt_text=prompt_text,
+                            sample=sample,
+                            device=device,
+                            max_length=args.max_logprob_tokens,
+                        )
+                        if logp is None:
+                            continue
+                        old_logp = torch.tensor(float(sample["old_logprob"]), dtype=torch.float32, device=device)
+                        current = logp.float()
+                        log_ratio = (old_logp - current).clamp(-20.0, 20.0)
+                        kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
+                        sample_loss = task_weight * retention_weight * kl_loss
+                        (sample_loss * update_batcher.loss_scale).backward()
+                        value = float(sample_loss.detach().cpu().item())
+                        retention_loss_total += value
+                        kl_loss_total += value / retention_weight if retention_weight else 0.0
+                        processed += 1
+                    if processed < 1:
+                        continue
+                    best_response_loss_total = 0.0
                 log_rows.append(
                     {
                         "step": step,
@@ -511,10 +711,14 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "queue": "retention",
                         "loss": retention_loss_total,
                         "policy_loss": 0.0,
-                        "kl_loss": retention_loss_total / retention_weight if retention_weight else 0.0,
+                        "kl_loss": kl_loss_total,
                         "clip_frac": 0.0,
                         "approx_kl": 0.0,
+                        "best_response_loss": best_response_loss_total,
+                        "pairwise_loss": 0.0,
                         "retention_loss": retention_loss_total,
+                        "retention_objective": args.retention_objective,
+                        "retention_positive_reward_threshold": args.retention_positive_reward_threshold,
                         "grad_norm": 0.0,
                         "skipped_step": False,
                         "mean_reward": sum(rewards) / len(rewards),
@@ -524,6 +728,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                 )
                 update_batcher.add(log_rows, len(log_rows) - 1)
             update_batcher.flush(log_rows)
+        update_batcher.flush(log_rows, force=True)
         epoch_rows = log_rows[epoch_log_start:]
         epoch_end_gates = gate_manager.gate_values()
         epoch_grad_max = max((float(item.get("grad_norm", 0.0)) for item in epoch_rows), default=0.0)
@@ -559,6 +764,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         "rollouts": list(args.rollouts),
         "replay_buffers": list(args.replay_buffer or []),
         "retention_only_replay_buffers": list(args.retention_only_replay_buffer or []),
+        "opd_distill_rollouts": list(args.opd_distill_rollout or []),
         "output": str(output),
         "kept_frontier_rows": len(rows),
         "raw_frontier_task_counts": raw_frontier_task_counts,
@@ -568,6 +774,10 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "seed": _frontier_shuffle_seed(args),
         },
         "retention_rows": len(retention_rows),
+        "opd_distill_rows": len(opd_rows),
+        "opd_distill_task_counts": _task_counts(opd_rows),
+        "opd_all_success_rows": len(opd_all_success_rows),
+        "opd_all_success_task_counts": _task_counts(opd_all_success_rows),
         "updates": len(log_rows),
         "optimizer_steps": update_batcher.optimizer_steps,
         "skipped_optimizer_steps": update_batcher.skipped_optimizer_steps,
@@ -582,12 +792,20 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         "epoch_summaries": epoch_summaries,
         "stopped_early_at_step": stopped_early_at_step,
         "optimizer": {
+            "name": str(args.optimizer),
             "lr": float(args.lr or config["optimizer"]["lr"]),
             "weight_decay": weight_decay,
+            "sgd_momentum": float(args.sgd_momentum),
+            "sgd_nesterov": bool(args.sgd_nesterov),
+            "optimizer_state_in": args.optimizer_state_in,
+            "optimizer_state_loaded": optimizer_state_loaded,
+            "optimizer_state_out": args.optimizer_state_out,
             "prior_loss_weight": prior_weight,
             "min_grad_norm_for_step": float(args.min_grad_norm_for_step),
             "update_batch_size": int(args.update_batch_size),
             "batch_loss_reduction": str(args.batch_loss_reduction),
+            "optimizer_step_scope": str(args.optimizer_step_scope),
+            "loss_normalizer": update_batcher.loss_normalizer,
             "loss_granularity": str(args.loss_granularity),
             "max_coefficient_delta_from_init": args.max_coefficient_delta_from_init,
             "early_stop_grad_norm": args.early_stop_grad_norm,
@@ -617,6 +835,15 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "pairwise": float(args.pairwise_loss_weight),
             "pairwise_margin": float(args.pairwise_margin),
             "max_pairwise_pairs_per_row": int(args.max_pairwise_pairs_per_row),
+            "opd": float(args.opd_loss_weight),
+            "opd_pairwise": float(args.opd_pairwise_loss_weight),
+            "opd_pairwise_margin": float(args.opd_pairwise_margin),
+            "max_opd_pairwise_pairs_per_row": int(args.max_opd_pairwise_pairs_per_row),
+            "opd_positive_reward_threshold": args.opd_positive_reward_threshold,
+            "retention_objective": str(args.retention_objective),
+            "retention_positive_reward_threshold": args.retention_positive_reward_threshold,
+            "opd_all_success": float(args.opd_all_success_loss_weight),
+            "opd_all_success_positive_reward_threshold": args.opd_all_success_positive_reward_threshold,
             "length_normalize_logprob": bool(args.length_normalize_logprob),
             "length_normalize_policy_logprob": bool(args.length_normalize_policy_logprob),
             "positive_reward_threshold": args.positive_reward_threshold,
@@ -624,6 +851,10 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
     }
     write_json(output.with_suffix(".summary.json"), summary)
     write_json(output.with_suffix(".gates.json"), {"gates": summary["final_gates"]})
+    if args.optimizer_state_out:
+        state_out = Path(args.optimizer_state_out)
+        state_out.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(optimizer.state_dict(), state_out)
     return summary
 
 
@@ -965,6 +1196,13 @@ def _normalize_gate_parameterization(value: str) -> str:
         "global_param": "global-parameter",
         "global-residual": "global-parameter",
         "global_residual": "global-parameter",
+        "global_coefficient": "global-coefficient",
+        "global-coefficients": "global-coefficient",
+        "global_coefficients": "global-coefficient",
+        "global-direct": "global-coefficient",
+        "global_direct": "global-coefficient",
+        "expert-coefficient": "global-coefficient",
+        "expert_coefficient": "global-coefficient",
     }
     return aliases.get(str(value), str(value))
 
@@ -977,8 +1215,52 @@ def _gate_prior_loss(torch, gate_manager):
     return gate_initialization_prior(torch, gate_manager)
 
 
+def _make_optimizer(
+    torch,
+    gate_manager,
+    *,
+    optimizer_name: str,
+    lr: float,
+    weight_decay: float,
+    sgd_momentum: float,
+    sgd_nesterov: bool,
+):
+    params = gate_manager.parameters()
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+    if optimizer_name == "sgd":
+        return torch.optim.SGD(
+            params,
+            lr=float(lr),
+            momentum=float(sgd_momentum),
+            weight_decay=float(weight_decay),
+            nesterov=bool(sgd_nesterov),
+        )
+    raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+
+def _planned_optimizer_loss_normalizer(
+    *,
+    args: argparse.Namespace,
+    frontier_rows: list[dict],
+    retention_rows: list[dict],
+    opd_rows: list[dict],
+    opd_all_success_rows: list[dict],
+    retention_weight: float,
+) -> int:
+    """Planned row count for epoch-scope mean loss scaling."""
+    count = len(frontier_rows)
+    if args.use_retention and retention_weight > 0.0:
+        count += len(retention_rows)
+    if float(args.opd_loss_weight) != 0.0 or float(args.opd_pairwise_loss_weight) != 0.0:
+        count += len(opd_rows)
+    if args.use_opd_all_success and float(args.opd_all_success_loss_weight) != 0.0:
+        count += len(opd_all_success_rows)
+    return max(1, int(count))
+
+
 class _UpdateBatcher:
-    """Accumulate row-level losses and apply one optimizer step per mini-batch."""
+    """Accumulate row-level losses and apply optimizer steps at batch or epoch scope."""
 
     def __init__(
         self,
@@ -990,6 +1272,8 @@ class _UpdateBatcher:
         min_grad_norm_for_step: float,
         update_batch_size: int,
         batch_loss_reduction: str,
+        optimizer_step_scope: str,
+        loss_normalizer: int,
         train_coefficients: set[str],
         coefficient_anchor_gates: dict[str, float],
         args: argparse.Namespace,
@@ -1001,6 +1285,8 @@ class _UpdateBatcher:
         self.min_grad_norm_for_step = float(min_grad_norm_for_step)
         self.update_batch_size = max(1, int(update_batch_size))
         self.batch_loss_reduction = str(batch_loss_reduction)
+        self.optimizer_step_scope = str(optimizer_step_scope)
+        self.loss_normalizer = max(1, int(loss_normalizer))
         self.train_coefficients = train_coefficients
         self.coefficient_anchor_gates = coefficient_anchor_gates
         self.args = args
@@ -1013,6 +1299,8 @@ class _UpdateBatcher:
     def loss_scale(self) -> float:
         if self.batch_loss_reduction == "sum":
             return 1.0
+        if self.optimizer_step_scope == "epoch":
+            return 1.0 / float(self.loss_normalizer)
         return 1.0 / float(self.update_batch_size)
 
     @property
@@ -1021,11 +1309,13 @@ class _UpdateBatcher:
 
     def add(self, log_rows: list[dict], log_index: int) -> None:
         self.pending_log_indices.append(int(log_index))
-        if self.pending >= self.update_batch_size:
+        if self.optimizer_step_scope == "batch" and self.pending >= self.update_batch_size:
             self.flush(log_rows)
 
-    def flush(self, log_rows: list[dict]) -> None:
+    def flush(self, log_rows: list[dict], *, force: bool = False) -> None:
         if not self.pending_log_indices:
+            return
+        if self.optimizer_step_scope == "epoch" and not force:
             return
         grad_norm = self.torch.nn.utils.clip_grad_norm_(self.gate_manager.parameters(), self.grad_clip_norm)
         grad_norm_value = float(grad_norm.detach().cpu().item())
@@ -1051,6 +1341,8 @@ class _UpdateBatcher:
             log_rows[index]["update_batch_size"] = self.update_batch_size
             log_rows[index]["batch_loss_reduction"] = self.batch_loss_reduction
             log_rows[index]["batch_loss_scale"] = self.loss_scale
+            log_rows[index]["optimizer_step_scope"] = self.optimizer_step_scope
+            log_rows[index]["loss_normalizer"] = self.loss_normalizer
         self.pending_log_indices.clear()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1065,6 +1357,15 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Replay buffer whose frontier and retention queues are used only for KL retention.",
+    )
+    parser.add_argument(
+        "--opd-distill-rollout",
+        action="append",
+        default=[],
+        help=(
+            "JSONL rows containing same-prompt expert positives and current-policy negatives for "
+            "on-policy distillation. Default unused."
+        ),
     )
     parser.add_argument("--mode-manifest", required=True)
     parser.add_argument("--output", required=True)
@@ -1083,7 +1384,21 @@ def parse_args() -> argparse.Namespace:
         "--batch-loss-reduction",
         choices=["mean", "sum"],
         default="mean",
-        help="Scale accumulated row losses by 1/update_batch_size for mean, or leave them unscaled for sum.",
+        help=(
+            "Scale accumulated row losses for mean reduction, or leave them unscaled for sum. "
+            "With optimizer-step-scope=batch, mean uses 1/update_batch_size; with epoch, mean uses "
+            "the planned number of rows in that epoch."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer-step-scope",
+        choices=["batch", "epoch"],
+        default="batch",
+        help=(
+            "batch applies optimizer.step() every update_batch_size rows. "
+            "epoch keeps mini-batches as gradient-accumulation chunks and applies one optimizer.step() "
+            "after all rows in an update epoch."
+        ),
     )
     parser.add_argument(
         "--loss-granularity",
@@ -1102,6 +1417,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--recompute-frontier", action="store_true")
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument("--sgd-momentum", type=float, default=0.0)
+    parser.add_argument("--sgd-nesterov", action="store_true")
+    parser.add_argument(
+        "--optimizer-state-in",
+        default=None,
+        help="Optional torch optimizer state_dict to restore before gate updates.",
+    )
+    parser.add_argument(
+        "--optimizer-state-out",
+        default=None,
+        help="Optional path where the updated torch optimizer state_dict is saved.",
+    )
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--prior-loss-weight", type=float, default=None)
     parser.add_argument("--min-grad-norm-for-step", type=float, default=0.0)
@@ -1113,7 +1441,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-retention", action="store_true")
     parser.add_argument("--max-retention-rows", type=int, default=None)
+    parser.add_argument("--max-retention-rows-per-task", type=int, default=None)
     parser.add_argument("--retention-loss-weight", type=float, default=None)
+    parser.add_argument(
+        "--retention-objective",
+        choices=["kl", "nll"],
+        default="kl",
+        help=(
+            "Objective for --use-retention rows. kl preserves old-policy logprob; "
+            "nll applies all-success best-response NLL so preservation has non-zero "
+            "gradient even before the optimizer step."
+        ),
+    )
+    parser.add_argument(
+        "--retention-positive-reward-threshold",
+        type=float,
+        default=1.0,
+        help="Positive reward_train threshold for --retention-objective nll. Default 1.0 preserves fully correct rows.",
+    )
+    parser.add_argument("--max-opd-distill-rows", type=int, default=None)
+    parser.add_argument(
+        "--use-opd-all-success",
+        action="store_true",
+        help="Add auxiliary OPD best-response loss on all-success rows that GRPO would otherwise skip.",
+    )
+    parser.add_argument("--opd-all-success-loss-weight", type=float, default=0.0)
+    parser.add_argument("--max-opd-all-success-rows", type=int, default=None)
     parser.add_argument("--early-stop-grad-norm", type=float, default=None)
     parser.add_argument("--early-stop-gate-delta", type=float, default=None)
     parser.add_argument("--early-stop-patience", type=int, default=1)
@@ -1169,6 +1522,25 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Cap best-response pairwise comparisons per frontier row; 0 keeps all positive-negative pairs.",
     )
+    parser.add_argument(
+        "--opd-loss-weight",
+        type=float,
+        default=0.0,
+        help="Sequence best-response loss weight for --opd-distill-rollout rows. Default 0 disables OPD.",
+    )
+    parser.add_argument(
+        "--opd-pairwise-loss-weight",
+        type=float,
+        default=0.0,
+        help="Pairwise expert-positive versus current-negative loss weight for OPD rows. Default 0 disables it.",
+    )
+    parser.add_argument("--opd-pairwise-margin", type=float, default=0.0)
+    parser.add_argument(
+        "--max-opd-pairwise-pairs-per-row",
+        type=int,
+        default=0,
+        help="Cap OPD pairwise comparisons per row; 0 keeps all positive-negative pairs.",
+    )
     parser.add_argument("--length-normalize-logprob", action="store_true")
     parser.add_argument(
         "--length-normalize-policy-logprob",
@@ -1214,18 +1586,42 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(advantage_field_apply_frontier_weight=False)
     parser.add_argument("--positive-reward-threshold", type=float, default=None)
+    parser.add_argument(
+        "--opd-positive-reward-threshold",
+        type=float,
+        default=None,
+        help="Positive threshold for OPD rows. Default uses the best reward_train in each OPD row.",
+    )
+    parser.add_argument(
+        "--opd-all-success-positive-reward-threshold",
+        type=float,
+        default=1.0,
+        help="Positive threshold for all-success OPD rows. Default 1.0 uses fully correct samples only.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--device-map", default=None, help="Optional HF device_map, e.g. auto, for multi-GPU sharding.")
     parser.add_argument("--max-memory", action="append", default=[], help="HF max_memory entry, e.g. 0=70GiB. Repeatable.")
     parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable HF gradient checkpointing during gate updates.")
     parser.add_argument("--torch-dtype", default="bfloat16")
-    parser.add_argument("--gate-parameterization", choices=["global", "layer-band", "parameter", "global-parameter"], default="global")
+    parser.add_argument(
+        "--gate-parameterization",
+        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        default="global",
+    )
     parser.add_argument("--init-gate-checkpoint", default=None)
     args = parser.parse_args()
     if args.advantage_field and args.advantage_field_apply_frontier_weight:
         args.use_frontier_weight = True
-    if not args.rollouts and not args.replay_buffer and not args.retention_only_replay_buffer:
-        parser.error("at least one --rollouts, --replay-buffer, or --retention-only-replay-buffer input is required")
+    if (
+        not args.rollouts
+        and not args.replay_buffer
+        and not args.retention_only_replay_buffer
+        and not args.opd_distill_rollout
+    ):
+        parser.error(
+            "at least one --rollouts, --replay-buffer, --retention-only-replay-buffer, "
+            "or --opd-distill-rollout input is required"
+        )
     if int(args.update_batch_size) < 1:
         parser.error("--update-batch-size must be >= 1")
     return args
@@ -1296,6 +1692,20 @@ def _limit_frontier_rows(
         else:
             selected_by_task[task] = {id(row) for row in task_rows[: int(limit)]}
     return [row for row in rows if id(row) in selected_by_task.get(str(row.get("task")), set())]
+
+
+def _limit_rows_per_task(rows: list[dict], max_per_task: int) -> list[dict]:
+    if max_per_task < 0:
+        return rows
+    counts: Counter[str] = Counter()
+    selected = []
+    for row in rows:
+        task = str(row.get("task"))
+        if counts[task] >= max_per_task:
+            continue
+        selected.append(row)
+        counts[task] += 1
+    return selected
 
 
 def _frontier_shuffle_seed(args: argparse.Namespace) -> int:

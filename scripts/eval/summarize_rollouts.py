@@ -51,9 +51,9 @@ def summarize_rollouts(paths: list[str]) -> dict[str, Any]:
             if not isinstance(sample, dict):
                 continue
             acc["samples"] += 1
-            reward = _as_float(sample.get("reward"), default=0.0)
+            reward = _train_reward(sample)
             acc["rewards"].append(reward)
-            acc["successes"] += int(bool(sample.get("success")) or reward > 0.0)
+            acc["successes"] += int(bool(sample.get("success", reward > 0.5)))
             length = _as_float(sample.get("length"), default=0.0)
             if length > 0:
                 acc["lengths"].append(length)
@@ -164,6 +164,16 @@ def _as_float(value: Any, *, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _train_reward(sample: dict[str, Any]) -> float:
+    if "reward_train" in sample:
+        return _as_float(sample.get("reward_train"), default=0.0)
+    raw = _as_float(sample.get("reward"), default=0.0)
+    details = sample.get("details") if isinstance(sample.get("details"), dict) else {}
+    if details.get("toolrl_score_range") == [-3.0, 4.0]:
+        return max(0.0, min((raw + 3.0) / 7.0, 1.0))
+    return max(0.0, min(raw, 1.0))
 
 
 def parse_args() -> argparse.Namespace:

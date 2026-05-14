@@ -1,0 +1,202 @@
+{
+  "created_at": "2026-05-14T15:53:01.746062+00:00",
+  "eval": {
+    "enabled": true,
+    "eval_gpus": "2,3,4,5",
+    "eval_runner": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_bal15_balanced_w3_ret05_i15_v1_addons.py",
+    "eval_session": "eval_bal15_balanced_w3_ret05_i15_v1",
+    "work_root": "/tmp/shared-storage/AgentMerging_plan/evaluation_workdirs/eval6-20260502-125748-bal15-balanced-w3-ret05-i15-v1"
+  },
+  "expected_iters": 15,
+  "format": "opvec_balanced_experiment_supervisor_v1",
+  "runs": [
+    {
+      "best_validated": {
+        "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_A_gc_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+        "balanced_score": 0.36448529211364034,
+        "iteration": 1,
+        "overall_reward": 0.3817692934545613,
+        "task_reward": {
+          "code": 0.388671875,
+          "memory": 0.34375,
+          "tool": 0.4128860053636839
+        }
+      },
+      "collapse": {
+        "triggered": false
+      },
+      "label": "A_gc",
+      "latest_iteration": 1,
+      "metrics": [
+        {
+          "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_A_gc_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+          "frontier_task_counts": null,
+          "gate_checkpoint": null,
+          "gate_delta_max": null,
+          "grad_norm_max": null,
+          "has_update": false,
+          "iteration": 1,
+          "kept_frontiers": null,
+          "opd_distill_rows": null,
+          "overall_reward": 0.3817692934545613,
+          "retention_rows": null,
+          "rollouts": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_A_gc_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/rollouts.jsonl",
+          "task_reward": {
+            "code": 0.388671875,
+            "memory": 0.34375,
+            "tool": 0.4128860053636839
+          },
+          "task_success": {
+            "code": 0.2890625,
+            "memory": 0.34375,
+            "tool": 0.2734375
+          }
+        }
+      ],
+      "run_dir": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_A_gc_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1",
+      "session": "opvec_bal15_A_gc_20260514_balanced_w3_ret05_i15_v1",
+      "state": "running"
+    },
+    {
+      "best_validated": {
+        "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_B_global_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+        "balanced_score": 0.37608929900085036,
+        "iteration": 1,
+        "overall_reward": 0.38707562712585036,
+        "task_reward": {
+          "code": 0.4033203125,
+          "memory": 0.359375,
+          "tool": 0.39853156887755103
+        }
+      },
+      "collapse": {
+        "triggered": false
+      },
+      "label": "B_global",
+      "latest_iteration": 1,
+      "metrics": [
+        {
+          "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_B_global_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+          "frontier_task_counts": null,
+          "gate_checkpoint": null,
+          "gate_delta_max": null,
+          "grad_norm_max": null,
+          "has_update": false,
+          "iteration": 1,
+          "kept_frontiers": null,
+          "opd_distill_rows": null,
+          "overall_reward": 0.38707562712585036,
+          "retention_rows": null,
+          "rollouts": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_B_global_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/rollouts.jsonl",
+          "task_reward": {
+            "code": 0.4033203125,
+            "memory": 0.359375,
+            "tool": 0.39853156887755103
+          },
+          "task_success": {
+            "code": 0.3046875,
+            "memory": 0.359375,
+            "tool": 0.28125
+          }
+        }
+      ],
+      "run_dir": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_B_global_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1",
+      "session": "opvec_bal15_B_global_20260514_balanced_w3_ret05_i15_v1",
+      "state": "running"
+    },
+    {
+      "best_validated": {
+        "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_C_layerband_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+        "balanced_score": 0.41590775172248384,
+        "iteration": 1,
+        "overall_reward": 0.4458575693899354,
+        "task_reward": {
+          "code": 0.4208984375,
+          "memory": 0.3984375,
+          "tool": 0.5182367706698063
+        }
+      },
+      "collapse": {
+        "triggered": false
+      },
+      "label": "C_layerband",
+      "latest_iteration": 1,
+      "metrics": [
+        {
+          "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_C_layerband_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+          "frontier_task_counts": null,
+          "gate_checkpoint": null,
+          "gate_delta_max": null,
+          "grad_norm_max": null,
+          "has_update": false,
+          "iteration": 1,
+          "kept_frontiers": null,
+          "opd_distill_rows": null,
+          "overall_reward": 0.4458575693899354,
+          "retention_rows": null,
+          "rollouts": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_C_layerband_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/rollouts.jsonl",
+          "task_reward": {
+            "code": 0.4208984375,
+            "memory": 0.3984375,
+            "tool": 0.5182367706698063
+          },
+          "task_success": {
+            "code": 0.3203125,
+            "memory": 0.3984375,
+            "tool": 0.3671875
+          }
+        }
+      ],
+      "run_dir": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_C_layerband_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1",
+      "session": "opvec_bal15_C_layerband_20260514_balanced_w3_ret05_i15_v1",
+      "state": "running"
+    },
+    {
+      "best_validated": {
+        "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_D_gp_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+        "balanced_score": 0.3762544390753096,
+        "iteration": 1,
+        "overall_reward": 0.4001802203253096,
+        "task_reward": {
+          "code": 0.439453125,
+          "memory": 0.34375,
+          "tool": 0.4173375359759288
+        }
+      },
+      "collapse": {
+        "triggered": false
+      },
+      "label": "D_globalparameter",
+      "latest_iteration": 1,
+      "metrics": [
+        {
+          "baked_policy": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_D_gp_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/baked_policy",
+          "frontier_task_counts": null,
+          "gate_checkpoint": null,
+          "gate_delta_max": null,
+          "grad_norm_max": null,
+          "has_update": false,
+          "iteration": 1,
+          "kept_frontiers": null,
+          "opd_distill_rows": null,
+          "overall_reward": 0.4001802203253096,
+          "retention_rows": null,
+          "rollouts": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_D_gp_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1/iter_001/rollouts.jsonl",
+          "task_reward": {
+            "code": 0.439453125,
+            "memory": 0.34375,
+            "tool": 0.4173375359759288
+          },
+          "task_success": {
+            "code": 0.34375,
+            "memory": 0.34375,
+            "tool": 0.296875
+          }
+        }
+      ],
+      "run_dir": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/bal15_D_gp_w3_ret05_m02_20260514_balanced_w3_ret05_i15_v1",
+      "session": "opvec_bal15_D_gp_20260514_balanced_w3_ret05_i15_v1",
+      "state": "running"
+    }
+  ]
+}

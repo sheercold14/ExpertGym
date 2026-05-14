@@ -15,6 +15,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 EXPERTS = ("tool", "memory", "code")
+PAPER96_EVAL_MODELS = {
+    "A_gc_opd": "paper96-a-gc-fixedopd-final-iter8",
+    "B_gc_noopd": "paper96-b-gc-noopd-final-iter8",
+    "C_gp_opd": "paper96-c-gp-fixedopd-final-iter8",
+    "D_gc_dynamic_opd": "paper96-d-gc-dynopd-final-iter8",
+}
+EVAL6_ROOT = Path("/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation")
+EVAL6_RUN_ID = "eval6-20260502-125748"
 
 
 def main() -> None:
@@ -131,6 +139,7 @@ def build_state(run_dir: Path, *, init_value: float, max_prompt_rows: int) -> di
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "iterations": iterations,
         "run_summary": _run_summary(iterations, loop_manifest),
+        "eval6": _eval6_summary(run_dir),
         "reward_series": _reward_series(iterations),
         "coefficient_series": _coefficient_series(iterations),
         "metric_series": _metric_series(iterations),
@@ -149,11 +158,13 @@ def _iteration_state(
     rollout_summary_path = iter_dir / "rollouts.summary.json"
     update_summary_path = iter_dir / "gate_updates.summary.json"
     gates_path = iter_dir / "gate_updates.gates.json"
+    dynamic_opd_summary_path = iter_dir / "opd_distill_from_allfail.summary.json"
     rows = _read_jsonl(rollout_path) if rollout_path.exists() else []
     prompt_rows = [_prompt_row(row) for row in rows[:max_prompt_rows]]
     task_stats = _task_stats(rows)
     rollout_summary = _read_json(rollout_summary_path) if rollout_summary_path.exists() else None
     update_summary = _read_json(update_summary_path) if update_summary_path.exists() else None
+    dynamic_opd_summary = _read_json(dynamic_opd_summary_path) if dynamic_opd_summary_path.exists() else None
     gates = _load_gates(gates_path) if gates_path.exists() else {}
     status = _status(rollout_path=rollout_path, update_summary_path=update_summary_path, gates_path=gates_path)
     update = _compact_update(update_summary)
@@ -166,6 +177,7 @@ def _iteration_state(
         update=update,
         gate_stats=gate_stats,
         token_stats=token_stats,
+        dynamic_opd_summary=dynamic_opd_summary,
     )
     return {
         "iteration": iter_dir.name,
@@ -175,13 +187,15 @@ def _iteration_state(
             "rollout_summary": str(rollout_summary_path) if rollout_summary_path.exists() else None,
             "update_summary": str(update_summary_path) if update_summary_path.exists() else None,
             "gates": str(gates_path) if gates_path.exists() else None,
+            "dynamic_opd_summary": str(dynamic_opd_summary_path) if dynamic_opd_summary_path.exists() else None,
         },
-        "mtime": _max_mtime([rollout_path, rollout_summary_path, update_summary_path, gates_path]),
+        "mtime": _max_mtime([rollout_path, rollout_summary_path, update_summary_path, gates_path, dynamic_opd_summary_path]),
         "rollout_rows": len(rows),
         "task_stats": task_stats,
         "prompt_rows": prompt_rows,
         "rollout_summary": rollout_summary,
         "update": update,
+        "dynamic_opd": _compact_dynamic_opd(dynamic_opd_summary),
         "gate_stats": gate_stats,
         "metrics": metrics,
         "timings": _timings(manifest_iteration, rollout_summary),
@@ -241,10 +255,10 @@ def _task_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for sample in samples:
             if not isinstance(sample, dict):
                 continue
-            reward = _float(sample.get("reward"))
+            reward = _train_reward(sample)
             acc[task]["samples"] += 1
             acc[task]["rewards"].append(reward)
-            acc[task]["successes"] += int(bool(sample.get("success")) or reward > 0.0)
+            acc[task]["successes"] += int(bool(sample.get("success", reward > 0.5)))
             acc[task]["token_lengths"].append(_token_count(sample))
     output = {}
     for task, item in sorted(acc.items()):
@@ -280,8 +294,14 @@ def _compact_update(payload: dict[str, Any] | None) -> dict[str, Any] | None:
         "skipped_optimizer_steps": payload.get("skipped_optimizer_steps"),
         "filled_missing_old_logprobs": payload.get("filled_missing_old_logprobs"),
         "gate_grad_nonzero": payload.get("gate_grad_nonzero"),
+        "gate_parameterization": payload.get("gate_parameterization"),
         "parameter_coefficients": payload.get("parameter_coefficients"),
         "stopped_early_at_step": payload.get("stopped_early_at_step"),
+        "opd_distill_rows": payload.get("opd_distill_rows"),
+        "opd_distill_task_counts": payload.get("opd_distill_task_counts"),
+        "opd_all_success_rows": payload.get("opd_all_success_rows"),
+        "opd_all_success_task_counts": payload.get("opd_all_success_task_counts"),
+        "retention_rows": payload.get("retention_rows"),
         "optimizer": payload.get("optimizer"),
         "loss_weights": payload.get("loss_weights"),
         "epoch_summaries": [
@@ -299,6 +319,23 @@ def _compact_update(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _compact_dynamic_opd(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not payload:
+        return None
+    skipped = payload.get("skipped") if isinstance(payload.get("skipped"), dict) else {}
+    selected = int(payload.get("selected_rows") or 0)
+    all_fail_rows = selected + sum(int(value or 0) for key, value in skipped.items() if key != "current_not_failure")
+    return {
+        "selected_rows": selected,
+        "selected_task_counts": payload.get("selected_task_counts") or {},
+        "candidate_task_counts": payload.get("candidate_task_counts") or {},
+        "all_fail_rows": all_fail_rows,
+        "current_not_failure": int(skipped.get("current_not_failure") or 0),
+        "skipped": skipped,
+        "current_max_success": payload.get("current_max_success"),
+    }
+
+
 def _iteration_metrics(
     *,
     task_stats: dict[str, Any],
@@ -307,6 +344,7 @@ def _iteration_metrics(
     update: dict[str, Any] | None,
     gate_stats: dict[str, Any] | None,
     token_stats: dict[str, Any],
+    dynamic_opd_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
     samples = sum(int(stats.get("samples") or 0) for stats in task_stats.values())
     reward_numerator = sum(_float(stats.get("mean_reward")) * int(stats.get("samples") or 0) for stats in task_stats.values())
@@ -319,6 +357,9 @@ def _iteration_metrics(
     epochs = (update or {}).get("epoch_summaries") or []
     last_epoch = epochs[-1] if epochs else {}
     optimizer_steps = (update or {}).get("optimizer_steps")
+    dynamic_opd = _compact_dynamic_opd(dynamic_opd_summary)
+    opd_rows = int((dynamic_opd or {}).get("selected_rows") or (update or {}).get("opd_distill_rows") or 0)
+    opd_task_counts = (dynamic_opd or {}).get("selected_task_counts") or (update or {}).get("opd_distill_task_counts") or {}
     return {
         "mean_reward": reward_numerator / samples if samples else 0.0,
         "samples": samples,
@@ -326,6 +367,10 @@ def _iteration_metrics(
         "kept_frontier_rows": int(kept_from_update if kept_from_update is not None else kept_from_summary or kept_from_tasks),
         "optimizer_steps": int(optimizer_steps or 0),
         "updates": int((update or {}).get("updates") or last_epoch.get("updates") or 0),
+        "retention_rows": int((update or {}).get("retention_rows") or 0),
+        "opd_distill_rows": opd_rows,
+        "opd_all_success_rows": int((update or {}).get("opd_all_success_rows") or 0),
+        "all_fail_rows": int((dynamic_opd or {}).get("all_fail_rows") or 0),
         "grad_norm_max": _float(last_epoch.get("grad_norm_max")),
         "gate_delta_max": _float(last_epoch.get("gate_delta_max")),
         "clip_frac_mean": _float(last_epoch.get("clip_frac_mean")),
@@ -340,6 +385,7 @@ def _iteration_metrics(
         ),
         "task_rewards": {task: _float(stats.get("mean_reward")) for task, stats in sorted(task_stats.items())},
         "task_frontier_rows": {task: int(stats.get("kept_frontier_rows") or 0) for task, stats in sorted(task_stats.items())},
+        "opd_task_rows": {task: int(opd_task_counts.get(task) or 0) for task in EXPERTS},
         "expert_coefficients": dict((gate_stats or {}).get("expert_means") or {}),
         "expert_delta_from_init": dict((gate_stats or {}).get("expert_delta") or {}),
     }
@@ -442,8 +488,13 @@ def _gate_stats(gates: dict[str, float], *, init_value: float) -> dict[str, Any]
     coeffs = _effective_coefficients(gates)
     values = [value for _, _, value in coeffs]
     by_expert: dict[str, list[float]] = defaultdict(list)
-    for _, expert, value in coeffs:
+    by_source: dict[str, list[float]] = defaultdict(list)
+    by_source_expert: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for name, expert, value in coeffs:
         by_expert[expert].append(value)
+        source = _coefficient_source(name)
+        by_source[source].append(value)
+        by_source_expert[source][expert].append(value)
     abs_deltas = [abs(value - init_value) for value in values]
     top_changed = sorted(
         [
@@ -463,8 +514,34 @@ def _gate_stats(gates: dict[str, float], *, init_value: float) -> dict[str, Any]
         "max_abs_delta_from_init": max(abs_deltas) if abs_deltas else 0.0,
         "expert_means": {expert: mean(items) for expert, items in sorted(by_expert.items()) if items},
         "expert_delta": {expert: mean(items) - init_value for expert, items in sorted(by_expert.items()) if items},
+        "source_stats": {
+            source: {
+                "n": len(items),
+                "mean": mean(items),
+                "min": min(items),
+                "max": max(items),
+                "task_mean": {
+                    expert: mean(expert_items)
+                    for expert, expert_items in sorted(by_source_expert[source].items())
+                    if expert_items
+                },
+            }
+            for source, items in sorted(by_source.items())
+            if items
+        },
         "top_changed": top_changed,
     }
+
+
+def _coefficient_source(name: str) -> str:
+    if name == "global":
+        return "global"
+    parts = name.split(".")
+    if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+        return ".".join(parts[:3])
+    if len(parts) >= 2:
+        return ".".join(parts[:2])
+    return name
 
 
 def _effective_coefficients(gates: dict[str, float]) -> list[tuple[str, str, float]]:
@@ -476,6 +553,8 @@ def _effective_coefficients(gates: dict[str, float]) -> list[tuple[str, str, flo
             if expert in EXPERTS:
                 output.append((name, expert, float(gates[key])))
         return output
+    if all(expert in gates for expert in EXPERTS):
+        return [("global", expert, float(gates[expert])) for expert in EXPERTS]
     band_names = sorted({key.split(".", 1)[0] for key in gates if "." in key and "::" not in key})
     if band_names:
         output = []
@@ -529,6 +608,10 @@ def _metric_series(iterations: list[dict[str, Any]]) -> dict[str, list[dict[str,
     scalar_fields = (
         "mean_reward",
         "kept_frontier_rows",
+        "retention_rows",
+        "opd_distill_rows",
+        "opd_all_success_rows",
+        "all_fail_rows",
         "optimizer_steps",
         "updates",
         "grad_norm_max",
@@ -549,10 +632,16 @@ def _metric_series(iterations: list[dict[str, Any]]) -> dict[str, list[dict[str,
             series.setdefault(f"task_reward/{task}", []).append({"iteration": item["iteration"], "value": _float(value)})
         for task, value in (metrics.get("task_frontier_rows") or {}).items():
             series.setdefault(f"task_frontier_rows/{task}", []).append({"iteration": item["iteration"], "value": _float(value)})
+        for task, value in (metrics.get("opd_task_rows") or {}).items():
+            series.setdefault(f"opd_task_rows/{task}", []).append({"iteration": item["iteration"], "value": _float(value)})
         for expert, value in (metrics.get("expert_coefficients") or {}).items():
             series.setdefault(f"coefficient/{expert}", []).append({"iteration": item["iteration"], "value": _float(value)})
         for expert, value in (metrics.get("expert_delta_from_init") or {}).items():
             series.setdefault(f"delta_from_init/{expert}", []).append({"iteration": item["iteration"], "value": _float(value)})
+        for field in ("bake_seconds", "collect_seconds", "update_seconds", "dynamic_opd_seconds", "iteration_seconds"):
+            value = (item.get("timings") or {}).get(field)
+            if value is not None:
+                series.setdefault(f"timing/{field}", []).append({"iteration": item["iteration"], "value": _float(value)})
     return {key: values for key, values in sorted(series.items()) if values}
 
 
@@ -563,6 +652,95 @@ def _comparison_series(runs: list[dict[str, Any]]) -> dict[str, dict[str, list[d
         for metric, values in (run.get("metric_series") or {}).items():
             output[metric][run_id] = values
     return {metric: dict(items) for metric, items in sorted(output.items())}
+
+
+def _eval6_summary(run_dir: Path) -> dict[str, Any]:
+    model_name = _paper96_eval_model_name(run_dir)
+    output: dict[str, Any] = {
+        "model_name": model_name,
+        "run_id": EVAL6_RUN_ID,
+        "tool": {"status": "missing"},
+        "memory": {"status": "missing"},
+        "code": {"status": "missing"},
+    }
+    if not model_name:
+        return output
+    tool_path = EVAL6_ROOT / "eval-batch" / EVAL6_RUN_ID / "runs" / model_name / "tool" / "summary.json"
+    memory_path = EVAL6_ROOT / "eval6-memory-hotpotqa" / model_name / EVAL6_RUN_ID / "summary.json"
+    code_path = EVAL6_ROOT / "eval6-code-cure-full" / model_name / EVAL6_RUN_ID / "summary.json"
+    output["tool"] = _compact_tool_eval(tool_path)
+    output["memory"] = _compact_memory_eval(memory_path)
+    output["code"] = _compact_code_eval(code_path)
+    return output
+
+
+def _paper96_eval_model_name(run_dir: Path) -> str | None:
+    name = run_dir.name
+    for key, model_name in PAPER96_EVAL_MODELS.items():
+        if key in name:
+            return model_name
+    return None
+
+
+def _compact_tool_eval(path: Path) -> dict[str, Any]:
+    payload = _read_json(path)
+    if not payload:
+        return {"status": "missing", "path": str(path)}
+    scores = payload.get("scores") if isinstance(payload.get("scores"), dict) else {}
+    values = [_float(item.get("accuracy")) for item in scores.values() if isinstance(item, dict)]
+    live_values = [
+        _float(scores[key].get("accuracy"))
+        for key in ("live_parallel", "live_parallel_multiple")
+        if isinstance(scores.get(key), dict)
+    ]
+    return {
+        "status": "ready",
+        "path": str(path),
+        "mean": mean(values) if values else 0.0,
+        "live_mean": mean(live_values) if live_values else 0.0,
+        "scores": {key: _float(value.get("accuracy")) for key, value in sorted(scores.items()) if isinstance(value, dict)},
+    }
+
+
+def _compact_memory_eval(path: Path) -> dict[str, Any]:
+    payload = _read_json(path)
+    if not payload:
+        return {"status": "missing", "path": str(path)}
+    datasets = [item for item in payload.get("datasets", []) if isinstance(item, dict)]
+    f1_values = [_float(item.get("avg_f1")) for item in datasets]
+    em_values = [_float(item.get("exact_match_rate")) for item in datasets]
+    return {
+        "status": "ready",
+        "path": str(path),
+        "f1_mean": mean(f1_values) if f1_values else 0.0,
+        "em_mean": mean(em_values) if em_values else 0.0,
+        "datasets": {
+            str(item.get("dataset")): {
+                "f1": _float(item.get("avg_f1")),
+                "em": _float(item.get("exact_match_rate")),
+            }
+            for item in datasets
+        },
+    }
+
+
+def _compact_code_eval(path: Path) -> dict[str, Any]:
+    payload = _read_json(path)
+    if not payload:
+        return {"status": "missing", "path": str(path)}
+    datasets = payload.get("datasets") if isinstance(payload.get("datasets"), list) else []
+    scores: dict[str, dict[str, float]] = {}
+    for item in datasets:
+        if not isinstance(item, dict):
+            continue
+        dataset = str(item.get("dataset") or item.get("name") or "unknown")
+        scores[dataset] = {
+            "acc": _float(item.get("code_acc", item.get("acc", item.get("accuracy")))),
+            "tp": _float(item.get("test_point_acc", item.get("test_point_accuracy"))),
+            "bon": _float(item.get("bon_acc", item.get("best_of_n_acc"))),
+        }
+    acc_values = [value["acc"] for value in scores.values()]
+    return {"status": "ready", "path": str(path), "acc_mean": mean(acc_values) if acc_values else 0.0, "datasets": scores}
 
 
 def _alerts(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -626,6 +804,16 @@ def _float(value: Any) -> float:
     return output
 
 
+def _train_reward(sample: dict[str, Any]) -> float:
+    if "reward_train" in sample:
+        return _float(sample.get("reward_train"))
+    raw = _float(sample.get("reward"))
+    details = sample.get("details") if isinstance(sample.get("details"), dict) else {}
+    if details.get("toolrl_score_range") == [-3.0, 4.0]:
+        return max(0.0, min((raw + 3.0) / 7.0, 1.0))
+    return max(0.0, min(raw, 1.0))
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -686,8 +874,16 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </header>
   <main class="grid">
+    <section class="panel span12"><h2>四实验总览</h2><div id="allRuns"></div></section>
     <section class="panel span12"><h2>Run Overview</h2><div id="overview" class="cards"></div></section>
+    <section class="panel span12"><h2>Eval6 状态入口</h2><div id="eval6"></div></section>
     <section class="panel span12"><h2>Alerts</h2><div id="alerts" class="path">loading</div></section>
+    <section class="panel span4"><h2>Tool 训练奖励</h2><canvas id="taskToolChart" width="720" height="260"></canvas><div id="taskToolLegend" class="legend"></div></section>
+    <section class="panel span4"><h2>Memory 训练奖励</h2><canvas id="taskMemoryChart" width="720" height="260"></canvas><div id="taskMemoryLegend" class="legend"></div></section>
+    <section class="panel span4"><h2>Code 训练奖励</h2><canvas id="taskCodeChart" width="720" height="260"></canvas><div id="taskCodeLegend" class="legend"></div></section>
+    <section class="panel span4"><h2>Frontier Rows</h2><canvas id="frontierChart" width="720" height="260"></canvas><div id="frontierLegend" class="legend"></div></section>
+    <section class="panel span4"><h2>OPD / All-fail Rows</h2><canvas id="opdChart" width="720" height="260"></canvas><div id="opdLegend" class="legend"></div></section>
+    <section class="panel span4"><h2>Update 耗时</h2><canvas id="updateTimeChart" width="720" height="260"></canvas><div id="updateTimeLegend" class="legend"></div></section>
     <section class="panel span6">
       <div class="chart-head"><h2 id="rewardChartTitle">Strategy Metrics</h2><select id="metricSelect"></select></div>
       <canvas id="rewardChart" width="900" height="330"></canvas><div id="rewardLegend" class="legend"></div>
@@ -718,6 +914,18 @@ INDEX_HTML = r"""<!doctype html>
       'task_reward/memory':'memory reward',
       'task_reward/code':'code reward',
       kept_frontier_rows:'kept frontier rows',
+      retention_rows:'retention rows',
+      opd_distill_rows:'OPD rows',
+      opd_all_success_rows:'all-success OPD rows',
+      all_fail_rows:'all-fail rows',
+      'opd_task_rows/tool':'OPD tool rows',
+      'opd_task_rows/memory':'OPD memory rows',
+      'opd_task_rows/code':'OPD code rows',
+      'timing/bake_seconds':'bake seconds',
+      'timing/collect_seconds':'rollout seconds',
+      'timing/update_seconds':'update seconds',
+      'timing/dynamic_opd_seconds':'dynamic OPD seconds',
+      'timing/iteration_seconds':'iteration seconds',
       optimizer_steps:'optimizer steps',
       updates:'policy updates',
       grad_norm_max:'grad norm max',
@@ -749,7 +957,9 @@ INDEX_HTML = r"""<!doctype html>
       renderRunSelector();
       document.getElementById('runDir').textContent = state.run_id ? `[${state.run_id}] ${state.run_dir}` : state.run_dir;
       document.getElementById('updatedAt').textContent = (rootState && rootState.updated_at) || state.updated_at;
+      renderAllRuns();
       renderOverview();
+      renderEval6();
       renderAlerts();
       renderTimings();
       renderGateUpdate();
@@ -758,6 +968,7 @@ INDEX_HTML = r"""<!doctype html>
       renderChartControls();
       drawMetricChart();
       drawCoef();
+      drawPaperCharts();
       renderPromptRows();
     }
     function renderRunSelector() {
@@ -786,6 +997,47 @@ INDEX_HTML = r"""<!doctype html>
       const box = document.getElementById('alerts');
       if (!state.alerts.length) { box.textContent = 'no alerts'; return; }
       box.innerHTML = state.alerts.map(a => '<span class="alert">' + esc(JSON.stringify(a)) + '</span>').join('<br>');
+    }
+    function renderAllRuns() {
+      const box = document.getElementById('allRuns');
+      const runs = isMulti() ? rootState.runs : [state];
+      let html = '<table><thead><tr><th>run</th><th>状态 / 轮次</th><th>当前阶段</th><th>耗时</th><th>reward tool/memory/code</th><th>gate tool/memory/code</th><th>frontier</th><th>OPD / all-fail</th><th>Eval6</th></tr></thead><tbody>';
+      for (const run of runs) {
+        const summary = run.run_summary || {};
+        const latest = run.iterations[run.iterations.length - 1] || {};
+        const metrics = latest.metrics || {};
+        const gateIteration = latestWithGate(run) || latest;
+        const gateMetrics = gateIteration.metrics || {};
+        const rewards = ['tool','memory','code'].map(t => `<span class="task-${t}">${t}</span> <span class="num">${fmt((metrics.task_rewards || {})[t])}</span>`).join('<br>');
+        const gateNote = gateIteration.iteration && gateIteration.iteration !== latest.iteration ? `<div class="path">from ${esc(gateIteration.iteration)}</div>` : '';
+        const gates = ['tool','memory','code'].map(t => `<span class="task-${t}">${t}</span> <span class="num">${fmt((gateMetrics.expert_coefficients || {})[t])}</span>`).join('<br>') + gateNote;
+        const frontier = JSON.stringify((latest.update || {}).frontier_task_counts || metrics.task_frontier_rows || {});
+        const opdCounts = (latest.dynamic_opd || {}).selected_task_counts || (latest.update || {}).opd_distill_task_counts || {};
+        const opd = `OPD ${metrics.opd_distill_rows || 0} ${esc(JSON.stringify(opdCounts))}<br>all-fail <span class="num">${metrics.all_fail_rows || 0}</span> retention <span class="num">${metrics.retention_rows || 0}</span>`;
+        const eval6 = run.eval6 || {};
+        html += `<tr><td><button type="button" onclick="selectRun('${esc(run.run_id)}')">${esc(run.run_id || '')}</button><div class="path">${esc(shortRunName(run.run_dir || ''))}</div></td><td><span class="pill">${esc(summary.status || 'pending')}</span><br><span class="num">${summary.iterations || 0} iters</span></td><td>${esc(latest.status || '')}</td><td class="num">${sec(summary.elapsed_seconds || (summary.timing_totals || {}).iteration_seconds)}</td><td>${rewards}</td><td>${gates}</td><td class="num">${esc(frontier)}</td><td class="num">${opd}</td><td>${evalCell(eval6)}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      box.innerHTML = html;
+    }
+    function latestWithGate(run) {
+      const iterations = run.iterations || [];
+      for (let i = iterations.length - 1; i >= 0; i--) {
+        const coeffs = ((iterations[i].metrics || {}).expert_coefficients) || {};
+        if (Object.keys(coeffs).length) return iterations[i];
+      }
+      return null;
+    }
+    function renderEval6() {
+      const box = document.getElementById('eval6');
+      const runs = isMulti() ? rootState.runs : [state];
+      let html = '<table><thead><tr><th>run</th><th>model</th><th>Tool</th><th>Memory</th><th>Code</th></tr></thead><tbody>';
+      for (const run of runs) {
+        const e = run.eval6 || {};
+        html += `<tr><td>${esc(run.run_id || '')}</td><td class="path">${esc(e.model_name || '')}</td><td>${toolEval(e.tool)}</td><td>${memoryEval(e.memory)}</td><td>${codeEval(e.code)}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      box.innerHTML = html;
     }
     function renderOverview() {
       const s = state.run_summary || {};
@@ -827,17 +1079,30 @@ INDEX_HTML = r"""<!doctype html>
       let table = '<table><thead><tr><th>expert</th><th>coefficient</th><th>delta</th></tr></thead><tbody>';
       for (const task of ['tool','memory','code']) table += `<tr><td class="task-${task}">${task}</td><td class="num">${fmt(means[task])}</td><td class="num">${fmt(deltas[task])}</td></tr>`;
       table += '</tbody></table>';
-      document.getElementById('gateUpdate').innerHTML = `<div class="cards">${cards}</div>${table}`;
+      const sources = Object.entries(gate.source_stats || {}).slice(0, 12);
+      let sourceTable = '';
+      if (sources.length > 1 || (sources[0] && sources[0][0] !== 'global')) {
+        sourceTable = '<h2>Global-parameter source 聚合</h2><table><thead><tr><th>source</th><th>n</th><th>mean/min/max</th><th>task-wise mean</th></tr></thead><tbody>';
+        for (const [source, s] of sources) {
+          const tm = s.task_mean || {};
+          sourceTable += `<tr><td class="path">${esc(source)}</td><td class="num">${s.n}</td><td class="num">${fmt(s.mean)} / ${fmt(s.min)} / ${fmt(s.max)}</td><td>${['tool','memory','code'].map(t => `<span class="task-${t}">${t}</span> <span class="num">${fmt(tm[t])}</span>`).join('<br>')}</td></tr>`;
+        }
+        sourceTable += '</tbody></table>';
+      }
+      document.getElementById('gateUpdate').innerHTML = `<div class="cards">${cards}</div>${table}${sourceTable}`;
     }
     function renderIterations() {
-      let html = '<table><thead><tr><th>iter</th><th>status</th><th>rows</th><th>task rewards</th><th>tokens</th><th>frontier</th><th>gate mean / max delta</th></tr></thead><tbody>';
+      let html = '<table><thead><tr><th>iter</th><th>status</th><th>rows</th><th>task rewards</th><th>tokens</th><th>frontier</th><th>OPD / all-fail</th><th>gate mean / max delta</th></tr></thead><tbody>';
       for (const it of state.iterations) {
         const rewards = Object.entries(it.task_stats || {}).map(([task,s]) => `<span class="task-${task}">${task}</span> <span class="num">${fmt(s.mean_reward)}</span> sr <span class="num">${fmt(s.success_rate)}</span> fr <span class="num">${fmt(s.frontier_ratio)}</span>`).join('<br>');
         const frontier = it.update ? JSON.stringify(it.update.frontier_task_counts || {}) : '';
+        const dyn = it.dynamic_opd || {};
+        const opdCounts = dyn.selected_task_counts || (it.update || {}).opd_distill_task_counts || {};
+        const opd = `OPD ${fmt((it.metrics || {}).opd_distill_rows)} ${esc(JSON.stringify(opdCounts))}<br>all-fail ${fmt((it.metrics || {}).all_fail_rows)} retention ${fmt((it.metrics || {}).retention_rows)}`;
         const gs = it.gate_stats;
         const gate = gs ? `n=${gs.num_coefficients} mean=${fmt(gs.mean)} max_d=${fmt(gs.max_abs_delta_from_init)}` : '';
         const toks = it.token_stats ? `old ${it.token_stats.samples_with_old_logprobs}/${it.token_stats.samples} mean ${fmt(it.token_stats.mean)} p95 ${fmt(it.token_stats.p95)}` : '';
-        html += `<tr><td class="num">${it.iteration}</td><td><span class="pill">${it.status}</span></td><td class="num">${it.rollout_rows}</td><td>${rewards}</td><td class="num">${toks}</td><td class="num">${esc(frontier)}</td><td class="num">${gate}</td></tr>`;
+        html += `<tr><td class="num">${it.iteration}</td><td><span class="pill">${it.status}</span></td><td class="num">${it.rollout_rows}</td><td>${rewards}</td><td class="num">${toks}</td><td class="num">${esc(frontier)}</td><td class="num">${opd}</td><td class="num">${gate}</td></tr>`;
       }
       html += '</tbody></table>';
       document.getElementById('iterations').innerHTML = html;
@@ -852,7 +1117,7 @@ INDEX_HTML = r"""<!doctype html>
       const metricSelect = document.getElementById('metricSelect');
       const oldMetric = metricSelect.value || 'mean_reward';
       const metricKeys = isMulti() ? Object.keys(rootState.comparison_series || {}) : Object.keys(state.metric_series || {});
-      const preferred = ['mean_reward','task_reward/tool','task_reward/memory','task_reward/code','kept_frontier_rows','optimizer_steps','updates','grad_norm_max','clip_frac_mean','approx_kl_mean','delta_from_init_mean_abs','delta_from_init_max_abs','old_logprob_coverage'];
+      const preferred = ['mean_reward','task_reward/tool','task_reward/memory','task_reward/code','kept_frontier_rows','task_frontier_rows/tool','task_frontier_rows/memory','task_frontier_rows/code','opd_distill_rows','all_fail_rows','opd_task_rows/tool','opd_task_rows/memory','opd_task_rows/code','retention_rows','timing/bake_seconds','timing/collect_seconds','timing/update_seconds','optimizer_steps','updates','grad_norm_max','clip_frac_mean','approx_kl_mean','delta_from_init_mean_abs','delta_from_init_max_abs','old_logprob_coverage'];
       const orderedMetrics = [...preferred.filter(k => metricKeys.includes(k)), ...metricKeys.filter(k => !preferred.includes(k)).sort()];
       metricSelect.innerHTML = orderedMetrics.map(key => `<option value="${esc(key)}">${esc(metricLabels[key] || key)}</option>`).join('');
       metricSelect.value = orderedMetrics.includes(oldMetric) ? oldMetric : (orderedMetrics[0] || '');
@@ -888,23 +1153,32 @@ INDEX_HTML = r"""<!doctype html>
     }
     function drawCoef() {
       const metric = document.getElementById('coefSelect').value || 'coefficient/tool';
-      if (isMulti()) drawComparisonSeries('coefChart', rootState.comparison_series?.[metric] || {}, 'coefLegend');
-      else drawSingleMetricSeries('coefChart', metric, 'coefLegend');
+      if (isMulti()) drawComparisonSeries('coefChart', rootState.comparison_series?.[metric] || {}, 'coefLegend', {autoZoom: true});
+      else drawSingleMetricSeries('coefChart', metric, 'coefLegend', {autoZoom: true});
     }
-    function drawSingleMetricSeries(canvasId, metric, legendId) {
+    function drawPaperCharts() {
+      if (!isMulti()) return;
+      drawComparisonSeries('taskToolChart', rootState.comparison_series?.['task_reward/tool'] || {}, 'taskToolLegend');
+      drawComparisonSeries('taskMemoryChart', rootState.comparison_series?.['task_reward/memory'] || {}, 'taskMemoryLegend');
+      drawComparisonSeries('taskCodeChart', rootState.comparison_series?.['task_reward/code'] || {}, 'taskCodeLegend');
+      drawComparisonSeries('frontierChart', rootState.comparison_series?.kept_frontier_rows || {}, 'frontierLegend');
+      drawComparisonSeries('opdChart', rootState.comparison_series?.opd_distill_rows || rootState.comparison_series?.all_fail_rows || {}, 'opdLegend');
+      drawComparisonSeries('updateTimeChart', rootState.comparison_series?.['timing/update_seconds'] || {}, 'updateTimeLegend');
+    }
+    function drawSingleMetricSeries(canvasId, metric, legendId, options = {}) {
       const raw = (state.metric_series || {})[metric] || [];
       const series = {};
       series[metricLabels[metric] || metric] = raw.map(p => ({iteration:p.iteration, value:p.value}));
-      drawSeries(canvasId, series, 'value', legendId);
+      drawSeries(canvasId, series, 'value', legendId, options);
     }
-    function drawComparisonSeries(canvasId, rawSeries, legendId) {
+    function drawComparisonSeries(canvasId, rawSeries, legendId, options = {}) {
       const series = {};
       for (const [runId, points] of Object.entries(rawSeries || {})) {
         series[runId] = points.map(p => ({iteration:p.iteration, value:p.value}));
       }
-      drawSeries(canvasId, series, 'value', legendId);
+      drawSeries(canvasId, series, 'value', legendId, options);
     }
-    function drawSeries(id, series, field, legendId) {
+    function drawSeries(id, series, field, legendId, options = {}) {
       const canvas = document.getElementById(id), ctx = canvas.getContext('2d');
       ctx.clearRect(0,0,canvas.width,canvas.height);
       const names = Object.keys(series);
@@ -912,7 +1186,13 @@ INDEX_HTML = r"""<!doctype html>
       let vals = names.flatMap(t => series[t].map(p => Number(p[field] || 0)));
       if (!vals.length) vals = [0,1];
       let min = Math.min(...vals), max = Math.max(...vals);
-      if (min > 0 && min < 1) min = 0;
+      if (options.autoZoom && max !== min) {
+        const span = max - min;
+        min -= span * 0.18;
+        max += span * 0.18;
+      } else if (min > 0 && min < 1) {
+        min = 0;
+      }
       if (max === min) { max += 1; min -= 1; }
       const padL = 60, padR = 18, padT = 18, padB = 42;
       const w = canvas.width - padL - padR, h = canvas.height - padT - padB;
@@ -965,7 +1245,30 @@ INDEX_HTML = r"""<!doctype html>
       return v.toFixed(3);
     }
     function shortRunName(name) {
-      return String(name).replace('qbank_c033333_', '').replace('_i20_20260513_010622', '').replace('global_parameter', 'global-param').replace('layer_band', 'layer-band');
+      return String(name).split('/').pop().replace('paper96_', '').replace('_20260514_paper96_dynopd_i8', '').replace('_20260514_paper96_i8', '').replace('A_gc_opd_i8', 'A gc+fixedOPD').replace('B_gc_noopd_i8', 'B gc noOPD').replace('C_gp_opd_i8', 'C gp+fixedOPD').replace('D_gc_dynamic_opd_i8', 'D gc+dynamicOPD');
+    }
+    function evalCell(e) {
+      return `T ${statusText(e.tool)}<br>M ${statusText(e.memory)}<br>C ${statusText(e.code)}`;
+    }
+    function statusText(item) { return item && item.status === 'ready' ? '<span class="pill">ready</span>' : '<span class="pill">pending</span>'; }
+    function toolEval(item) {
+      if (!item || item.status !== 'ready') return `<span class="pill">missing</span><div class="path">${esc((item || {}).path || '')}</div>`;
+      return `<span class="num">mean ${fmt(item.mean)} live ${fmt(item.live_mean)}</span><br>${Object.entries(item.scores || {}).map(([k,v]) => `${esc(k)} <span class="num">${fmt(v)}</span>`).join('<br>')}<div class="path">${esc(item.path || '')}</div>`;
+    }
+    function memoryEval(item) {
+      if (!item || item.status !== 'ready') return `<span class="pill">missing</span><div class="path">${esc((item || {}).path || '')}</div>`;
+      return `<span class="num">F1 ${fmt(item.f1_mean)} EM ${fmt(item.em_mean)}</span><br>${Object.entries(item.datasets || {}).map(([k,v]) => `${esc(k)} F1 <span class="num">${fmt(v.f1)}</span> EM <span class="num">${fmt(v.em)}</span>`).join('<br>')}<div class="path">${esc(item.path || '')}</div>`;
+    }
+    function codeEval(item) {
+      if (!item || item.status !== 'ready') return `<span class="pill">missing</span><div class="path">${esc((item || {}).path || '')}</div>`;
+      return `<span class="num">ACC ${fmt(item.acc_mean)}</span><br>${Object.entries(item.datasets || {}).map(([k,v]) => `${esc(k)} acc <span class="num">${fmt(v.acc)}</span> tp <span class="num">${fmt(v.tp)}</span> bon <span class="num">${fmt(v.bon)}</span>`).join('<br>')}<div class="path">${esc(item.path || '')}</div>`;
+    }
+    function selectRun(runId) {
+      selectedRunId = runId;
+      localStorage.setItem('opvecMonitorRunId', selectedRunId);
+      state = pickState(rootState);
+      render();
+      window.scrollTo({top: 0, behavior: 'smooth'});
     }
     function isMulti() { return !!(rootState && Array.isArray(rootState.runs)); }
     function sec(x) { if (x === null || x === undefined || x === '') return ''; const v = Number(x || 0); return v < 60 ? v.toFixed(1) + 's' : (v/60).toFixed(1) + 'm'; }

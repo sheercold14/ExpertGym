@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 from opvec.config import write_json
 from opvec.modes.gates import expert_coefficients, project_gates
-from opvec.modeling.gate_parameters import DEFAULT_LAYER_BANDS, layer_band_for_param
+from opvec.modeling.gate_parameters import DEFAULT_LAYER_BANDS, EXPERT_NAMES, layer_band_for_param
 
 
 MODEL_SIDECAR_SUFFIXES = {
@@ -47,6 +47,8 @@ def load_gate_values(path: str | Path) -> dict[str, float]:
     numeric = {str(key): float(value) for key, value in payload.items() if isinstance(value, (int, float))}
     if any("::" in key for key in numeric):
         return numeric
+    if _is_global_coefficient_values(numeric):
+        return _global_coefficient_values(numeric)
     if any("." in key for key in numeric):
         return numeric
     return {
@@ -68,12 +70,16 @@ def create_bake_plan(
     parameter_mode = _is_parameter_coefficient_values(gate_values)
     global_parameter_mode = parameter_mode and any(str(key).startswith("__global__::") for key in gate_values)
     layer_band_mode = (not parameter_mode) and _is_layer_band_gate_values(gate_values)
+    global_coefficient_mode = (not parameter_mode) and (not layer_band_mode) and _is_global_coefficient_values(gate_values)
     if parameter_mode:
         projected = {str(key): float(value) for key, value in gate_values.items() if "::" in str(key)}
         coeffs = {"parameter_coefficients": projected}
     elif layer_band_mode:
         projected = project_layer_band_gates(gate_values)
         coeffs = {band: expert_coefficients(_band_gate_values(projected, band)) for band in _gate_band_names(projected)}
+    elif global_coefficient_mode:
+        projected = _global_coefficient_values(gate_values)
+        coeffs = dict(projected)
     else:
         projected = project_gates(gate_values).as_dict()
         coeffs = expert_coefficients(projected)
@@ -98,7 +104,11 @@ def create_bake_plan(
         "output_dir": str(Path(output_dir).expanduser().resolve()),
         "gate_values": projected,
         "expert_coefficients": coeffs,
-        "gate_parameterization": "global-parameter" if global_parameter_mode else ("parameter" if parameter_mode else ("layer-band" if layer_band_mode else "global")),
+        "gate_parameterization": (
+            "global-parameter"
+            if global_parameter_mode
+            else ("parameter" if parameter_mode else ("layer-band" if layer_band_mode else ("global-coefficient" if global_coefficient_mode else "global")))
+        ),
         "num_params": len(entries_by_param),
         "num_delta_entries": sum(len(value) for value in entries_by_param.values()),
         "entries_by_param": entries_by_param,
@@ -203,6 +213,18 @@ def _is_layer_band_gate_values(gate_values: Mapping[str, float]) -> bool:
 
 def _is_parameter_coefficient_values(gate_values: Mapping[str, float]) -> bool:
     return any("::" in str(key) for key in gate_values)
+
+
+def _is_global_coefficient_values(gate_values: Mapping[str, float]) -> bool:
+    keys = {str(key) for key in gate_values}
+    return all(expert in keys for expert in EXPERT_NAMES) or all(f"global.{expert}" in keys for expert in EXPERT_NAMES)
+
+
+def _global_coefficient_values(gate_values: Mapping[str, float]) -> dict[str, float]:
+    return {
+        expert: float(gate_values[expert] if expert in gate_values else gate_values[f"global.{expert}"])
+        for expert in EXPERT_NAMES
+    }
 
 
 def _gate_band_names(gate_values: Mapping[str, float]) -> list[str]:

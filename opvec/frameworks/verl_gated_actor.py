@@ -127,6 +127,12 @@ def normalize_gate_parameterization(value: str) -> str:
         "layer_band": "layer-band",
         "global_parameter": "global-parameter",
         "global_param": "global-parameter",
+        "global_coefficient": "global-coefficient",
+        "global_coefficients": "global-coefficient",
+        "global-direct": "global-coefficient",
+        "global_direct": "global-coefficient",
+        "expert-coefficient": "global-coefficient",
+        "expert_coefficient": "global-coefficient",
         "param": "parameter",
     }
     return aliases.get(str(value), str(value))

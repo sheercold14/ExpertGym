@@ -17,7 +17,7 @@ Common overrides:
   CALIBRATION=...                      default $QB/calibration/calib100_seed20260511.prompts.jsonl
 
 Gate strategy:
-  STRATEGY=global|layer-band|parameter|global-parameter
+  STRATEGY=global|global-coefficient|layer-band|parameter|global-parameter
   INIT_VALUE=0.3333333333333333        initial task-vector coefficient
   MAX_GATED_MODULES=                   empty means all modules; use 1 only for smoke tests
 
@@ -54,6 +54,7 @@ Update / objective:
   UPDATE_EPOCHS=1
   UPDATE_BATCH_SIZE=4
   BATCH_LOSS_REDUCTION=mean|sum
+  OPTIMIZER_STEP_SCOPE=batch|epoch       batch steps every UPDATE_BATCH_SIZE rows; epoch accumulates all rows then steps once
   LOSS_GRANULARITY=token|sequence
   STORE_TOKEN_LOGPROBS=0|1|auto        recommended 0; avoids vLLM-old/HF-current mismatch
   TASK_NORMALIZE_ADVANTAGES=0|1          default 0; keep per-prompt GRPO normalization, do not rescale across tasks
@@ -62,6 +63,11 @@ Update / objective:
   LENGTH_NORMALIZE_POLICY_LOGPROB=0|1
   LENGTH_NORMALIZE_LOGPROB=0|1
   LR=                                  default depends on STRATEGY
+  OPTIMIZER=adamw|sgd
+  SGD_MOMENTUM=0.0
+  SGD_NESTEROV=0|1
+  PERSIST_OPTIMIZER_STATE=0|1
+  OPTIMIZER_STATE_CHECKPOINT=
   PRIOR_LOSS_WEIGHT=                   default depends on STRATEGY
   PPO_LOSS_WEIGHT=1.0
   BEST_RESPONSE_LOSS_WEIGHT=0.0
@@ -79,8 +85,27 @@ Frontier / task balance:
   FRONTIER_CODE_QUOTA=32
   MAX_FRONTIER_ROWS_PER_TASK=
   USE_RETENTION=0|1                   default 0; all-success rows become KL retention rows when enabled
+  RETENTION_OBJECTIVE=kl|nll           kl is legacy; nll preserves all-success rows with non-zero NLL gradient
   RETENTION_LOSS_WEIGHT=              recommended 0.05 when USE_RETENTION=1
+  RETENTION_POSITIVE_REWARD_THRESHOLD=1.0
   MAX_RETENTION_ROWS=                 recommended 64 when USE_RETENTION=1
+  MAX_RETENTION_ROWS_PER_TASK=        optional per-task cap before MAX_RETENTION_ROWS
+  OPD_DISTILL_ROLLOUT=                optional comma-separated OPD distill JSONL paths
+  OPD_LOSS_WEIGHT=0.0                 sequence expert-positive likelihood loss for OPD rows
+  OPD_PAIRWISE_LOSS_WEIGHT=0.0        pairwise expert-positive vs current-negative loss for OPD rows
+  OPD_PAIRWISE_MARGIN=0.0
+  OPD_POSITIVE_REWARD_THRESHOLD=      empty means best reward_train in each OPD row
+  MAX_OPD_DISTILL_ROWS=
+  MAX_OPD_PAIRWISE_PAIRS_PER_ROW=0
+  DYNAMIC_OPD_EXPERT_ROLLOUT=        optional comma-separated expert rollout JSONL paths; each iter selects current all-fail prompts
+  DYNAMIC_OPD_TASKS=tool,memory,code
+  DYNAMIC_OPD_PER_TASK=32
+  DYNAMIC_OPD_MAX_POSITIVES_PER_ROW=1
+  DYNAMIC_OPD_MAX_NEGATIVES_PER_ROW=2
+  USE_OPD_ALL_SUCCESS=0|1             add auxiliary OPD loss on all-success rows
+  OPD_ALL_SUCCESS_LOSS_WEIGHT=0.0
+  OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD=1.0
+  MAX_OPD_ALL_SUCCESS_ROWS=
   TASK_WEIGHT_TOOL=1.0
   TASK_WEIGHT_MEMORY=1.0
   TASK_WEIGHT_CODE=1.0
@@ -170,6 +195,11 @@ case "$STRATEGY" in
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.01}"
     MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.2}"
     ;;
+  global-coefficient)
+    LR="${LR:-0.03}"
+    PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.01}"
+    MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.2}"
+    ;;
   layer-band)
     LR="${LR:-0.02}"
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
@@ -194,6 +224,7 @@ esac
 UPDATE_EPOCHS="${UPDATE_EPOCHS:-1}"
 UPDATE_BATCH_SIZE="${UPDATE_BATCH_SIZE:-4}"
 BATCH_LOSS_REDUCTION="${BATCH_LOSS_REDUCTION:-mean}"
+OPTIMIZER_STEP_SCOPE="${OPTIMIZER_STEP_SCOPE:-batch}"
 LOSS_GRANULARITY="${LOSS_GRANULARITY:-token}"
 FRONTIER_ORDER="${FRONTIER_ORDER:-task-interleaved}"
 FRONTIER_SHUFFLE_SEED="${FRONTIER_SHUFFLE_SEED:-}"
@@ -204,6 +235,11 @@ USE_FRONTIER_WEIGHT="${USE_FRONTIER_WEIGHT:-0}"
 LENGTH_NORMALIZE_POLICY_LOGPROB="${LENGTH_NORMALIZE_POLICY_LOGPROB:-1}"
 LENGTH_NORMALIZE_LOGPROB="${LENGTH_NORMALIZE_LOGPROB:-0}"
 PPO_LOSS_WEIGHT="${PPO_LOSS_WEIGHT:-1.0}"
+OPTIMIZER="${OPTIMIZER:-adamw}"
+SGD_MOMENTUM="${SGD_MOMENTUM:-0.0}"
+SGD_NESTEROV="${SGD_NESTEROV:-0}"
+PERSIST_OPTIMIZER_STATE="${PERSIST_OPTIMIZER_STATE:-0}"
+OPTIMIZER_STATE_CHECKPOINT="${OPTIMIZER_STATE_CHECKPOINT:-}"
 BEST_RESPONSE_LOSS_WEIGHT="${BEST_RESPONSE_LOSS_WEIGHT:-0.0}"
 PAIRWISE_LOSS_WEIGHT="${PAIRWISE_LOSS_WEIGHT:-0.0}"
 PAIRWISE_MARGIN="${PAIRWISE_MARGIN:-0.0}"
@@ -215,8 +251,31 @@ FRONTIER_MEMORY_QUOTA="${FRONTIER_MEMORY_QUOTA:-32}"
 FRONTIER_CODE_QUOTA="${FRONTIER_CODE_QUOTA:-32}"
 MAX_FRONTIER_ROWS_PER_TASK="${MAX_FRONTIER_ROWS_PER_TASK:-}"
 USE_RETENTION="${USE_RETENTION:-0}"
+RETENTION_OBJECTIVE="${RETENTION_OBJECTIVE:-kl}"
 RETENTION_LOSS_WEIGHT="${RETENTION_LOSS_WEIGHT:-}"
+RETENTION_POSITIVE_REWARD_THRESHOLD="${RETENTION_POSITIVE_REWARD_THRESHOLD:-1.0}"
 MAX_RETENTION_ROWS="${MAX_RETENTION_ROWS:-}"
+MAX_RETENTION_ROWS_PER_TASK="${MAX_RETENTION_ROWS_PER_TASK:-}"
+OPD_DISTILL_ROLLOUT="${OPD_DISTILL_ROLLOUT:-}"
+OPD_LOSS_WEIGHT="${OPD_LOSS_WEIGHT:-0.0}"
+OPD_PAIRWISE_LOSS_WEIGHT="${OPD_PAIRWISE_LOSS_WEIGHT:-0.0}"
+OPD_PAIRWISE_MARGIN="${OPD_PAIRWISE_MARGIN:-0.0}"
+OPD_POSITIVE_REWARD_THRESHOLD="${OPD_POSITIVE_REWARD_THRESHOLD:-}"
+MAX_OPD_DISTILL_ROWS="${MAX_OPD_DISTILL_ROWS:-}"
+MAX_OPD_PAIRWISE_PAIRS_PER_ROW="${MAX_OPD_PAIRWISE_PAIRS_PER_ROW:-0}"
+DYNAMIC_OPD_EXPERT_ROLLOUT="${DYNAMIC_OPD_EXPERT_ROLLOUT:-}"
+DYNAMIC_OPD_TASKS="${DYNAMIC_OPD_TASKS:-tool,memory,code}"
+DYNAMIC_OPD_KEY="${DYNAMIC_OPD_KEY:-prompt_id}"
+DYNAMIC_OPD_CURRENT_MAX_SUCCESS="${DYNAMIC_OPD_CURRENT_MAX_SUCCESS:-0}"
+DYNAMIC_OPD_POSITIVE_THRESHOLD="${DYNAMIC_OPD_POSITIVE_THRESHOLD:-1.0}"
+DYNAMIC_OPD_MAX_POSITIVES_PER_ROW="${DYNAMIC_OPD_MAX_POSITIVES_PER_ROW:-1}"
+DYNAMIC_OPD_MAX_NEGATIVES_PER_ROW="${DYNAMIC_OPD_MAX_NEGATIVES_PER_ROW:-2}"
+DYNAMIC_OPD_PER_TASK="${DYNAMIC_OPD_PER_TASK:-32}"
+DYNAMIC_OPD_QUOTA="${DYNAMIC_OPD_QUOTA:-}"
+USE_OPD_ALL_SUCCESS="${USE_OPD_ALL_SUCCESS:-0}"
+OPD_ALL_SUCCESS_LOSS_WEIGHT="${OPD_ALL_SUCCESS_LOSS_WEIGHT:-0.0}"
+OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD="${OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD:-1.0}"
+MAX_OPD_ALL_SUCCESS_ROWS="${MAX_OPD_ALL_SUCCESS_ROWS:-}"
 TASK_WEIGHT_TOOL="${TASK_WEIGHT_TOOL:-1.0}"
 TASK_WEIGHT_MEMORY="${TASK_WEIGHT_MEMORY:-1.0}"
 TASK_WEIGHT_CODE="${TASK_WEIGHT_CODE:-1.0}"
@@ -241,13 +300,25 @@ case "$BATCH_LOSS_REDUCTION" in
   mean|sum) ;;
   *) echo "[error] BATCH_LOSS_REDUCTION must be mean or sum, got $BATCH_LOSS_REDUCTION" >&2; exit 2 ;;
 esac
+case "$OPTIMIZER_STEP_SCOPE" in
+  batch|epoch) ;;
+  *) echo "[error] OPTIMIZER_STEP_SCOPE must be batch or epoch, got $OPTIMIZER_STEP_SCOPE" >&2; exit 2 ;;
+esac
 case "$LOSS_GRANULARITY" in
   token|sequence) ;;
   *) echo "[error] LOSS_GRANULARITY must be token or sequence, got $LOSS_GRANULARITY" >&2; exit 2 ;;
 esac
+case "$OPTIMIZER" in
+  adamw|sgd) ;;
+  *) echo "[error] OPTIMIZER must be adamw or sgd, got $OPTIMIZER" >&2; exit 2 ;;
+esac
 case "$FRONTIER_ORDER" in
   as-is|shuffle|task-interleaved) ;;
   *) echo "[error] FRONTIER_ORDER must be as-is, shuffle, or task-interleaved, got $FRONTIER_ORDER" >&2; exit 2 ;;
+esac
+case "$RETENTION_OBJECTIVE" in
+  kl|nll) ;;
+  *) echo "[error] RETENTION_OBJECTIVE must be kl or nll, got $RETENTION_OBJECTIVE" >&2; exit 2 ;;
 esac
 case "$STORE_TOKEN_LOGPROBS" in
   0|1|true|false|yes|no|auto) ;;
@@ -333,11 +404,82 @@ fi
 if is_truthy "$USE_RETENTION"; then
   UPDATE_EXTRA_ARGS+=(--use-retention)
 fi
+UPDATE_EXTRA_ARGS+=(--retention-objective "$RETENTION_OBJECTIVE")
+if [[ -n "$RETENTION_POSITIVE_REWARD_THRESHOLD" ]]; then
+  UPDATE_EXTRA_ARGS+=(--retention-positive-reward-threshold "$RETENTION_POSITIVE_REWARD_THRESHOLD")
+fi
 if [[ -n "$RETENTION_LOSS_WEIGHT" ]]; then
   UPDATE_EXTRA_ARGS+=(--retention-loss-weight "$RETENTION_LOSS_WEIGHT")
 fi
 if [[ -n "$MAX_RETENTION_ROWS" ]]; then
   UPDATE_EXTRA_ARGS+=(--max-retention-rows "$MAX_RETENTION_ROWS")
+fi
+if [[ -n "$MAX_RETENTION_ROWS_PER_TASK" ]]; then
+  UPDATE_EXTRA_ARGS+=(--max-retention-rows-per-task "$MAX_RETENTION_ROWS_PER_TASK")
+fi
+if [[ -n "$OPD_DISTILL_ROLLOUT" ]]; then
+  IFS=',' read -r -a OPD_ROLLOUT_LIST <<< "$OPD_DISTILL_ROLLOUT"
+  for opd_path in "${OPD_ROLLOUT_LIST[@]}"; do
+    if [[ -n "$opd_path" ]]; then
+      UPDATE_EXTRA_ARGS+=(--opd-distill-rollout "$opd_path")
+    fi
+  done
+fi
+if [[ "$OPD_LOSS_WEIGHT" != "0" && "$OPD_LOSS_WEIGHT" != "0.0" ]]; then
+  UPDATE_EXTRA_ARGS+=(--opd-loss-weight "$OPD_LOSS_WEIGHT")
+fi
+if [[ "$OPD_PAIRWISE_LOSS_WEIGHT" != "0" && "$OPD_PAIRWISE_LOSS_WEIGHT" != "0.0" ]]; then
+  UPDATE_EXTRA_ARGS+=(--opd-pairwise-loss-weight "$OPD_PAIRWISE_LOSS_WEIGHT")
+fi
+if [[ "$OPD_PAIRWISE_MARGIN" != "0" && "$OPD_PAIRWISE_MARGIN" != "0.0" ]]; then
+  UPDATE_EXTRA_ARGS+=(--opd-pairwise-margin "$OPD_PAIRWISE_MARGIN")
+fi
+if [[ -n "$MAX_OPD_DISTILL_ROWS" ]]; then
+  UPDATE_EXTRA_ARGS+=(--max-opd-distill-rows "$MAX_OPD_DISTILL_ROWS")
+fi
+if [[ "$MAX_OPD_PAIRWISE_PAIRS_PER_ROW" != "0" ]]; then
+  UPDATE_EXTRA_ARGS+=(--max-opd-pairwise-pairs-per-row "$MAX_OPD_PAIRWISE_PAIRS_PER_ROW")
+fi
+if [[ -n "$OPD_POSITIVE_REWARD_THRESHOLD" ]]; then
+  UPDATE_EXTRA_ARGS+=(--opd-positive-reward-threshold "$OPD_POSITIVE_REWARD_THRESHOLD")
+fi
+DYNAMIC_OPD_ARGS=()
+if [[ -n "$DYNAMIC_OPD_EXPERT_ROLLOUT" ]]; then
+  IFS=',' read -r -a DYNAMIC_OPD_ROLLOUT_LIST <<< "$DYNAMIC_OPD_EXPERT_ROLLOUT"
+  for opd_path in "${DYNAMIC_OPD_ROLLOUT_LIST[@]}"; do
+    if [[ -n "$opd_path" ]]; then
+      DYNAMIC_OPD_ARGS+=(--dynamic-opd-expert-rollout "$opd_path")
+    fi
+  done
+  DYNAMIC_OPD_ARGS+=(
+    --dynamic-opd-tasks "$DYNAMIC_OPD_TASKS"
+    --dynamic-opd-key "$DYNAMIC_OPD_KEY"
+    --dynamic-opd-current-max-success "$DYNAMIC_OPD_CURRENT_MAX_SUCCESS"
+    --dynamic-opd-positive-threshold "$DYNAMIC_OPD_POSITIVE_THRESHOLD"
+    --dynamic-opd-max-positives-per-row "$DYNAMIC_OPD_MAX_POSITIVES_PER_ROW"
+    --dynamic-opd-max-negatives-per-row "$DYNAMIC_OPD_MAX_NEGATIVES_PER_ROW"
+    --dynamic-opd-per-task "$DYNAMIC_OPD_PER_TASK"
+  )
+  if [[ -n "$DYNAMIC_OPD_QUOTA" ]]; then
+    IFS=',' read -r -a DYNAMIC_OPD_QUOTA_LIST <<< "$DYNAMIC_OPD_QUOTA"
+    for quota_value in "${DYNAMIC_OPD_QUOTA_LIST[@]}"; do
+      if [[ -n "$quota_value" ]]; then
+        DYNAMIC_OPD_ARGS+=(--dynamic-opd-quota "$quota_value")
+      fi
+    done
+  fi
+fi
+if is_truthy "$USE_OPD_ALL_SUCCESS"; then
+  UPDATE_EXTRA_ARGS+=(--use-opd-all-success)
+fi
+if [[ "$OPD_ALL_SUCCESS_LOSS_WEIGHT" != "0" && "$OPD_ALL_SUCCESS_LOSS_WEIGHT" != "0.0" ]]; then
+  UPDATE_EXTRA_ARGS+=(--opd-all-success-loss-weight "$OPD_ALL_SUCCESS_LOSS_WEIGHT")
+fi
+if [[ -n "$MAX_OPD_ALL_SUCCESS_ROWS" ]]; then
+  UPDATE_EXTRA_ARGS+=(--max-opd-all-success-rows "$MAX_OPD_ALL_SUCCESS_ROWS")
+fi
+if [[ -n "$OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD" ]]; then
+  UPDATE_EXTRA_ARGS+=(--opd-all-success-positive-reward-threshold "$OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD")
 fi
 if [[ -n "$ADVANTAGE_FIELD" ]]; then
   UPDATE_EXTRA_ARGS+=(--advantage-field "$ADVANTAGE_FIELD")
@@ -362,6 +504,15 @@ if [[ -n "$POSITIVE_REWARD_THRESHOLD" ]]; then
 fi
 if is_truthy "$RECOMPUTE_FRONTIER"; then
   UPDATE_EXTRA_ARGS+=(--recompute-frontier)
+fi
+if is_truthy "$SGD_NESTEROV"; then
+  UPDATE_EXTRA_ARGS+=(--sgd-nesterov)
+fi
+if is_truthy "$PERSIST_OPTIMIZER_STATE"; then
+  UPDATE_EXTRA_ARGS+=(--persist-optimizer-state)
+fi
+if [[ -n "$OPTIMIZER_STATE_CHECKPOINT" ]]; then
+  UPDATE_EXTRA_ARGS+=(--optimizer-state-checkpoint "$OPTIMIZER_STATE_CHECKPOINT")
 fi
 
 FRONTIER_QUOTA_ARGS=()
@@ -392,12 +543,16 @@ echo "[run] strategy=$STRATEGY init=$INIT_VALUE"
 echo "[run] calibration=$CALIBRATION"
 echo "[run] run_dir=$RUN_DIR"
 echo "[run] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[run] optimizer=$OPTIMIZER sgd_momentum=$SGD_MOMENTUM persist_optimizer_state=$PERSIST_OPTIMIZER_STATE"
 echo "[run] lr=$LR prior=$PRIOR_LOSS_WEIGHT max_delta=$MAX_COEFF_DELTA"
-echo "[run] loss_granularity=$LOSS_GRANULARITY update_batch_size=$UPDATE_BATCH_SIZE store_token_logprobs=$STORE_TOKEN_LOGPROBS"
+echo "[run] loss_granularity=$LOSS_GRANULARITY update_batch_size=$UPDATE_BATCH_SIZE optimizer_step_scope=$OPTIMIZER_STEP_SCOPE store_token_logprobs=$STORE_TOKEN_LOGPROBS"
 echo "[run] task_normalize_advantages=$TASK_NORMALIZE_ADVANTAGES advantage_normalization=$ADVANTAGE_NORMALIZATION use_frontier_weight=$USE_FRONTIER_WEIGHT advantage_field_frontier_weight=$ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT"
 echo "[run] frontier_order=$FRONTIER_ORDER frontier_shuffle_seed=${FRONTIER_SHUFFLE_SEED:-auto}"
 echo "[run] task_weights=tool:$TASK_WEIGHT_TOOL,memory:$TASK_WEIGHT_MEMORY,code:$TASK_WEIGHT_CODE quotas=tool:$FRONTIER_TOOL_QUOTA,memory:$FRONTIER_MEMORY_QUOTA,code:$FRONTIER_CODE_QUOTA"
-echo "[run] retention=$USE_RETENTION retention_loss_weight=${RETENTION_LOSS_WEIGHT:-none} max_retention_rows=${MAX_RETENTION_ROWS:-none}"
+echo "[run] retention=$USE_RETENTION retention_objective=$RETENTION_OBJECTIVE retention_loss_weight=${RETENTION_LOSS_WEIGHT:-none} retention_positive_threshold=${RETENTION_POSITIVE_REWARD_THRESHOLD:-none} max_retention_rows=${MAX_RETENTION_ROWS:-none} max_retention_rows_per_task=${MAX_RETENTION_ROWS_PER_TASK:-none}"
+echo "[run] opd_rollout=${OPD_DISTILL_ROLLOUT:-none} opd_loss=$OPD_LOSS_WEIGHT opd_pairwise=$OPD_PAIRWISE_LOSS_WEIGHT max_opd_rows=${MAX_OPD_DISTILL_ROWS:-none}"
+echo "[run] dynamic_opd_rollout=${DYNAMIC_OPD_EXPERT_ROLLOUT:-none} dynamic_opd_tasks=$DYNAMIC_OPD_TASKS dynamic_opd_per_task=$DYNAMIC_OPD_PER_TASK"
+echo "[run] opd_all_success=$USE_OPD_ALL_SUCCESS opd_all_success_loss=$OPD_ALL_SUCCESS_LOSS_WEIGHT max_opd_all_success_rows=${MAX_OPD_ALL_SUCCESS_ROWS:-none}"
 echo "[run] tokens=default:$MAX_NEW_TOKENS,tool:$TOOL_MAX_NEW_TOKENS,code:$CODE_MAX_NEW_TOKENS,memory_update:$MEMORY_UPDATE_MAX_NEW_TOKENS,memory_final:$MEMORY_FINAL_MAX_NEW_TOKENS"
 echo "[run] rollout_shards=$ROLLOUT_SHARDS rollout_gpus=$ROLLOUT_GPUS vllm_batch_size=$ROLLOUT_BATCH_SIZE"
 
@@ -442,13 +597,17 @@ echo "[run] rollout_shards=$ROLLOUT_SHARDS rollout_gpus=$ROLLOUT_GPUS vllm_batch
   --update-epochs "$UPDATE_EPOCHS" \
   --update-batch-size "$UPDATE_BATCH_SIZE" \
   --batch-loss-reduction "$BATCH_LOSS_REDUCTION" \
+  --optimizer-step-scope "$OPTIMIZER_STEP_SCOPE" \
   --loss-granularity "$LOSS_GRANULARITY" \
   "${FRONTIER_ORDER_ARGS[@]}" \
   "${UPDATE_EXTRA_ARGS[@]}" \
   --lr "$LR" \
+  --optimizer "$OPTIMIZER" \
+  --sgd-momentum "$SGD_MOMENTUM" \
   --prior-loss-weight "$PRIOR_LOSS_WEIGHT" \
   --max-coefficient-delta-from-init "$MAX_COEFF_DELTA" \
   --behavior-span-reward-weight "$BEHAVIOR_SPAN_REWARD_WEIGHT" \
+  "${DYNAMIC_OPD_ARGS[@]}" \
   "${FRONTIER_QUOTA_ARGS[@]}" \
   "${TASK_WEIGHT_ARGS[@]}" \
   --device "$DEVICE" \

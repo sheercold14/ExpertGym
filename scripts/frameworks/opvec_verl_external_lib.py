@@ -148,6 +148,13 @@ def _normalize_gate_parameterization(value: str) -> str:
         "global_param": "global-parameter",
         "global-residual": "global-parameter",
         "global_residual": "global-parameter",
+        "global_coefficient": "global-coefficient",
+        "global-coefficients": "global-coefficient",
+        "global_coefficients": "global-coefficient",
+        "global-direct": "global-coefficient",
+        "global_direct": "global-coefficient",
+        "expert-coefficient": "global-coefficient",
+        "expert_coefficient": "global-coefficient",
     }
     return aliases.get(str(value), str(value))
 

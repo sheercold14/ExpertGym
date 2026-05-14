@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# OPD wrapper for qbank gate training. By default it adds all-success OPD as
+# an auxiliary loss to the normal GRPO frontier update.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+STRATEGY_VALUE="${STRATEGY:-global}"
+SAFE_STRATEGY="${STRATEGY_VALUE//[^A-Za-z0-9_]/_}"
+export USE_OPD_ALL_SUCCESS="${USE_OPD_ALL_SUCCESS:-1}"
+export OPD_ALL_SUCCESS_LOSS_WEIGHT="${OPD_ALL_SUCCESS_LOSS_WEIGHT:-0.08}"
+export OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD="${OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD:-1.0}"
+export MAX_OPD_ALL_SUCCESS_ROWS="${MAX_OPD_ALL_SUCCESS_ROWS:-64}"
+export OPD_LOSS_WEIGHT="${OPD_LOSS_WEIGHT:-0.00}"
+export OPD_PAIRWISE_LOSS_WEIGHT="${OPD_PAIRWISE_LOSS_WEIGHT:-0.00}"
+export OPD_PAIRWISE_MARGIN="${OPD_PAIRWISE_MARGIN:-0.0}"
+export OPD_POSITIVE_REWARD_THRESHOLD="${OPD_POSITIVE_REWARD_THRESHOLD:-1.0}"
+export MAX_OPD_DISTILL_ROWS="${MAX_OPD_DISTILL_ROWS:-}"
+export MAX_OPD_PAIRWISE_PAIRS_PER_ROW="${MAX_OPD_PAIRWISE_PAIRS_PER_ROW:-0}"
+export RUN_NAME="${RUN_NAME:-qbank_c033333_${SAFE_STRATEGY}_opd_i2_seed20260511}"
+
+exec bash "$SCRIPT_DIR/run_qbank_c033333_gate_strategy.sh" "$@"

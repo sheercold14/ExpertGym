@@ -217,6 +217,9 @@ def _effective_coefficients(gates: dict[str, float]) -> list[tuple[str, str, flo
                 output.append((name, expert, float(gates[key])))
         return output
 
+    if all(expert in gates for expert in EXPERTS):
+        return [("global", expert, float(gates[expert])) for expert in EXPERTS]
+
     band_names = sorted({key.split(".", 1)[0] for key in gates if "." in key and "::" not in key})
     if band_names:
         output = []

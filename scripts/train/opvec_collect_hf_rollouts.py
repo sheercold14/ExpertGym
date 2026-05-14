@@ -605,7 +605,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default=None, help="Optional HF device_map, e.g. auto, for multi-GPU sharding.")
     parser.add_argument("--max-memory", action="append", default=[], help="HF max_memory entry, e.g. 0=70GiB. Repeatable.")
     parser.add_argument("--torch-dtype", default="bfloat16")
-    parser.add_argument("--gate-parameterization", choices=["global", "layer-band", "parameter", "global-parameter"], default="global")
+    parser.add_argument(
+        "--gate-parameterization",
+        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        default="global",
+    )
     parser.add_argument("--gate-checkpoint", default=None)
     parser.add_argument("--policy-model", default=None, help="Optional policy checkpoint to sample from instead of config models.base.")
     parser.add_argument("--disable-gates", action="store_true", help="Do not install OP-VEC gated modules; useful for baked policy checkpoints.")
@@ -624,6 +628,13 @@ def _normalize_gate_parameterization(value: str) -> str:
         "global_param": "global-parameter",
         "global-residual": "global-parameter",
         "global_residual": "global-parameter",
+        "global_coefficient": "global-coefficient",
+        "global-coefficients": "global-coefficient",
+        "global_coefficients": "global-coefficient",
+        "global-direct": "global-coefficient",
+        "global_direct": "global-coefficient",
+        "expert-coefficient": "global-coefficient",
+        "expert_coefficient": "global-coefficient",
     }
     return aliases.get(str(value), str(value))
 

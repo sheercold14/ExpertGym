@@ -38,6 +38,11 @@ def main() -> None:
     loop_start = time.time()
     if args.start_iteration < 1:
         raise SystemExit("--start-iteration must be >= 1")
+    optimizer_state_checkpoint = args.optimizer_state_checkpoint
+    if args.persist_optimizer_state and optimizer_state_checkpoint is None and args.start_iteration > 1:
+        previous_state = run_dir / f"iter_{args.start_iteration - 1:03d}" / "gate_updates.optimizer.pt"
+        if previous_state.exists():
+            optimizer_state_checkpoint = str(previous_state)
     end_iteration = args.start_iteration + args.num_iters - 1
     for iteration in range(args.start_iteration, end_iteration + 1):
         iter_start = time.time()
@@ -46,6 +51,8 @@ def main() -> None:
         baked_policy = iter_dir / "baked_policy"
         rollouts = iter_dir / "rollouts.jsonl"
         updates = iter_dir / "gate_updates.jsonl"
+        optimizer_state_out = iter_dir / "gate_updates.optimizer.pt" if args.persist_optimizer_state else None
+        dynamic_opd_rollout = iter_dir / "opd_distill_from_allfail.jsonl" if args.dynamic_opd_expert_rollout else None
 
         bake_cmd = _bake_command(args, baked_policy=baked_policy, gate_checkpoint=gate_checkpoint)
         collect_cmd = _collect_command(
@@ -66,12 +73,20 @@ def main() -> None:
             if args.rollout_shards > 1
             else []
         )
+        dynamic_opd_cmd = (
+            _dynamic_opd_command(args, current_rollouts=rollouts, output=dynamic_opd_rollout, iteration=iteration)
+            if dynamic_opd_rollout is not None
+            else None
+        )
         update_cmd = _update_command(
             args,
             rollouts=rollouts,
             updates=updates,
             gate_checkpoint=gate_checkpoint,
+            optimizer_state_in=optimizer_state_checkpoint,
+            optimizer_state_out=optimizer_state_out,
             iteration=iteration,
+            extra_opd_rollouts=[dynamic_opd_rollout] if dynamic_opd_rollout is not None else [],
         )
 
         timings = {}
@@ -86,6 +101,8 @@ def main() -> None:
                 print("[dry-run][merge]", " ".join(str(spec["output"]) for spec in shard_specs), "->", rollouts)
             else:
                 print("[dry-run]", _fmt_cmd(collect_cmd))
+            if dynamic_opd_cmd:
+                print("[dry-run][dynamic-opd]", _fmt_cmd(dynamic_opd_cmd))
             print("[dry-run]", _fmt_cmd(update_cmd))
         else:
             timings["bake_seconds"] = _run_timed("bake", bake_cmd)
@@ -96,6 +113,8 @@ def main() -> None:
                 timings["collect_seconds"] = _run_sharded_collect(args, shard_specs, merged_rollouts=rollouts)
             else:
                 timings["collect_seconds"] = _run_timed("collect", collect_cmd)
+            if dynamic_opd_cmd:
+                timings["dynamic_opd_seconds"] = _run_timed("dynamic-opd", dynamic_opd_cmd)
             timings["update_seconds"] = _run_timed("update", update_cmd)
 
         next_gate = updates.with_suffix(".gates.json")
@@ -107,11 +126,15 @@ def main() -> None:
             "updates": str(updates),
             "input_gate_checkpoint": gate_checkpoint,
             "output_gate_checkpoint": str(next_gate),
+            "input_optimizer_state": optimizer_state_checkpoint,
+            "output_optimizer_state": str(optimizer_state_out) if optimizer_state_out else None,
             "bake_command": bake_cmd,
             "collect_command": collect_cmd,
             "update_command": update_cmd,
             "collect_commands": [spec["cmd"] for spec in shard_specs] if shard_specs else [collect_cmd],
             "rollout_shards": _compact_shard_specs(shard_specs),
+            "dynamic_opd_rollout": str(dynamic_opd_rollout) if dynamic_opd_rollout else None,
+            "dynamic_opd_command": dynamic_opd_cmd,
             "timings": {**timings, "iteration_seconds": time.time() - iter_start},
         }
         if summary_path.exists():
@@ -121,6 +144,8 @@ def main() -> None:
                 iter_summary["update_summary_error"] = str(error)
         manifest["iterations"].append(iter_summary)
         gate_checkpoint = str(next_gate)
+        if optimizer_state_out and (args.dry_run or optimizer_state_out.exists()):
+            optimizer_state_checkpoint = str(optimizer_state_out)
         _write_json(run_dir / "gated_grpo_bake_vllm_loop_manifest.json", manifest)
 
     manifest["elapsed_seconds"] = time.time() - loop_start
@@ -319,7 +344,10 @@ def _update_command(
     rollouts: Path,
     updates: Path,
     gate_checkpoint: str | None,
+    optimizer_state_in: str | None,
+    optimizer_state_out: Path | None,
     iteration: int,
+    extra_opd_rollouts: list[Path] | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -339,6 +367,10 @@ def _update_command(
         "--fill-missing-old-logprob",
         "--lr",
         str(args.lr),
+        "--optimizer",
+        args.optimizer,
+        "--sgd-momentum",
+        str(args.sgd_momentum),
         "--prior-loss-weight",
         str(args.prior_loss_weight),
         "--ppo-loss-weight",
@@ -363,6 +395,8 @@ def _update_command(
         str(args.update_batch_size),
         "--batch-loss-reduction",
         args.batch_loss_reduction,
+        "--optimizer-step-scope",
+        args.optimizer_step_scope,
         "--loss-granularity",
         args.loss_granularity,
         "--frontier-order",
@@ -372,6 +406,12 @@ def _update_command(
     ]
     if args.device_map:
         cmd += ["--device-map", args.device_map]
+    if args.sgd_nesterov:
+        cmd.append("--sgd-nesterov")
+    if optimizer_state_in:
+        cmd += ["--optimizer-state-in", str(optimizer_state_in)]
+    if optimizer_state_out:
+        cmd += ["--optimizer-state-out", str(optimizer_state_out)]
     for item in args.max_memory or []:
         cmd += ["--max-memory", item]
     if args.gradient_checkpointing:
@@ -390,8 +430,40 @@ def _update_command(
         cmd.append("--use-retention")
     if args.max_retention_rows is not None:
         cmd += ["--max-retention-rows", str(args.max_retention_rows)]
+    if args.max_retention_rows_per_task is not None:
+        cmd += ["--max-retention-rows-per-task", str(args.max_retention_rows_per_task)]
     if args.retention_loss_weight is not None:
         cmd += ["--retention-loss-weight", str(args.retention_loss_weight)]
+    cmd += ["--retention-objective", args.retention_objective]
+    if args.retention_positive_reward_threshold is not None:
+        cmd += ["--retention-positive-reward-threshold", str(args.retention_positive_reward_threshold)]
+    for item in args.opd_distill_rollout or []:
+        cmd += ["--opd-distill-rollout", item]
+    for item in extra_opd_rollouts or []:
+        cmd += ["--opd-distill-rollout", str(item)]
+    if args.max_opd_distill_rows is not None:
+        cmd += ["--max-opd-distill-rows", str(args.max_opd_distill_rows)]
+    if args.opd_loss_weight != 0.0:
+        cmd += ["--opd-loss-weight", str(args.opd_loss_weight)]
+    if args.opd_pairwise_loss_weight != 0.0:
+        cmd += ["--opd-pairwise-loss-weight", str(args.opd_pairwise_loss_weight)]
+    if args.opd_pairwise_margin != 0.0:
+        cmd += ["--opd-pairwise-margin", str(args.opd_pairwise_margin)]
+    if args.max_opd_pairwise_pairs_per_row:
+        cmd += ["--max-opd-pairwise-pairs-per-row", str(args.max_opd_pairwise_pairs_per_row)]
+    if args.opd_positive_reward_threshold is not None:
+        cmd += ["--opd-positive-reward-threshold", str(args.opd_positive_reward_threshold)]
+    if args.use_opd_all_success:
+        cmd.append("--use-opd-all-success")
+    if args.opd_all_success_loss_weight != 0.0:
+        cmd += ["--opd-all-success-loss-weight", str(args.opd_all_success_loss_weight)]
+    if args.max_opd_all_success_rows is not None:
+        cmd += ["--max-opd-all-success-rows", str(args.max_opd_all_success_rows)]
+    if args.opd_all_success_positive_reward_threshold is not None:
+        cmd += [
+            "--opd-all-success-positive-reward-threshold",
+            str(args.opd_all_success_positive_reward_threshold),
+        ]
     if args.recompute_frontier:
         cmd.append("--recompute-frontier")
     if args.length_normalize_logprob:
@@ -419,6 +491,46 @@ def _update_command(
         cmd += ["--positive-reward-threshold", str(args.positive_reward_threshold)]
     if args.max_coefficient_delta_from_init is not None:
         cmd += ["--max-coefficient-delta-from-init", str(args.max_coefficient_delta_from_init)]
+    return cmd
+
+
+def _dynamic_opd_command(
+    args: argparse.Namespace,
+    *,
+    current_rollouts: Path,
+    output: Path,
+    iteration: int,
+) -> list[str]:
+    if output is None:
+        raise ValueError("dynamic OPD output path is required")
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/data/build_opd_distill_from_expert_rollouts.py"),
+        "--current-rollouts",
+        str(current_rollouts),
+        "--output",
+        str(output),
+        "--tasks",
+        args.dynamic_opd_tasks,
+        "--key",
+        args.dynamic_opd_key,
+        "--current-max-success",
+        str(args.dynamic_opd_current_max_success),
+        "--positive-threshold",
+        str(args.dynamic_opd_positive_threshold),
+        "--max-positives-per-row",
+        str(args.dynamic_opd_max_positives_per_row),
+        "--max-negatives-per-row",
+        str(args.dynamic_opd_max_negatives_per_row),
+        "--per-task",
+        str(args.dynamic_opd_per_task),
+        "--seed",
+        str(int(args.seed + iteration - 1 + args.dynamic_opd_seed_offset)),
+    ]
+    for item in args.dynamic_opd_expert_rollout or []:
+        cmd += ["--expert-rollouts", item]
+    for item in args.dynamic_opd_quota or []:
+        cmd += ["--quota", item]
     return cmd
 
 
@@ -611,10 +723,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update-epochs", type=int, default=1)
     parser.add_argument("--update-batch-size", type=int, default=1)
     parser.add_argument("--batch-loss-reduction", choices=["mean", "sum"], default="mean")
+    parser.add_argument("--optimizer-step-scope", choices=["batch", "epoch"], default="batch")
     parser.add_argument("--loss-granularity", choices=["sequence", "token"], default="sequence")
     parser.add_argument("--frontier-order", choices=["as-is", "shuffle", "task-interleaved"], default="as-is")
     parser.add_argument("--frontier-shuffle-seed", type=int, default=None)
     parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument("--sgd-momentum", type=float, default=0.0)
+    parser.add_argument("--sgd-nesterov", action="store_true")
+    parser.add_argument(
+        "--persist-optimizer-state",
+        action="store_true",
+        help="Persist and reload optimizer state across outer rollout/update iterations.",
+    )
+    parser.add_argument(
+        "--optimizer-state-checkpoint",
+        default=None,
+        help="Optional optimizer state checkpoint to load before the first update iteration.",
+    )
     parser.add_argument("--prior-loss-weight", type=float, default=0.02)
     parser.add_argument("--ppo-loss-weight", type=float, default=1.0)
     parser.add_argument("--best-response-loss-weight", type=float, default=0.0)
@@ -628,7 +754,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-memory", action="append", default=[])
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--torch-dtype", default="bfloat16")
-    parser.add_argument("--gate-parameterization", choices=["global", "layer-band", "parameter", "global-parameter"], default="global")
+    parser.add_argument(
+        "--gate-parameterization",
+        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        default="global",
+    )
     parser.add_argument("--init-gate-checkpoint", default=None)
     parser.add_argument("--max-gated-modules", type=int, default=None)
     parser.add_argument("--task-weight", action="append", default=[])
@@ -636,7 +766,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frontier-rows-per-task", type=int, default=None)
     parser.add_argument("--use-retention", action="store_true")
     parser.add_argument("--max-retention-rows", type=int, default=None)
+    parser.add_argument("--max-retention-rows-per-task", type=int, default=None)
     parser.add_argument("--retention-loss-weight", type=float, default=None)
+    parser.add_argument("--retention-objective", choices=["kl", "nll"], default="kl")
+    parser.add_argument("--retention-positive-reward-threshold", type=float, default=1.0)
+    parser.add_argument("--opd-distill-rollout", action="append", default=[])
+    parser.add_argument("--max-opd-distill-rows", type=int, default=None)
+    parser.add_argument("--opd-loss-weight", type=float, default=0.0)
+    parser.add_argument("--opd-pairwise-loss-weight", type=float, default=0.0)
+    parser.add_argument("--opd-pairwise-margin", type=float, default=0.0)
+    parser.add_argument("--max-opd-pairwise-pairs-per-row", type=int, default=0)
+    parser.add_argument("--opd-positive-reward-threshold", type=float, default=None)
+    parser.add_argument(
+        "--dynamic-opd-expert-rollout",
+        action="append",
+        default=[],
+        help=(
+            "Expert rollout JSONL used to build per-iteration OPD rows from the current "
+            "policy's all-failure prompts. Repeat for multiple task experts."
+        ),
+    )
+    parser.add_argument("--dynamic-opd-tasks", default="tool,memory,code")
+    parser.add_argument("--dynamic-opd-key", choices=["prompt_id", "group_id"], default="prompt_id")
+    parser.add_argument("--dynamic-opd-current-max-success", type=int, default=0)
+    parser.add_argument("--dynamic-opd-positive-threshold", type=float, default=1.0)
+    parser.add_argument("--dynamic-opd-max-positives-per-row", type=int, default=1)
+    parser.add_argument("--dynamic-opd-max-negatives-per-row", type=int, default=2)
+    parser.add_argument("--dynamic-opd-per-task", type=int, default=32)
+    parser.add_argument("--dynamic-opd-quota", action="append", default=[])
+    parser.add_argument("--dynamic-opd-seed-offset", type=int, default=7919)
+    parser.add_argument("--use-opd-all-success", action="store_true")
+    parser.add_argument("--opd-all-success-loss-weight", type=float, default=0.0)
+    parser.add_argument("--max-opd-all-success-rows", type=int, default=None)
+    parser.add_argument("--opd-all-success-positive-reward-threshold", type=float, default=1.0)
     parser.add_argument("--recompute-frontier", action="store_true")
     parser.add_argument("--length-normalize-logprob", action="store_true")
     parser.add_argument("--length-normalize-policy-logprob", action="store_true")

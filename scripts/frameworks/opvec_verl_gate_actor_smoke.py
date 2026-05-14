@@ -56,7 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--config", default="configs/gated_grpo.yaml")
     parser.add_argument("--mode-manifest", required=True)
-    parser.add_argument("--gate-parameterization", choices=["global", "layer-band", "parameter", "global-parameter"], default="global")
+    parser.add_argument(
+        "--gate-parameterization",
+        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        default="global",
+    )
     parser.add_argument("--init-gate-checkpoint", default=None)
     parser.add_argument("--max-gated-modules", type=int, default=1)
     parser.add_argument("--device", default="cpu")

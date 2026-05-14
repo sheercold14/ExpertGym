@@ -43,12 +43,18 @@ def main() -> None:
             "Only OP-VEC gate/coefficient parameters are optimized; base and expert task-vector deltas remain frozen.",
         ],
     }
+    optimizer_state_checkpoint = args.optimizer_state_checkpoint
+    if args.persist_optimizer_state and optimizer_state_checkpoint is None:
+        previous_state = run_dir / "iter_000" / "gate_updates.optimizer.pt"
+        if previous_state.exists():
+            optimizer_state_checkpoint = str(previous_state)
 
     for iteration in range(1, args.num_iters + 1):
         iter_dir = run_dir / f"iter_{iteration:03d}"
         iter_dir.mkdir(parents=True, exist_ok=True)
         rollouts = iter_dir / "rollouts.jsonl"
         updates = iter_dir / "gate_updates.jsonl"
+        optimizer_state_out = iter_dir / "gate_updates.optimizer.pt" if args.persist_optimizer_state else None
 
         collect_cmd = _collect_command(args, rollouts=rollouts, gate_checkpoint=gate_checkpoint, iteration=iteration)
         update_cmd = _update_command(
@@ -56,6 +62,8 @@ def main() -> None:
             rollouts=rollouts,
             updates=updates,
             gate_checkpoint=gate_checkpoint,
+            optimizer_state_in=optimizer_state_checkpoint,
+            optimizer_state_out=optimizer_state_out,
             iteration=iteration,
         )
 
@@ -74,6 +82,8 @@ def main() -> None:
             "updates": str(updates),
             "input_gate_checkpoint": gate_checkpoint,
             "output_gate_checkpoint": str(next_gate),
+            "input_optimizer_state": optimizer_state_checkpoint,
+            "output_optimizer_state": str(optimizer_state_out) if optimizer_state_out else None,
             "collect_command": collect_cmd,
             "update_command": update_cmd,
         }
@@ -84,6 +94,8 @@ def main() -> None:
                 iter_summary["update_summary_error"] = str(error)
         manifest["iterations"].append(iter_summary)
         gate_checkpoint = str(next_gate)
+        if optimizer_state_out and (args.dry_run or optimizer_state_out.exists()):
+            optimizer_state_checkpoint = str(optimizer_state_out)
         _write_json(run_dir / "gated_grpo_loop_manifest.json", manifest)
 
     if args.bake_final and gate_checkpoint:
@@ -187,6 +199,8 @@ def _update_command(
     rollouts: Path,
     updates: Path,
     gate_checkpoint: str | None,
+    optimizer_state_in: str | None,
+    optimizer_state_out: Path | None,
     iteration: int,
 ) -> list[str]:
     cmd = [
@@ -206,6 +220,10 @@ def _update_command(
         str(args.max_logprob_tokens),
         "--lr",
         str(args.lr),
+        "--optimizer",
+        args.optimizer,
+        "--sgd-momentum",
+        str(args.sgd_momentum),
         "--prior-loss-weight",
         str(args.prior_loss_weight),
         "--ppo-loss-weight",
@@ -230,6 +248,8 @@ def _update_command(
         str(args.update_batch_size),
         "--batch-loss-reduction",
         args.batch_loss_reduction,
+        "--optimizer-step-scope",
+        args.optimizer_step_scope,
         "--loss-granularity",
         args.loss_granularity,
         "--frontier-order",
@@ -239,6 +259,12 @@ def _update_command(
     ]
     if args.recompute_frontier:
         cmd.append("--recompute-frontier")
+    if args.sgd_nesterov:
+        cmd.append("--sgd-nesterov")
+    if optimizer_state_in:
+        cmd += ["--optimizer-state-in", str(optimizer_state_in)]
+    if optimizer_state_out:
+        cmd += ["--optimizer-state-out", str(optimizer_state_out)]
     if args.length_normalize_logprob:
         cmd.append("--length-normalize-logprob")
     if args.length_normalize_policy_logprob:
@@ -278,6 +304,34 @@ def _update_command(
         cmd += ["--max-retention-rows", str(args.max_retention_rows)]
     if args.retention_loss_weight is not None:
         cmd += ["--retention-loss-weight", str(args.retention_loss_weight)]
+    cmd += ["--retention-objective", args.retention_objective]
+    if args.retention_positive_reward_threshold is not None:
+        cmd += ["--retention-positive-reward-threshold", str(args.retention_positive_reward_threshold)]
+    for item in args.opd_distill_rollout or []:
+        cmd += ["--opd-distill-rollout", item]
+    if args.max_opd_distill_rows is not None:
+        cmd += ["--max-opd-distill-rows", str(args.max_opd_distill_rows)]
+    if args.opd_loss_weight != 0.0:
+        cmd += ["--opd-loss-weight", str(args.opd_loss_weight)]
+    if args.opd_pairwise_loss_weight != 0.0:
+        cmd += ["--opd-pairwise-loss-weight", str(args.opd_pairwise_loss_weight)]
+    if args.opd_pairwise_margin != 0.0:
+        cmd += ["--opd-pairwise-margin", str(args.opd_pairwise_margin)]
+    if args.max_opd_pairwise_pairs_per_row:
+        cmd += ["--max-opd-pairwise-pairs-per-row", str(args.max_opd_pairwise_pairs_per_row)]
+    if args.opd_positive_reward_threshold is not None:
+        cmd += ["--opd-positive-reward-threshold", str(args.opd_positive_reward_threshold)]
+    if args.use_opd_all_success:
+        cmd.append("--use-opd-all-success")
+    if args.opd_all_success_loss_weight != 0.0:
+        cmd += ["--opd-all-success-loss-weight", str(args.opd_all_success_loss_weight)]
+    if args.max_opd_all_success_rows is not None:
+        cmd += ["--max-opd-all-success-rows", str(args.max_opd_all_success_rows)]
+    if args.opd_all_success_positive_reward_threshold is not None:
+        cmd += [
+            "--opd-all-success-positive-reward-threshold",
+            str(args.opd_all_success_positive_reward_threshold),
+        ]
     return cmd
 
 
@@ -311,7 +365,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-manifest-order", action="store_true")
     parser.add_argument("--seed", type=int, default=20260510)
     parser.add_argument("--init-gate-checkpoint", default=None)
-    parser.add_argument("--gate-parameterization", choices=["global", "layer-band", "parameter", "global-parameter"], default="global")
+    parser.add_argument(
+        "--gate-parameterization",
+        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        default="global",
+    )
     parser.add_argument("--max-gated-modules", type=int, default=None, help="Default/all; use 1 for smoke test")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-prompt-tokens", type=int, default=2048)
@@ -332,10 +390,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update-epochs", type=int, default=1, help="GRPO epochs over each collected on-policy rollout file")
     parser.add_argument("--update-batch-size", type=int, default=1)
     parser.add_argument("--batch-loss-reduction", choices=["mean", "sum"], default="mean")
+    parser.add_argument("--optimizer-step-scope", choices=["batch", "epoch"], default="batch")
     parser.add_argument("--loss-granularity", choices=["sequence", "token"], default="sequence")
     parser.add_argument("--frontier-order", choices=["as-is", "shuffle", "task-interleaved"], default="as-is")
     parser.add_argument("--frontier-shuffle-seed", type=int, default=None)
     parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument("--sgd-momentum", type=float, default=0.0)
+    parser.add_argument("--sgd-nesterov", action="store_true")
+    parser.add_argument("--persist-optimizer-state", action="store_true")
+    parser.add_argument("--optimizer-state-checkpoint", default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--prior-loss-weight", type=float, default=0.01)
     parser.add_argument("--ppo-loss-weight", type=float, default=1.0)
@@ -360,6 +424,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-retention", action="store_true")
     parser.add_argument("--max-retention-rows", type=int, default=None)
     parser.add_argument("--retention-loss-weight", type=float, default=None)
+    parser.add_argument("--retention-objective", choices=["kl", "nll"], default="kl")
+    parser.add_argument("--retention-positive-reward-threshold", type=float, default=1.0)
+    parser.add_argument("--opd-distill-rollout", action="append", default=[])
+    parser.add_argument("--max-opd-distill-rows", type=int, default=None)
+    parser.add_argument("--opd-loss-weight", type=float, default=0.0)
+    parser.add_argument("--opd-pairwise-loss-weight", type=float, default=0.0)
+    parser.add_argument("--opd-pairwise-margin", type=float, default=0.0)
+    parser.add_argument("--max-opd-pairwise-pairs-per-row", type=int, default=0)
+    parser.add_argument("--opd-positive-reward-threshold", type=float, default=None)
+    parser.add_argument("--use-opd-all-success", action="store_true")
+    parser.add_argument("--opd-all-success-loss-weight", type=float, default=0.0)
+    parser.add_argument("--max-opd-all-success-rows", type=int, default=None)
+    parser.add_argument("--opd-all-success-positive-reward-threshold", type=float, default=1.0)
 
     parser.add_argument("--bake-final", action="store_true")
     parser.add_argument("--bake-output", default=None)
