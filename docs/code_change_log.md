@@ -420,3 +420,82 @@ Validation:
   - 18 tests passed.
 - `DRY_RUN=1 RUN_TAG=20260514_nll_dry NUM_ITERS=1 NUM_PROMPTS=2 SAMPLES_PER_PROMPT=2 bash skill/command/run_paper96_dynamic_opd_nolen_abcd_20260514.sh`
   - Verified B/D update commands include `--use-retention --retention-objective nll`; protected variants now use `RETENTION_LOSS_WEIGHT=0.05`.
+
+## 2026-05-15 Dynamic OPD Scale And Component Length Norm Split
+
+Context:
+
+- The balanced Paper96 run with `LENGTH_NORMALIZE_LOGPROB=1` made OPD numerically clean but too weak: gate deltas stayed around `1e-3`.
+- The previous successful OPD run used sequence-level OPD and had much larger gate movement, but raw sequence loss can let long Memory/Code trajectories dominate.
+- The new control rule separates overall step size from relative objective scale: LR controls total movement, OPD scale controls OPD-vs-GRPO pressure, and OPD rows are balanced by task.
+
+Changes:
+
+- `scripts/train/opvec_update_gates_from_rollouts.py`
+  - Added component-specific length normalization:
+    - `--opd-length-normalize-logprob` / `--no-opd-length-normalize-logprob`
+    - `--retention-length-normalize-logprob` / `--no-retention-length-normalize-logprob`
+    - Both default to legacy `--length-normalize-logprob` when unspecified.
+  - Added `--opd-dynamic-scale`.
+    - Before OPD backward, the updater runs a no-grad OPD scoring pass per task.
+    - It estimates mean absolute OPD loss per task and computes a component scale:
+
+```text
+scale_task = clamp(
+  ppo_loss_weight * target_ratio(recoverable_all_fail_rate_task)
+  / (mean_abs_opd_loss_task + eps),
+  scale_min,
+  scale_max
+)
+```
+
+  - Added `--opd-task-balanced-loss-scale`.
+    - OPD row reduction becomes `1 / (3 * opd_rows_in_task)`.
+    - Missing-task OPD is not redistributed to other tasks.
+  - Summary and row logs now include:
+    - `opd_scale_plan`
+    - `opd_dynamic_scale`
+    - `opd_row_loss_scale`
+    - `opd_scale_target_ratio`
+    - `opd_recoverable_all_fail_rate`
+    - component-specific length norm settings.
+
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - Passes the new OPD/retention length-norm and OPD scale arguments to the updater.
+
+- `scripts/train/opvec_gated_grpo_loop.py`
+  - Same passthrough for the non-bake native loop.
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - Added env controls:
+    - `OPD_LENGTH_NORMALIZE_LOGPROB=inherit|0|1`
+    - `RETENTION_LENGTH_NORMALIZE_LOGPROB=inherit|0|1`
+    - `RETENTION_DYNAMIC_SCALE=0|1`
+    - `RETENTION_TASK_BALANCED_LOSS_SCALE=0|1`
+    - `RETENTION_SCALE_TARGET`
+    - `OPD_DYNAMIC_SCALE=0|1`
+    - `OPD_TASK_BALANCED_LOSS_SCALE=0|1`
+    - `OPD_SCALE_TARGET_HIGH/MID/LOW/TAIL`
+  - Launch logs now print active component length norm, retention scale, and OPD scale settings.
+
+Follow-up refinement:
+
+- Added dynamic scaling for retention NLL, matching the OPD scale mechanism.
+  - `--retention-dynamic-scale` performs a no-grad retention NLL scoring pass.
+  - `--retention-task-balanced-loss-scale` reduces retention as `1 / (3 * retention_rows_in_task)`.
+  - `--retention-scale-target` sets the GRPO-relative target, default `0.5`.
+  - Row logs now include `retention_dynamic_scale`, `retention_row_loss_scale`, and `retention_scale_target_ratio`.
+  - Summary now includes `retention_scale_plan`.
+- `skill/command/run_dynamic_opd_scale_20260515.sh` enables retention dynamic scaling by default for the four-run matrix.
+
+Validation:
+
+- `python -m py_compile scripts/train/opvec_update_gates_from_rollouts.py scripts/train/opvec_gated_grpo_bake_vllm_loop.py scripts/train/opvec_gated_grpo_loop.py`
+- `bash -n skill/command/run_qbank_c033333_gate_strategy.sh`
+- Dry-run verified that the update command includes:
+  - `--no-opd-length-normalize-logprob`
+  - `--retention-length-normalize-logprob`
+  - `--retention-dynamic-scale`
+  - `--retention-task-balanced-loss-scale`
+  - `--opd-dynamic-scale`
+  - `--opd-task-balanced-loss-scale`

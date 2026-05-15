@@ -62,6 +62,14 @@ Update / objective:
   USE_FRONTIER_WEIGHT=0|1                default 0; keep frontier filtering but do not scale advantages by frontier weight
   LENGTH_NORMALIZE_POLICY_LOGPROB=0|1
   LENGTH_NORMALIZE_LOGPROB=0|1
+  OPD_LENGTH_NORMALIZE_LOGPROB=inherit|0|1
+  RETENTION_LENGTH_NORMALIZE_LOGPROB=inherit|0|1
+  RETENTION_DYNAMIC_SCALE=0|1           auto-scale retention NLL per task to a fixed GRPO-relative target
+  RETENTION_TASK_BALANCED_LOSS_SCALE=0|1 average retention by task instead of raw row count
+  RETENTION_SCALE_TARGET=0.5             target retention/GRPO ratio when retention rows exist
+  OPD_DYNAMIC_SCALE=0|1                  auto-scale OPD per task from current OPD loss magnitudes
+  OPD_TASK_BALANCED_LOSS_SCALE=0|1       average OPD by task instead of raw row count
+  OPD_SCALE_TARGET_HIGH/MID/LOW/TAIL     target OPD/GRPO ratios by recoverable all-fail rate
   LR=                                  default depends on STRATEGY
   OPTIMIZER=adamw|sgd
   SGD_MOMENTUM=0.0
@@ -234,6 +242,25 @@ ADVANTAGE_NORMALIZATION="${ADVANTAGE_NORMALIZATION:-centered}"
 USE_FRONTIER_WEIGHT="${USE_FRONTIER_WEIGHT:-0}"
 LENGTH_NORMALIZE_POLICY_LOGPROB="${LENGTH_NORMALIZE_POLICY_LOGPROB:-1}"
 LENGTH_NORMALIZE_LOGPROB="${LENGTH_NORMALIZE_LOGPROB:-0}"
+OPD_LENGTH_NORMALIZE_LOGPROB="${OPD_LENGTH_NORMALIZE_LOGPROB:-inherit}"
+RETENTION_LENGTH_NORMALIZE_LOGPROB="${RETENTION_LENGTH_NORMALIZE_LOGPROB:-inherit}"
+RETENTION_DYNAMIC_SCALE="${RETENTION_DYNAMIC_SCALE:-0}"
+RETENTION_TASK_BALANCED_LOSS_SCALE="${RETENTION_TASK_BALANCED_LOSS_SCALE:-0}"
+RETENTION_SCALE_TARGET="${RETENTION_SCALE_TARGET:-0.5}"
+RETENTION_SCALE_MIN="${RETENTION_SCALE_MIN:-0.05}"
+RETENTION_SCALE_MAX="${RETENTION_SCALE_MAX:-100.0}"
+RETENTION_SCALE_EPS="${RETENTION_SCALE_EPS:-1e-6}"
+OPD_DYNAMIC_SCALE="${OPD_DYNAMIC_SCALE:-0}"
+OPD_TASK_BALANCED_LOSS_SCALE="${OPD_TASK_BALANCED_LOSS_SCALE:-0}"
+OPD_SCALE_MIN="${OPD_SCALE_MIN:-0.05}"
+OPD_SCALE_MAX="${OPD_SCALE_MAX:-100.0}"
+OPD_SCALE_RATE_HIGH="${OPD_SCALE_RATE_HIGH:-0.20}"
+OPD_SCALE_RATE_MID="${OPD_SCALE_RATE_MID:-0.10}"
+OPD_SCALE_RATE_LOW="${OPD_SCALE_RATE_LOW:-0.03}"
+OPD_SCALE_TARGET_HIGH="${OPD_SCALE_TARGET_HIGH:-5.0}"
+OPD_SCALE_TARGET_MID="${OPD_SCALE_TARGET_MID:-3.0}"
+OPD_SCALE_TARGET_LOW="${OPD_SCALE_TARGET_LOW:-1.0}"
+OPD_SCALE_TARGET_TAIL="${OPD_SCALE_TARGET_TAIL:-0.33}"
 PPO_LOSS_WEIGHT="${PPO_LOSS_WEIGHT:-1.0}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
 SGD_MOMENTUM="${SGD_MOMENTUM:-0.0}"
@@ -368,6 +395,47 @@ fi
 if is_truthy "$LENGTH_NORMALIZE_LOGPROB"; then
   OBJECTIVE_ARGS+=(--length-normalize-logprob)
 fi
+case "${OPD_LENGTH_NORMALIZE_LOGPROB,,}" in
+  inherit|"") ;;
+  1|true|yes|y|on) OBJECTIVE_ARGS+=(--opd-length-normalize-logprob) ;;
+  0|false|no|n|off) OBJECTIVE_ARGS+=(--no-opd-length-normalize-logprob) ;;
+  *) echo "[error] OPD_LENGTH_NORMALIZE_LOGPROB must be inherit, 0, or 1; got $OPD_LENGTH_NORMALIZE_LOGPROB" >&2; exit 2 ;;
+esac
+case "${RETENTION_LENGTH_NORMALIZE_LOGPROB,,}" in
+  inherit|"") ;;
+  1|true|yes|y|on) OBJECTIVE_ARGS+=(--retention-length-normalize-logprob) ;;
+  0|false|no|n|off) OBJECTIVE_ARGS+=(--no-retention-length-normalize-logprob) ;;
+  *) echo "[error] RETENTION_LENGTH_NORMALIZE_LOGPROB must be inherit, 0, or 1; got $RETENTION_LENGTH_NORMALIZE_LOGPROB" >&2; exit 2 ;;
+esac
+if is_truthy "$RETENTION_DYNAMIC_SCALE"; then
+  OBJECTIVE_ARGS+=(--retention-dynamic-scale)
+fi
+if is_truthy "$RETENTION_TASK_BALANCED_LOSS_SCALE"; then
+  OBJECTIVE_ARGS+=(--retention-task-balanced-loss-scale)
+fi
+OBJECTIVE_ARGS+=(
+  --retention-scale-target "$RETENTION_SCALE_TARGET"
+  --retention-scale-min "$RETENTION_SCALE_MIN"
+  --retention-scale-max "$RETENTION_SCALE_MAX"
+  --retention-scale-eps "$RETENTION_SCALE_EPS"
+)
+if is_truthy "$OPD_DYNAMIC_SCALE"; then
+  OBJECTIVE_ARGS+=(--opd-dynamic-scale)
+fi
+if is_truthy "$OPD_TASK_BALANCED_LOSS_SCALE"; then
+  OBJECTIVE_ARGS+=(--opd-task-balanced-loss-scale)
+fi
+OBJECTIVE_ARGS+=(
+  --opd-scale-min "$OPD_SCALE_MIN"
+  --opd-scale-max "$OPD_SCALE_MAX"
+  --opd-scale-rate-high "$OPD_SCALE_RATE_HIGH"
+  --opd-scale-rate-mid "$OPD_SCALE_RATE_MID"
+  --opd-scale-rate-low "$OPD_SCALE_RATE_LOW"
+  --opd-scale-target-high "$OPD_SCALE_TARGET_HIGH"
+  --opd-scale-target-mid "$OPD_SCALE_TARGET_MID"
+  --opd-scale-target-low "$OPD_SCALE_TARGET_LOW"
+  --opd-scale-target-tail "$OPD_SCALE_TARGET_TAIL"
+)
 if [[ "$LENGTH_NORMALIZE_POLICY_LOGPROB" == "1" || "$LENGTH_NORMALIZE_POLICY_LOGPROB" == "true" || "$LENGTH_NORMALIZE_POLICY_LOGPROB" == "yes" ]]; then
   OBJECTIVE_ARGS+=(--length-normalize-policy-logprob)
 fi
@@ -547,6 +615,9 @@ echo "[run] optimizer=$OPTIMIZER sgd_momentum=$SGD_MOMENTUM persist_optimizer_st
 echo "[run] lr=$LR prior=$PRIOR_LOSS_WEIGHT max_delta=$MAX_COEFF_DELTA"
 echo "[run] loss_granularity=$LOSS_GRANULARITY update_batch_size=$UPDATE_BATCH_SIZE optimizer_step_scope=$OPTIMIZER_STEP_SCOPE store_token_logprobs=$STORE_TOKEN_LOGPROBS"
 echo "[run] task_normalize_advantages=$TASK_NORMALIZE_ADVANTAGES advantage_normalization=$ADVANTAGE_NORMALIZATION use_frontier_weight=$USE_FRONTIER_WEIGHT advantage_field_frontier_weight=$ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT"
+echo "[run] length_norm policy=$LENGTH_NORMALIZE_POLICY_LOGPROB legacy=$LENGTH_NORMALIZE_LOGPROB opd=$OPD_LENGTH_NORMALIZE_LOGPROB retention=$RETENTION_LENGTH_NORMALIZE_LOGPROB"
+echo "[run] retention_dynamic_scale=$RETENTION_DYNAMIC_SCALE retention_task_balanced=$RETENTION_TASK_BALANCED_LOSS_SCALE retention_target=$RETENTION_SCALE_TARGET"
+echo "[run] opd_dynamic_scale=$OPD_DYNAMIC_SCALE opd_task_balanced=$OPD_TASK_BALANCED_LOSS_SCALE scale_targets=$OPD_SCALE_TARGET_HIGH/$OPD_SCALE_TARGET_MID/$OPD_SCALE_TARGET_LOW/$OPD_SCALE_TARGET_TAIL"
 echo "[run] frontier_order=$FRONTIER_ORDER frontier_shuffle_seed=${FRONTIER_SHUFFLE_SEED:-auto}"
 echo "[run] task_weights=tool:$TASK_WEIGHT_TOOL,memory:$TASK_WEIGHT_MEMORY,code:$TASK_WEIGHT_CODE quotas=tool:$FRONTIER_TOOL_QUOTA,memory:$FRONTIER_MEMORY_QUOTA,code:$FRONTIER_CODE_QUOTA"
 echo "[run] retention=$USE_RETENTION retention_objective=$RETENTION_OBJECTIVE retention_loss_weight=${RETENTION_LOSS_WEIGHT:-none} retention_positive_threshold=${RETENTION_POSITIVE_REWARD_THRESHOLD:-none} max_retention_rows=${MAX_RETENTION_ROWS:-none} max_retention_rows_per_task=${MAX_RETENTION_ROWS_PER_TASK:-none}"

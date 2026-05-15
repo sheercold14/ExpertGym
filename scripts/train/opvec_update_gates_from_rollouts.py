@@ -197,6 +197,14 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
     task_weights = _merged_float_mapping(config.get("calibration", {}).get("task_loss_weight", {}), args.task_weight)
     category_weights = _parse_task_weights(args.category_weight)
     source_weights = _parse_task_weights(args.source_weight)
+    opd_length_normalize = _resolve_component_length_normalize(
+        args.opd_length_normalize_logprob,
+        fallback=bool(args.length_normalize_logprob),
+    )
+    retention_length_normalize = _resolve_component_length_normalize(
+        args.retention_length_normalize_logprob,
+        fallback=bool(args.length_normalize_logprob),
+    )
     train_coefficients = _parse_train_coefficients(args.train_coefficient)
     if train_coefficients and gate_parameterization not in {"global", "layer-band"}:
         raise SystemExit("--train-coefficient only applies to --gate-parameterization global or layer-band; parameterized modes train every mergeable task-vector coefficient")
@@ -227,6 +235,37 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         train_coefficients=train_coefficients,
         coefficient_anchor_gates=coefficient_anchor_gates,
         args=args,
+    )
+    opd_scale_plan = _build_opd_scale_plan(
+        torch,
+        model,
+        tokenizer,
+        opd_rows=opd_rows,
+        raw_rows=raw_rows,
+        args=args,
+        device=device,
+        max_logprob_tokens=int(args.max_logprob_tokens),
+        task_weights=task_weights,
+        category_weights=category_weights,
+        source_weights=source_weights,
+        loss_normalizer=update_batcher.loss_normalizer,
+        length_normalize=opd_length_normalize,
+    )
+    retention_scale_plan = _build_retention_scale_plan(
+        torch,
+        model,
+        tokenizer,
+        retention_rows=retention_rows,
+        raw_rows=raw_rows,
+        args=args,
+        device=device,
+        max_logprob_tokens=int(args.max_logprob_tokens),
+        task_weights=task_weights,
+        category_weights=category_weights,
+        source_weights=source_weights,
+        retention_weight=retention_weight,
+        loss_normalizer=update_batcher.loss_normalizer,
+        length_normalize=retention_length_normalize,
     )
     log_rows = []
     epoch_summaries = []
@@ -515,6 +554,12 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                 source = str(row.get("source") or "opd_distill")
                 source_weight = source_weights.get(source, 1.0)
                 task_weight = task_weights.get(str(row.get("task")), 1.0) * category_weights.get(category, 1.0) * source_weight
+                opd_row_scale = _opd_row_loss_scale(
+                    row,
+                    opd_scale_plan=opd_scale_plan,
+                    default_loss_scale=update_batcher.loss_scale,
+                )
+                opd_component_scale = _opd_component_scale(row, opd_scale_plan=opd_scale_plan)
                 objective_stats = _backward_incremental_best_response_losses(
                     torch,
                     model,
@@ -528,15 +573,16 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     best_response_loss_weight=float(args.opd_loss_weight),
                     pairwise_loss_weight=float(args.opd_pairwise_loss_weight),
                     pairwise_margin=float(args.opd_pairwise_margin),
-                    length_normalize=bool(args.length_normalize_logprob),
+                    length_normalize=opd_length_normalize,
                     positive_reward_threshold=args.opd_positive_reward_threshold,
                     max_pairwise_pairs_per_row=args.max_opd_pairwise_pairs_per_row,
-                    loss_scale=update_batcher.loss_scale,
+                    loss_scale=opd_row_scale,
+                    component_scale=opd_component_scale,
                 )
                 if objective_stats["processed"] < 1:
                     continue
                 prior_loss = _gate_prior_loss(torch, gate_manager) * prior_weight
-                (prior_loss * update_batcher.loss_scale).backward()
+                (prior_loss * opd_row_scale).backward()
                 log_rows.append(
                     {
                         "step": step,
@@ -561,6 +607,11 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "frontier_weight": 0.0,
                         "reward_field": "reward_train",
                         "opd_positive_reward_threshold": args.opd_positive_reward_threshold,
+                        "opd_length_normalize_logprob": opd_length_normalize,
+                        "opd_dynamic_scale": opd_component_scale,
+                        "opd_row_loss_scale": opd_row_scale,
+                        "opd_scale_target_ratio": _opd_task_plan_value(row, opd_scale_plan, "target_ratio"),
+                        "opd_recoverable_all_fail_rate": _opd_task_plan_value(row, opd_scale_plan, "recoverable_all_fail_rate"),
                         "loss_granularity": "sequence",
                         "gates": {},
                     }
@@ -592,7 +643,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     best_response_loss_weight=float(args.opd_all_success_loss_weight),
                     pairwise_loss_weight=0.0,
                     pairwise_margin=0.0,
-                    length_normalize=bool(args.length_normalize_logprob),
+                    length_normalize=retention_length_normalize,
                     positive_reward_threshold=args.opd_all_success_positive_reward_threshold,
                     max_pairwise_pairs_per_row=0,
                     loss_scale=update_batcher.loss_scale,
@@ -625,6 +676,7 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "frontier_weight": 0.0,
                         "reward_field": "reward_train",
                         "opd_positive_reward_threshold": args.opd_all_success_positive_reward_threshold,
+                        "opd_length_normalize_logprob": retention_length_normalize,
                         "loss_granularity": "sequence",
                         "gates": {},
                     }
@@ -646,6 +698,15 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                 source_weight = source_weights.get(source, 1.0)
                 task_weight = task_weights.get(str(row.get("task")), 1.0) * category_weights.get(category, 1.0) * source_weight
                 if args.retention_objective == "nll":
+                    retention_row_scale = _retention_row_loss_scale(
+                        row,
+                        retention_scale_plan=retention_scale_plan,
+                        default_loss_scale=update_batcher.loss_scale,
+                    )
+                    retention_component_scale = _retention_component_scale(
+                        row,
+                        retention_scale_plan=retention_scale_plan,
+                    )
                     objective_stats = _backward_incremental_best_response_losses(
                         torch,
                         model,
@@ -659,10 +720,11 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         best_response_loss_weight=retention_weight,
                         pairwise_loss_weight=0.0,
                         pairwise_margin=0.0,
-                        length_normalize=bool(args.length_normalize_logprob),
+                        length_normalize=retention_length_normalize,
                         positive_reward_threshold=args.retention_positive_reward_threshold,
                         max_pairwise_pairs_per_row=0,
-                        loss_scale=update_batcher.loss_scale,
+                        loss_scale=retention_row_scale,
+                        component_scale=retention_component_scale,
                     )
                     if objective_stats["processed"] < 1:
                         continue
@@ -670,6 +732,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                     kl_loss_total = 0.0
                     best_response_loss_total = objective_stats["best_response_loss"]
                 else:
+                    retention_row_scale = update_batcher.loss_scale
+                    retention_component_scale = 1.0
                     retention_loss_total = 0.0
                     kl_loss_total = 0.0
                     processed = 0
@@ -690,8 +754,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         current = logp.float()
                         log_ratio = (old_logp - current).clamp(-20.0, 20.0)
                         kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
-                        sample_loss = task_weight * retention_weight * kl_loss
-                        (sample_loss * update_batcher.loss_scale).backward()
+                        sample_loss = task_weight * retention_weight * retention_component_scale * kl_loss
+                        (sample_loss * retention_row_scale).backward()
                         value = float(sample_loss.detach().cpu().item())
                         retention_loss_total += value
                         kl_loss_total += value / retention_weight if retention_weight else 0.0
@@ -719,6 +783,10 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
                         "retention_loss": retention_loss_total,
                         "retention_objective": args.retention_objective,
                         "retention_positive_reward_threshold": args.retention_positive_reward_threshold,
+                        "retention_length_normalize_logprob": retention_length_normalize,
+                        "retention_dynamic_scale": retention_component_scale,
+                        "retention_row_loss_scale": retention_row_scale,
+                        "retention_scale_target_ratio": _retention_task_plan_value(row, retention_scale_plan, "target_ratio"),
                         "grad_norm": 0.0,
                         "skipped_step": False,
                         "mean_reward": sum(rewards) / len(rewards),
@@ -776,6 +844,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         "retention_rows": len(retention_rows),
         "opd_distill_rows": len(opd_rows),
         "opd_distill_task_counts": _task_counts(opd_rows),
+        "opd_scale_plan": opd_scale_plan,
+        "retention_scale_plan": retention_scale_plan,
         "opd_all_success_rows": len(opd_all_success_rows),
         "opd_all_success_task_counts": _task_counts(opd_all_success_rows),
         "updates": len(log_rows),
@@ -846,6 +916,14 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "opd_all_success_positive_reward_threshold": args.opd_all_success_positive_reward_threshold,
             "length_normalize_logprob": bool(args.length_normalize_logprob),
             "length_normalize_policy_logprob": bool(args.length_normalize_policy_logprob),
+            "opd_length_normalize_logprob": opd_length_normalize,
+            "retention_length_normalize_logprob": retention_length_normalize,
+            "opd_dynamic_scale": bool(args.opd_dynamic_scale),
+            "opd_task_balanced_loss_scale": bool(args.opd_task_balanced_loss_scale),
+            "opd_scale_mode": str(args.opd_scale_mode),
+            "retention_dynamic_scale": bool(args.retention_dynamic_scale),
+            "retention_task_balanced_loss_scale": bool(args.retention_task_balanced_loss_scale),
+            "retention_scale_target": float(args.retention_scale_target),
             "positive_reward_threshold": args.positive_reward_threshold,
         },
     }
@@ -1543,6 +1621,72 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--length-normalize-logprob", action="store_true")
     parser.add_argument(
+        "--opd-length-normalize-logprob",
+        dest="opd_length_normalize_logprob",
+        action="store_true",
+        default=None,
+        help="Use per-token average logprob for OPD best-response/pairwise losses. Defaults to --length-normalize-logprob.",
+    )
+    parser.add_argument(
+        "--no-opd-length-normalize-logprob",
+        dest="opd_length_normalize_logprob",
+        action="store_false",
+        help="Use sequence-sum logprob for OPD even when --length-normalize-logprob is set.",
+    )
+    parser.add_argument(
+        "--retention-length-normalize-logprob",
+        dest="retention_length_normalize_logprob",
+        action="store_true",
+        default=None,
+        help="Use per-token average logprob for retention NLL / all-success preservation. Defaults to --length-normalize-logprob.",
+    )
+    parser.add_argument(
+        "--no-retention-length-normalize-logprob",
+        dest="retention_length_normalize_logprob",
+        action="store_false",
+        help="Use sequence-sum logprob for retention NLL / all-success preservation.",
+    )
+    parser.add_argument(
+        "--retention-dynamic-scale",
+        action="store_true",
+        help="Estimate retention NLL magnitudes before backward and scale retention to a target ratio.",
+    )
+    parser.add_argument(
+        "--retention-task-balanced-loss-scale",
+        action="store_true",
+        help="Scale retention row reductions as one third of each task mean, so all-success rows stay task-balanced.",
+    )
+    parser.add_argument("--retention-scale-target", type=float, default=0.5)
+    parser.add_argument("--retention-scale-min", type=float, default=0.05)
+    parser.add_argument("--retention-scale-max", type=float, default=100.0)
+    parser.add_argument("--retention-scale-eps", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--opd-dynamic-scale",
+        action="store_true",
+        help="Estimate per-task OPD loss magnitudes before backward and scale OPD to a recoverable-all-fail target ratio.",
+    )
+    parser.add_argument(
+        "--opd-task-balanced-loss-scale",
+        action="store_true",
+        help="Scale OPD row reductions as one third of each task mean, so tasks with more OPD rows do not dominate.",
+    )
+    parser.add_argument(
+        "--opd-scale-mode",
+        choices=["loss"],
+        default="loss",
+        help="Statistic used by --opd-dynamic-scale. loss uses no-grad OPD loss magnitudes.",
+    )
+    parser.add_argument("--opd-scale-min", type=float, default=0.05)
+    parser.add_argument("--opd-scale-max", type=float, default=100.0)
+    parser.add_argument("--opd-scale-eps", type=float, default=1.0e-6)
+    parser.add_argument("--opd-scale-rate-high", type=float, default=0.20)
+    parser.add_argument("--opd-scale-rate-mid", type=float, default=0.10)
+    parser.add_argument("--opd-scale-rate-low", type=float, default=0.03)
+    parser.add_argument("--opd-scale-target-high", type=float, default=5.0)
+    parser.add_argument("--opd-scale-target-mid", type=float, default=3.0)
+    parser.add_argument("--opd-scale-target-low", type=float, default=1.0)
+    parser.add_argument("--opd-scale-target-tail", type=float, default=0.33)
+    parser.add_argument(
         "--length-normalize-policy-logprob",
         action="store_true",
         help="Use per-token average logprob for PPO ratio/KL terms instead of full response logprob.",
@@ -1664,6 +1808,289 @@ def _merged_task_quota(config: dict, cli_items: list[str]) -> dict[str, int]:
 
 def _task_counts(rows: list[dict]) -> dict[str, int]:
     return dict(Counter(str(row.get("task")) for row in rows))
+
+
+def _resolve_component_length_normalize(value: bool | None, *, fallback: bool) -> bool:
+    return bool(fallback) if value is None else bool(value)
+
+
+def _build_opd_scale_plan(
+    torch,
+    model,
+    tokenizer,
+    *,
+    opd_rows: list[dict],
+    raw_rows: list[dict],
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    loss_normalizer: int,
+    length_normalize: bool,
+) -> dict:
+    raw_task_counts = _task_counts(raw_rows)
+    opd_task_counts = _task_counts(opd_rows)
+    tasks = sorted(set(raw_task_counts) | set(opd_task_counts))
+    task_stats: dict[str, dict] = {}
+    for task in tasks:
+        opd_count = int(opd_task_counts.get(task, 0))
+        raw_count = int(raw_task_counts.get(task, 0))
+        rate = float(opd_count) / float(raw_count) if raw_count > 0 else 0.0
+        target_ratio = _opd_target_ratio(rate, args=args) if opd_count > 0 else 0.0
+        task_stats[task] = {
+            "raw_rows": raw_count,
+            "opd_rows": opd_count,
+            "recoverable_all_fail_rate": rate,
+            "target_ratio": target_ratio,
+            "mean_abs_loss": None,
+            "sum_abs_loss": None,
+            "component_scale": 1.0 if opd_count > 0 else 0.0,
+            "row_loss_scale": None,
+        }
+    if args.opd_task_balanced_loss_scale:
+        for task, stats in task_stats.items():
+            count = int(stats.get("opd_rows") or 0)
+            stats["row_loss_scale"] = 1.0 / (3.0 * float(count)) if count > 0 else 0.0
+    else:
+        for stats in task_stats.values():
+            stats["row_loss_scale"] = 1.0 / float(max(1, loss_normalizer))
+
+    if not args.opd_dynamic_scale or not opd_rows:
+        return {
+            "enabled": bool(args.opd_dynamic_scale),
+            "mode": str(args.opd_scale_mode),
+            "task_balanced_loss_scale": bool(args.opd_task_balanced_loss_scale),
+            "length_normalize": bool(length_normalize),
+            "loss_normalizer": int(loss_normalizer),
+            "task_stats": task_stats,
+        }
+
+    losses_by_task: dict[str, list[float]] = defaultdict(list)
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+    with torch.no_grad():
+        for row in opd_rows:
+            task = str(row.get("task", ""))
+            prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+            valid_samples = _objective_samples(row.get("samples", []), require_old_logprob=False)
+            if len(valid_samples) < 2:
+                continue
+            category = _row_category(row)
+            source = str(row.get("source") or "opd_distill")
+            source_weight = source_weights.get(source, 1.0)
+            task_weight = task_weights.get(task, 1.0) * category_weights.get(category, 1.0) * source_weight
+            stats = _best_response_loss_value_no_grad(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=prompt_text,
+                valid_samples=valid_samples,
+                task=task,
+                device=device,
+                max_logprob_tokens=max_logprob_tokens,
+                task_weight=task_weight,
+                best_response_loss_weight=float(args.opd_loss_weight),
+                pairwise_loss_weight=float(args.opd_pairwise_loss_weight),
+                pairwise_margin=float(args.opd_pairwise_margin),
+                length_normalize=bool(length_normalize),
+                positive_reward_threshold=args.opd_positive_reward_threshold,
+                max_pairwise_pairs_per_row=int(args.max_opd_pairwise_pairs_per_row),
+            )
+            if stats["processed"] > 0:
+                losses_by_task[task].append(abs(float(stats["loss"])))
+    if was_training:
+        model.train()
+
+    for task, stats in task_stats.items():
+        losses = losses_by_task.get(task, [])
+        mean_abs = _mean(losses)
+        sum_abs = sum(float(value) for value in losses)
+        stats["mean_abs_loss"] = mean_abs
+        stats["sum_abs_loss"] = sum_abs
+        if int(stats.get("opd_rows") or 0) <= 0 or mean_abs <= 0.0:
+            stats["component_scale"] = 0.0
+            continue
+        target_loss = float(args.ppo_loss_weight) * float(stats.get("target_ratio") or 0.0)
+        raw_scale = target_loss / (mean_abs + float(args.opd_scale_eps))
+        stats["component_scale"] = max(float(args.opd_scale_min), min(float(args.opd_scale_max), raw_scale))
+        stats["target_loss"] = target_loss
+        stats["raw_component_scale"] = raw_scale
+    return {
+        "enabled": True,
+        "mode": str(args.opd_scale_mode),
+        "task_balanced_loss_scale": bool(args.opd_task_balanced_loss_scale),
+        "length_normalize": bool(length_normalize),
+        "loss_normalizer": int(loss_normalizer),
+        "task_stats": task_stats,
+    }
+
+
+def _opd_target_ratio(rate: float, *, args: argparse.Namespace) -> float:
+    if float(rate) >= float(args.opd_scale_rate_high):
+        return float(args.opd_scale_target_high)
+    if float(rate) >= float(args.opd_scale_rate_mid):
+        return float(args.opd_scale_target_mid)
+    if float(rate) >= float(args.opd_scale_rate_low):
+        return float(args.opd_scale_target_low)
+    if float(rate) > 0.0:
+        return float(args.opd_scale_target_tail)
+    return 0.0
+
+
+def _opd_row_loss_scale(row: dict, *, opd_scale_plan: dict, default_loss_scale: float) -> float:
+    task = str(row.get("task", ""))
+    stats = dict(opd_scale_plan.get("task_stats", {}).get(task, {}) or {})
+    if stats.get("row_loss_scale") is None:
+        return float(default_loss_scale)
+    return float(stats.get("row_loss_scale") or 0.0)
+
+
+def _opd_component_scale(row: dict, *, opd_scale_plan: dict) -> float:
+    task = str(row.get("task", ""))
+    stats = dict(opd_scale_plan.get("task_stats", {}).get(task, {}) or {})
+    return float(stats.get("component_scale", 1.0))
+
+
+def _opd_task_plan_value(row: dict, opd_scale_plan: dict, key: str):
+    task = str(row.get("task", ""))
+    stats = dict(opd_scale_plan.get("task_stats", {}).get(task, {}) or {})
+    return stats.get(key)
+
+
+def _build_retention_scale_plan(
+    torch,
+    model,
+    tokenizer,
+    *,
+    retention_rows: list[dict],
+    raw_rows: list[dict],
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    retention_weight: float,
+    loss_normalizer: int,
+    length_normalize: bool,
+) -> dict:
+    raw_task_counts = _task_counts(raw_rows)
+    retention_task_counts = _task_counts(retention_rows)
+    tasks = sorted(set(raw_task_counts) | set(retention_task_counts))
+    task_stats: dict[str, dict] = {}
+    for task in tasks:
+        row_count = int(retention_task_counts.get(task, 0))
+        raw_count = int(raw_task_counts.get(task, 0))
+        rate = float(row_count) / float(raw_count) if raw_count > 0 else 0.0
+        task_stats[task] = {
+            "raw_rows": raw_count,
+            "retention_rows": row_count,
+            "all_success_rate": rate,
+            "target_ratio": float(args.retention_scale_target) if row_count > 0 else 0.0,
+            "mean_abs_loss": None,
+            "sum_abs_loss": None,
+            "component_scale": 1.0 if row_count > 0 else 0.0,
+            "row_loss_scale": None,
+        }
+    if args.retention_task_balanced_loss_scale:
+        for stats in task_stats.values():
+            count = int(stats.get("retention_rows") or 0)
+            stats["row_loss_scale"] = 1.0 / (3.0 * float(count)) if count > 0 else 0.0
+    else:
+        for stats in task_stats.values():
+            stats["row_loss_scale"] = 1.0 / float(max(1, loss_normalizer))
+
+    enabled = bool(args.retention_dynamic_scale) and bool(retention_rows) and str(args.retention_objective) == "nll"
+    if not enabled:
+        return {
+            "enabled": bool(args.retention_dynamic_scale),
+            "objective": str(args.retention_objective),
+            "task_balanced_loss_scale": bool(args.retention_task_balanced_loss_scale),
+            "length_normalize": bool(length_normalize),
+            "loss_normalizer": int(loss_normalizer),
+            "task_stats": task_stats,
+        }
+
+    losses_by_task: dict[str, list[float]] = defaultdict(list)
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+    with torch.no_grad():
+        for row in retention_rows:
+            task = str(row.get("task", ""))
+            prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+            valid_samples = _objective_samples(row.get("samples", []), require_old_logprob=False)
+            if not valid_samples:
+                continue
+            category = _row_category(row)
+            source = str(row.get("source") or "")
+            source_weight = source_weights.get(source, 1.0)
+            task_weight = task_weights.get(task, 1.0) * category_weights.get(category, 1.0) * source_weight
+            stats = _best_response_loss_value_no_grad(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=prompt_text,
+                valid_samples=valid_samples,
+                task=task,
+                device=device,
+                max_logprob_tokens=max_logprob_tokens,
+                task_weight=task_weight,
+                best_response_loss_weight=retention_weight,
+                pairwise_loss_weight=0.0,
+                pairwise_margin=0.0,
+                length_normalize=bool(length_normalize),
+                positive_reward_threshold=args.retention_positive_reward_threshold,
+                max_pairwise_pairs_per_row=0,
+            )
+            if stats["processed"] > 0:
+                losses_by_task[task].append(abs(float(stats["loss"])))
+    if was_training:
+        model.train()
+
+    for task, stats in task_stats.items():
+        losses = losses_by_task.get(task, [])
+        mean_abs = _mean(losses)
+        sum_abs = sum(float(value) for value in losses)
+        stats["mean_abs_loss"] = mean_abs
+        stats["sum_abs_loss"] = sum_abs
+        if int(stats.get("retention_rows") or 0) <= 0 or mean_abs <= 0.0:
+            stats["component_scale"] = 0.0
+            continue
+        target_loss = float(args.ppo_loss_weight) * float(stats.get("target_ratio") or 0.0)
+        raw_scale = target_loss / (mean_abs + float(args.retention_scale_eps))
+        stats["component_scale"] = max(float(args.retention_scale_min), min(float(args.retention_scale_max), raw_scale))
+        stats["target_loss"] = target_loss
+        stats["raw_component_scale"] = raw_scale
+    return {
+        "enabled": True,
+        "objective": str(args.retention_objective),
+        "task_balanced_loss_scale": bool(args.retention_task_balanced_loss_scale),
+        "length_normalize": bool(length_normalize),
+        "loss_normalizer": int(loss_normalizer),
+        "task_stats": task_stats,
+    }
+
+
+def _retention_row_loss_scale(row: dict, *, retention_scale_plan: dict, default_loss_scale: float) -> float:
+    task = str(row.get("task", ""))
+    stats = dict(retention_scale_plan.get("task_stats", {}).get(task, {}) or {})
+    if stats.get("row_loss_scale") is None:
+        return float(default_loss_scale)
+    return float(stats.get("row_loss_scale") or 0.0)
+
+
+def _retention_component_scale(row: dict, *, retention_scale_plan: dict) -> float:
+    task = str(row.get("task", ""))
+    stats = dict(retention_scale_plan.get("task_stats", {}).get(task, {}) or {})
+    return float(stats.get("component_scale", 1.0))
+
+
+def _retention_task_plan_value(row: dict, retention_scale_plan: dict, key: str):
+    task = str(row.get("task", ""))
+    stats = dict(retention_scale_plan.get("task_stats", {}).get(task, {}) or {})
+    return stats.get(key)
 
 
 def _is_retention_candidate(row: dict) -> bool:
@@ -1909,6 +2336,7 @@ def _backward_incremental_best_response_losses(
     positive_reward_threshold: float | None,
     max_pairwise_pairs_per_row: int = 0,
     loss_scale: float = 1.0,
+    component_scale: float = 1.0,
 ) -> dict[str, float]:
     positives, negatives = _positive_and_negative_samples(valid_samples, positive_reward_threshold, task=task)
     if not positives:
@@ -1931,7 +2359,13 @@ def _backward_incremental_best_response_losses(
             )
             if logp is None:
                 continue
-            loss = task_weight * best_response_loss_weight * (-_sample_score(logp.float(), sample, length_normalize=length_normalize)) / denominator
+            loss = (
+                float(component_scale)
+                * task_weight
+                * best_response_loss_weight
+                * (-_sample_score(logp.float(), sample, length_normalize=length_normalize))
+                / denominator
+            )
             (loss * float(loss_scale)).backward()
             value = float(loss.detach().cpu().item())
             total_loss += value
@@ -1968,9 +2402,105 @@ def _backward_incremental_best_response_losses(
             positive_score = _sample_score(positive_logp.float(), positive, length_normalize=length_normalize)
             negative_score = _sample_score(negative_logp.float(), negative, length_normalize=length_normalize)
             pair_loss = torch.nn.functional.softplus(negative_score - positive_score + float(pairwise_margin))
-            loss = task_weight * pairwise_loss_weight * pair_loss / denominator
+            loss = float(component_scale) * task_weight * pairwise_loss_weight * pair_loss / denominator
             (loss * float(loss_scale)).backward()
             value = float(loss.detach().cpu().item())
+            total_loss += value
+            pairwise_total += value
+            processed += 1
+    return {
+        "processed": float(processed),
+        "loss": total_loss,
+        "best_response_loss": best_response_total,
+        "pairwise_loss": pairwise_total,
+    }
+
+
+def _best_response_loss_value_no_grad(
+    torch,
+    model,
+    tokenizer,
+    *,
+    prompt_text: str,
+    valid_samples: list[dict],
+    task: str | None,
+    device: str,
+    max_logprob_tokens: int,
+    task_weight: float,
+    best_response_loss_weight: float,
+    pairwise_loss_weight: float,
+    pairwise_margin: float,
+    length_normalize: bool,
+    positive_reward_threshold: float | None,
+    max_pairwise_pairs_per_row: int = 0,
+) -> dict[str, float]:
+    positives, negatives = _positive_and_negative_samples(valid_samples, positive_reward_threshold, task=task)
+    if not positives:
+        return {"processed": 0, "loss": 0.0, "best_response_loss": 0.0, "pairwise_loss": 0.0}
+    processed = 0
+    total_loss = 0.0
+    best_response_total = 0.0
+    pairwise_total = 0.0
+    if best_response_loss_weight != 0.0:
+        denominator = float(len(positives))
+        for sample in positives:
+            logp = _sample_response_logprob_tensor(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=prompt_text,
+                sample=sample,
+                device=device,
+                max_length=max_logprob_tokens,
+            )
+            if logp is None:
+                continue
+            value = float(
+                (
+                    task_weight
+                    * best_response_loss_weight
+                    * (-_sample_score(logp.float(), sample, length_normalize=length_normalize))
+                    / denominator
+                )
+                .detach()
+                .cpu()
+                .item()
+            )
+            total_loss += value
+            best_response_total += value
+            processed += 1
+    if pairwise_loss_weight != 0.0 and negatives:
+        pairs = _bounded_pairwise_samples(
+            positives,
+            negatives,
+            max_pairs=int(max_pairwise_pairs_per_row),
+        )
+        denominator = float(len(pairs))
+        for positive, negative in pairs:
+            positive_logp = _sample_response_logprob_tensor(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=prompt_text,
+                sample=positive,
+                device=device,
+                max_length=max_logprob_tokens,
+            )
+            negative_logp = _sample_response_logprob_tensor(
+                torch,
+                model,
+                tokenizer,
+                prompt_text=prompt_text,
+                sample=negative,
+                device=device,
+                max_length=max_logprob_tokens,
+            )
+            if positive_logp is None or negative_logp is None:
+                continue
+            positive_score = _sample_score(positive_logp.float(), positive, length_normalize=length_normalize)
+            negative_score = _sample_score(negative_logp.float(), negative, length_normalize=length_normalize)
+            pair_loss = torch.nn.functional.softplus(negative_score - positive_score + float(pairwise_margin))
+            value = float((task_weight * pairwise_loss_weight * pair_loss / denominator).detach().cpu().item())
             total_loss += value
             pairwise_total += value
             processed += 1

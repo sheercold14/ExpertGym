@@ -468,6 +468,56 @@ def _update_command(
         cmd.append("--recompute-frontier")
     if args.length_normalize_logprob:
         cmd.append("--length-normalize-logprob")
+    if args.opd_length_normalize_logprob is not None:
+        cmd.append("--opd-length-normalize-logprob" if args.opd_length_normalize_logprob else "--no-opd-length-normalize-logprob")
+    if args.retention_length_normalize_logprob is not None:
+        cmd.append(
+            "--retention-length-normalize-logprob"
+            if args.retention_length_normalize_logprob
+            else "--no-retention-length-normalize-logprob"
+        )
+    if args.retention_dynamic_scale:
+        cmd.append("--retention-dynamic-scale")
+    if args.retention_task_balanced_loss_scale:
+        cmd.append("--retention-task-balanced-loss-scale")
+    cmd += [
+        "--retention-scale-target",
+        str(args.retention_scale_target),
+        "--retention-scale-min",
+        str(args.retention_scale_min),
+        "--retention-scale-max",
+        str(args.retention_scale_max),
+        "--retention-scale-eps",
+        str(args.retention_scale_eps),
+    ]
+    if args.opd_dynamic_scale:
+        cmd.append("--opd-dynamic-scale")
+    if args.opd_task_balanced_loss_scale:
+        cmd.append("--opd-task-balanced-loss-scale")
+    cmd += [
+        "--opd-scale-mode",
+        args.opd_scale_mode,
+        "--opd-scale-min",
+        str(args.opd_scale_min),
+        "--opd-scale-max",
+        str(args.opd_scale_max),
+        "--opd-scale-eps",
+        str(args.opd_scale_eps),
+        "--opd-scale-rate-high",
+        str(args.opd_scale_rate_high),
+        "--opd-scale-rate-mid",
+        str(args.opd_scale_rate_mid),
+        "--opd-scale-rate-low",
+        str(args.opd_scale_rate_low),
+        "--opd-scale-target-high",
+        str(args.opd_scale_target_high),
+        "--opd-scale-target-mid",
+        str(args.opd_scale_target_mid),
+        "--opd-scale-target-low",
+        str(args.opd_scale_target_low),
+        "--opd-scale-target-tail",
+        str(args.opd_scale_target_tail),
+    ]
     if args.length_normalize_policy_logprob:
         cmd.append("--length-normalize-policy-logprob")
     if args.task_normalize_advantages:
@@ -801,6 +851,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opd-all-success-positive-reward-threshold", type=float, default=1.0)
     parser.add_argument("--recompute-frontier", action="store_true")
     parser.add_argument("--length-normalize-logprob", action="store_true")
+    parser.add_argument("--opd-length-normalize-logprob", dest="opd_length_normalize_logprob", action="store_true", default=None)
+    parser.add_argument("--no-opd-length-normalize-logprob", dest="opd_length_normalize_logprob", action="store_false")
+    parser.add_argument(
+        "--retention-length-normalize-logprob",
+        dest="retention_length_normalize_logprob",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--no-retention-length-normalize-logprob", dest="retention_length_normalize_logprob", action="store_false")
+    parser.add_argument("--retention-dynamic-scale", action="store_true")
+    parser.add_argument("--retention-task-balanced-loss-scale", action="store_true")
+    parser.add_argument("--retention-scale-target", type=float, default=0.5)
+    parser.add_argument("--retention-scale-min", type=float, default=0.05)
+    parser.add_argument("--retention-scale-max", type=float, default=100.0)
+    parser.add_argument("--retention-scale-eps", type=float, default=1.0e-6)
+    parser.add_argument("--opd-dynamic-scale", action="store_true")
+    parser.add_argument("--opd-task-balanced-loss-scale", action="store_true")
+    parser.add_argument("--opd-scale-mode", choices=["loss"], default="loss")
+    parser.add_argument("--opd-scale-min", type=float, default=0.05)
+    parser.add_argument("--opd-scale-max", type=float, default=100.0)
+    parser.add_argument("--opd-scale-eps", type=float, default=1.0e-6)
+    parser.add_argument("--opd-scale-rate-high", type=float, default=0.20)
+    parser.add_argument("--opd-scale-rate-mid", type=float, default=0.10)
+    parser.add_argument("--opd-scale-rate-low", type=float, default=0.03)
+    parser.add_argument("--opd-scale-target-high", type=float, default=5.0)
+    parser.add_argument("--opd-scale-target-mid", type=float, default=3.0)
+    parser.add_argument("--opd-scale-target-low", type=float, default=1.0)
+    parser.add_argument("--opd-scale-target-tail", type=float, default=0.33)
     parser.add_argument("--length-normalize-policy-logprob", action="store_true")
     parser.add_argument("--task-normalize-advantages", action="store_true")
     parser.add_argument("--advantage-normalization", choices=["centered", "zscore"], default="centered")
