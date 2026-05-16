@@ -67,10 +67,11 @@ def create_bake_plan(
 ) -> dict[str, Any]:
     manifest_path = Path(mode_manifest_path).expanduser().resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expert_names = _manifest_expert_names(manifest)
     parameter_mode = _is_parameter_coefficient_values(gate_values)
     global_parameter_mode = parameter_mode and any(str(key).startswith("__global__::") for key in gate_values)
     layer_band_mode = (not parameter_mode) and _is_layer_band_gate_values(gate_values)
-    global_coefficient_mode = (not parameter_mode) and (not layer_band_mode) and _is_global_coefficient_values(gate_values)
+    global_coefficient_mode = (not parameter_mode) and (not layer_band_mode) and _is_global_coefficient_values(gate_values, expert_names)
     if parameter_mode:
         projected = {str(key): float(value) for key, value in gate_values.items() if "::" in str(key)}
         coeffs = {"parameter_coefficients": projected}
@@ -78,7 +79,7 @@ def create_bake_plan(
         projected = project_layer_band_gates(gate_values)
         coeffs = {band: expert_coefficients(_band_gate_values(projected, band)) for band in _gate_band_names(projected)}
     elif global_coefficient_mode:
-        projected = _global_coefficient_values(gate_values)
+        projected = _global_coefficient_values(gate_values, expert_names)
         coeffs = dict(projected)
     else:
         projected = project_gates(gate_values).as_dict()
@@ -215,16 +216,38 @@ def _is_parameter_coefficient_values(gate_values: Mapping[str, float]) -> bool:
     return any("::" in str(key) for key in gate_values)
 
 
-def _is_global_coefficient_values(gate_values: Mapping[str, float]) -> bool:
+def _is_global_coefficient_values_for_experts(gate_values: Mapping[str, float], expert_names: tuple[str, ...]) -> bool:
     keys = {str(key) for key in gate_values}
-    return all(expert in keys for expert in EXPERT_NAMES) or all(f"global.{expert}" in keys for expert in EXPERT_NAMES)
+    return all(expert in keys for expert in expert_names) or all(f"global.{expert}" in keys for expert in expert_names)
 
 
-def _global_coefficient_values(gate_values: Mapping[str, float]) -> dict[str, float]:
+def _is_global_coefficient_values(gate_values: Mapping[str, float], expert_names: tuple[str, ...] = EXPERT_NAMES) -> bool:
+    return _is_global_coefficient_values_for_experts(gate_values, expert_names)
+
+
+def _global_coefficient_values(gate_values: Mapping[str, float], expert_names: tuple[str, ...] = EXPERT_NAMES) -> dict[str, float]:
     return {
         expert: float(gate_values[expert] if expert in gate_values else gate_values[f"global.{expert}"])
-        for expert in EXPERT_NAMES
+        for expert in expert_names
     }
+
+
+def _manifest_expert_names(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    configured = manifest.get("expert_names")
+    if isinstance(configured, list) and configured:
+        return tuple(str(item) for item in configured)
+    experts = manifest.get("experts")
+    if isinstance(experts, Mapping) and experts:
+        ordered = [expert for expert in EXPERT_NAMES if expert in experts]
+        ordered.extend(str(expert) for expert in experts if str(expert) not in ordered)
+        return tuple(ordered)
+    entries = manifest.get("basis_entries") or []
+    names: list[str] = []
+    for entry in entries:
+        expert = str(entry.get("expert", ""))
+        if expert and expert not in names:
+            names.append(expert)
+    return tuple(names or EXPERT_NAMES)
 
 
 def _gate_band_names(gate_values: Mapping[str, float]) -> list[str]:

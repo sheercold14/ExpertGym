@@ -778,3 +778,343 @@ Current interpretation:
 - Runner update:
   - Added non-destructive `H9` entry to `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_dynscale_20260515_addons.py`.
   - Existing `H` entry was left unchanged.
+
+11:39 I iter1 update:
+
+- Replacement I completed `iter_001` update.
+- Setting: `global-coefficient`, LR `0.018`, momentum `0.2`, lowered OPD targets `3/2/0.67/0.2`.
+- Initial rollout reward:
+  - overall `0.3800`, tool `0.4151`, memory `0.3281`, code `0.3969`.
+  - OPD selected rows: `tool=7`, `memory=6`, `code=1`.
+- Update result:
+  - Gates: code `0.333361`, memory `0.351276`, tool `0.331898`.
+  - `grad_norm_max=10.3303`, `gate_delta_max=0.01794`.
+  - Frontier counts: code `25`, memory `23`, tool `25`; retention rows `3`.
+- Interpretation:
+  - I behaves as intended: it still moves, but the memory slope is much slower than F/A.
+  - Compare F first update memory `0.3931` with I first update memory `0.3513`.
+  - This is a useful anti-overpush ablation; the next check is whether iter2 rollout improves tool/memory without rapidly entering the `memory ~= 0.60` collapse region.
+
+11:35 H stop:
+
+- H `iter_009` update completed after the strong H `iter_009` rollout.
+- Gate after update:
+  - code `0.337877`, memory `0.605451`, tool `0.329314`.
+  - `grad_norm_max=4.9874`, `gate_delta_max=0.0320`.
+  - OPD rows: `code=1`, `memory=1`, `tool=1`; retention rows `16`.
+- Interpretation:
+  - H crossed the empirical `memory ~= 0.60` tool-collapse boundary.
+  - E, F, and G all collapsed on the rollout immediately after crossing this region.
+  - Since H9 has already been preserved and sent to Eval6, continuing H would mostly spend compute to reproduce the known collapse mode.
+- Action:
+  - Stopped tmux session `opvec_dynscale_H_gp_target3_lr025_m02_20260515_dynloss_i15_v1`.
+  - Released GPUs `4,5`.
+  - Frontend restarted on `http://127.0.0.1:8783` with H marked as stopped and I live.
+- Preserved H candidate:
+  - `/tmp/shared-storage/OnPolicy/runs/gated_grpo/dynscale_H_gp_target3_lr025_m02_20260515_dynloss_i15_v1/iter_009/baked_policy`
+
+11:37 Replacement J launch:
+
+- Failure reason addressed:
+  - E/F/G/H all show the same boundary: memory coefficient around `0.60+` predicts or triggers tool collapse.
+- Replacement J tests an explicit coefficient trust-region:
+  - Run: `/tmp/shared-storage/OnPolicy/runs/gated_grpo/dynscale_J_gp_target3_lr018_cap024_m02_20260515_dynloss_i15_v1`
+  - Tmux: `opvec_dynscale_J_gp_target3_lr018_cap024_m02_20260515_dynloss_i15_v1`
+  - GPUs: `4,5`
+  - Strategy: `global-parameter`
+  - LR: `0.018`
+  - Momentum: `0.2`
+  - OPD targets: `3/2/0.67/0.2`
+  - `MAX_COEFF_DELTA=0.24`, so the nominal upper bound from `1/3` is about `0.573`.
+- Purpose:
+  - Determine whether a bounded global-parameter run can preserve the H9-style high proxy region without crossing the observed tool-collapse boundary.
+- Monitor update:
+  - Frontend restarted on `http://127.0.0.1:8783` with stopped A-H and live I/J.
+
+11:43 I iter2 rollout:
+
+- I `iter_002` rollout used I `iter_001` gate:
+  - code `0.333361`, memory `0.351276`, tool `0.331898`.
+- Reward improved across all three proxy tasks:
+  - overall `0.3800 -> 0.4630`.
+  - tool `0.4151 -> 0.5569`.
+  - memory `0.3281 -> 0.4219`.
+  - code `0.3969 -> 0.4102`.
+- All-fail rows:
+  - tool `5 -> 4`.
+  - memory `9 -> 8`.
+  - code `5 -> 3`.
+- Dynamic OPD rows for the next update:
+  - `tool=8`, `memory=6`, `code=2`, total `16`.
+- Interpretation:
+  - Lower LR/lower OPD target does not kill learning; it produces a slower but healthier first improvement.
+  - Unlike F/H, I is still far from the memory-collapse boundary after one update.
+  - Continue I; next important check is whether iter2 update keeps memory slope controlled.
+
+## 中文结论：是否复现了 2026-05-14 Best
+
+对照 `/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/report/opvec_best_gp_opd_reproduction_20260514.md`，昨晚到今天上午的 dynamic-loss 系列**还没有复现出同一种成功**。
+
+严格说，有几个 proxy reward 接近甚至略高的点，但它们不是 2026-05-14 best 那种可解释、可迁移的成功。2026-05-14 best 的关键不是单轮 proxy overall 高，而是 `global-parameter` 的 588 个 gate 在任务方向上形成了合理几何：`code ~= 0.71`、`memory ~= 0.54`、`tool ~= 0.29`，正式 Eval6 里 Tool 保持、Memory 明显增强、Code 略有收益。昨晚的 E/F/G/H 候选主要是 memory 方向被推高，code 基本停在 `1/3` 附近，tool 也基本停在 `1/3` 附近；proxy 上看起来高，是因为 tool 很早饱和，再叠加 memory 提升，但没有学到 2026-05-14 的 code+memory 分离结构。
+
+| 实验 | 最好 proxy 点 | proxy reward | gate 形态 | 后续行为 | 判断 |
+|---|---:|---|---|---|---|
+| 2026-05-14 best | iter9 | tool `0.9809`, memory `0.7188`, code `0.4570` | code `0.7136`, memory `0.5439`, tool `0.2903` | Eval6 通过，三能力相对稳 | 真成功 |
+| F | iter8 | tool `0.9711`, memory `0.7891`, code `0.4346` | code `0.3372`, memory `0.5440`, tool `0.3296` | memory 后续到 `0.6065`，tool 崩 | proxy 成功，不是同类成功 |
+| E | iter9 | tool `0.9555`, memory `0.8125`, code `0.4066` | code `0.3384`, memory `0.5745`, tool `0.3324` | memory 后续到 `0.6054`，tool 崩 | proxy 成功，不是同类成功 |
+| H | iter9 | tool `0.9602`, memory `0.7812`, code `0.4336` | code `0.3367`, memory `0.5745`, tool `0.3268` | update 后 memory 到 `0.6055`，按 E/F/G 经验高风险 | 待 Eval6，但形态不对 |
+| G | iter8 | tool `0.8835`, memory `0.7969`, code `0.4316` | code `0.3400`, memory `0.5856`, tool `0.3280` | memory 后续到 `0.6211`，tool 崩 | 失败复现 |
+
+核心问题不是 gate 推不动，而是**推的方向错了**。dynamic OPD 当前按“policy 全错、expert 能做对”抽样；第一两轮 tool 被修复后，剩余 all-fail recoverable 样本明显偏 memory，code 的可恢复样本稀疏。因此动态 loss scale 虽然把梯度幅值救回来了，却只是在放大当前可见的 memory repair 信号。结果是 memory gate 稳定上升，code gate 没被充分推开，最终一旦 memory 均值进入 `0.60` 左右区域，就触发 tool 行为崩溃。这个边界在 E/F/G/H 上反复出现，说明是系统性 merge geometry 问题，不是单个 run 的偶然噪声。
+
+另一个差异是 OPD 数据源。2026-05-14 best 用的是固定 compact OPD replay，虽然名义上 21 条、三任务各 7 条，但实际非零梯度更像 memory/code 强 OPD + tool 由 GRPO 维持；这恰好推动出了 code+memory 的有效方向。昨晚的新 dynamic OPD 更“在线”，但它依赖当前 policy 的 all-fail 分布，而这个分布会快速变成 memory-heavy。也就是说，新方法更规范，但没有保证任务方向的可辨识性；旧方法不够干净，却意外给了 code/memory 更强、更合适的方向信号。
+
+retention 目前也没有解决这个问题。它是 all-success NLL preservation，能提供保守约束，但不是真正的 task-vector trust region；它不会显式告诉优化器“memory 再涨会破坏 tool”，也不会主动把 code gate 推到 0.6-0.8 区间。因此它能延缓崩溃，不能阻止 memory-only 过推。
+
+结论：昨晚没有得到 2026-05-14 best 那种可作为论文主结果的成功，只得到了若干“proxy 高、但 gate 几何不对”的候选。下一步最合理的方向不是继续单纯调大 OPD/LR，而是让训练信号重新具备任务区分能力：保留 dynamic OPD，但对 code/memory/tool 的可恢复样本做方向约束或配额；对 memory 设置显式 trust region 或 cap；补充更接近 2026-05-14 compact replay 的 code-positive OPD；同时用 Eval6 而不是 paper96 proxy 决定最终 checkpoint。
+
+## 11:47 Live Status
+
+Training:
+
+| Run | State | Completed | Latest reward | Latest gate | Interpretation |
+|---|---|---|---|---|---|
+| I | active, `iter_002` update running | `g1/r2` | iter2 overall `0.4630`, tool `0.5569`, memory `0.4219`, code `0.4102` | iter1 code `0.3334`, memory `0.3513`, tool `0.3319` | Lower LR/lower OPD target is learning more slowly and has not entered the memory-collapse zone. |
+| J | active, `iter_001` update running | `g0/r1` | iter1 overall `0.4135`, tool `0.4367`, memory `0.3984`, code `0.4053` | init `1/3`, capped max delta `0.24` | First dynamic OPD rows are tool-heavy: tool `10`, memory `3`, code `2`; wait for update direction before judging. |
+
+Eval6 results:
+
+E/F/G/H9 have all completed Tool/Memory/Code Eval6 as of 2026-05-15 13:02.
+
+| Model | Tool mean | Tool detail | Memory mean F1 | Memory detail | Code |
+|---|---:|---|---:|---|---|
+| E `dynscale-e-gp-lr025-m02-best-iter8gate` | `0.7810` | live_parallel `0.6875`, live_parallel_multiple `0.6667`, parallel `0.9050`, parallel_multiple `0.8650` | `0.7539` | eval_50 `0.7192`, eval_100 `0.7357`, qa_32768 `0.7808`, qa_65536 `0.7798` | LiveBench `0.3926`, LiveCodeBench `0.3087`, mean `0.3506` |
+| F `dynscale-f-gc-lr025-m02-best-iter7gate` | `0.7823` | live_parallel `0.6875`, live_parallel_multiple `0.6667`, parallel `0.9050`, parallel_multiple `0.8700` | `0.7459` | eval_50 `0.7169`, eval_100 `0.7468`, qa_32768 `0.7531`, qa_65536 `0.7670` | LiveBench `0.4023`, LiveCodeBench `0.3009`, mean `0.3516` |
+| G `dynscale-g-gp-target3-lr03-m02-best-iter7gate` | `0.7810` | live_parallel `0.6875`, live_parallel_multiple `0.6667`, parallel `0.9050`, parallel_multiple `0.8650` | `0.7589` | eval_50 `0.7417`, eval_100 `0.7432`, qa_32768 `0.7736`, qa_65536 `0.7770` | LiveBench `0.3594`, LiveCodeBench `0.3151`, mean `0.3372` |
+| H9 `dynscale-h-gp-target3-lr025-m02-best-iter8gate` | `0.7810` | live_parallel `0.6875`, live_parallel_multiple `0.6667`, parallel `0.9050`, parallel_multiple `0.8650` | `0.7635` | eval_50 `0.7416`, eval_100 `0.7759`, qa_32768 `0.7659`, qa_65536 `0.7706` | LiveBench `0.3887`, LiveCodeBench `0.3058`, mean `0.3472` |
+
+Comparison with 2026-05-14 best partial Eval6:
+
+- Tool: current candidates are essentially tied with 2026-05-14 best (`~0.781-0.782` vs `0.7835`), so Tool is not the immediate blocker at the selected checkpoints.
+- Memory: H9 is closest to 2026-05-14 best (`0.7635` vs `0.7649`), G is slightly lower, E/F lower.
+- Code remains decisive. E/F are slightly above the 2026-05-14 best CURE mean (`0.3487`), H9 is slightly below, and G is clearly below.
+- H9 is the closest Memory candidate but does not exceed the 2026-05-14 best, and its Code mean is slightly lower.
+
+## 11:52 Principle Correction
+
+User correction:
+
+> 不可以对着期望结果调参，核心还是控制训练信号。
+
+Operational decision:
+
+- Stop treating LR lowering, OPD target lowering, and `MAX_COEFF_DELTA` cap as the main path to success.
+- E/F/G/H already showed the failure mode clearly enough: memory-only pressure pushes the policy into a tool-collapse region.
+- I/J were therefore reclassified as diagnostics, not valid mainline experiments.
+- Stopped I and J tmux sessions to avoid spending compute on result-shaped hyperparameter tuning:
+  - `opvec_dynscale_I_gc_target3_lr018_m02_20260515_dynloss_i15_v1`
+  - `opvec_dynscale_J_gp_target3_lr018_cap024_m02_20260515_dynloss_i15_v1`
+- Restarted monitor with I/J marked as stopped/diagnostic on `http://127.0.0.1:8783`.
+
+What this means for the next valid experiment:
+
+- Do not choose coefficients, caps, or LR schedules because they keep memory near an observed good region.
+- Keep optimization hyperparameters simple and fixed.
+- Change the **training signal** instead:
+  - OPD source must be task-balanced after filtering, not merely before filtering.
+  - If one task has few all-fail recoverable prompts, do not let memory fill the whole OPD budget by default.
+  - Add explicit code-positive and tool-retention signal from the same calibration pool instead of relying on memory-heavy all-fail rows.
+  - Separate "repair signal" from "preservation signal": all-fail expert OPD repairs missing ability; all-success NLL preserves already-good behavior; frontier GRPO handles within-prompt preference.
+  - Measure per-task gradient contribution before stepping, so a run can be rejected because the signal is memory-dominated before observing collapse.
+
+Current state after correction:
+
+- Training runs A-H: stopped, with candidate checkpoints preserved.
+- Diagnostic runs I/J: stopped by principle correction before becoming mainline.
+- Eval6 for E/F/G/H9 continues; these evaluations are still useful for diagnosing whether high proxy reward transfers to formal Tool/Memory/Code metrics.
+
+## 12:04 E Eval6 Complete
+
+Model: `dynscale-e-gp-lr025-m02-best-iter8gate`
+
+Path: `/tmp/shared-storage/OnPolicy/runs/gated_grpo/dynscale_E_gp_lr025_m02_20260515_dynloss_i15_v1/iter_009/baked_policy`
+
+| Task | Metric | Result |
+|---|---|---:|
+| Tool/BFCL | mean | `0.7810` |
+| Memory/HotpotQA | mean F1 | `0.7539` |
+| Code/CURE | LiveBench code_acc | `0.3926` |
+| Code/CURE | LiveCodeBench code_acc | `0.3087` |
+| Code/CURE | mean code_acc | `0.3506` |
+
+Comparison:
+
+- Code is slightly above 2026-05-14 best CURE mean (`0.3506` vs `0.3487`).
+- Tool is slightly below 2026-05-14 best (`0.7810` vs `0.7835`).
+- Memory is below 2026-05-14 best (`0.7539` vs `0.7649`).
+- E is therefore a credible evaluated checkpoint, but it is not a clean replacement for 2026-05-14 best: formal metrics are roughly tied/slightly mixed, while the gate geometry remains memory-heavy and its next update collapses Tool.
+
+## 12:07 F Eval6 Complete
+
+Model: `dynscale-f-gc-lr025-m02-best-iter7gate`
+
+Path: `/tmp/shared-storage/OnPolicy/runs/gated_grpo/dynscale_F_gc_lr025_m02_20260515_dynloss_i15_v1/iter_008/baked_policy`
+
+| Task | Metric | Result |
+|---|---|---:|
+| Tool/BFCL | mean | `0.7823` |
+| Memory/HotpotQA | mean F1 | `0.7459` |
+| Code/CURE | LiveBench code_acc | `0.4023` |
+| Code/CURE | LiveCodeBench code_acc | `0.3009` |
+| Code/CURE | mean code_acc | `0.3516` |
+
+Comparison:
+
+- F has the best Code mean so far among completed E/F (`0.3516`), slightly above both E and 2026-05-14 best.
+- Tool is close to 2026-05-14 best but still slightly lower (`0.7823` vs `0.7835`).
+- Memory is clearly lower than 2026-05-14 best (`0.7459` vs `0.7649`).
+- Like E, F is useful evidence that the proxy-high checkpoints transfer partly to formal Code/Tool, but it does not solve the training-signal issue: the checkpoint is selected before a later memory over-push collapse, not because the objective learned a robust task-separated gate geometry.
+
+## Code OPD Threshold Audit
+
+User concern:
+
+```text
+CodeRewardAdapter success = score >= 0.95
+DYNAMIC_OPD_POSITIVE_THRESHOLD = 1.0
+OPD_POSITIVE_REWARD_THRESHOLD = 1.0
+```
+
+Code review:
+
+- `opvec/rewards/simple.py`: public-example fallback can set code reward to `0.95`, while `success = score >= 0.95`.
+- `scripts/data/build_opd_distill_from_expert_rollouts.py`: dynamic OPD builder selects expert positives by `reward_train >= positive_threshold`.
+- `scripts/train/opvec_update_gates_from_rollouts.py`: update side also splits OPD positives/negatives by `reward_train` threshold.
+
+Audit on current paper96 expert rollouts:
+
+| Check | Result |
+|---|---:|
+| code expert prompts | `32` |
+| code expert samples | `64` |
+| `reward_train=1.0` samples | `24` |
+| `success=True` samples | `24` |
+| `success=True && reward_train<1.0` | `0` |
+| `reward_train=0.95` samples | `0` |
+| expert-positive prompts at threshold `1.0` | `17` |
+| expert-positive prompts at threshold `0.95` | `17` |
+
+Counterfactual on E/F/G/H code all-fail rows:
+
+- `threshold=1.0` and `threshold=0.95` recover exactly the same number of code prompts in every checked iteration.
+- Policy code samples across current runs also have no `reward_train=0.95`; success samples are all `reward_train=1.0`.
+- OPD code positive samples are all `reward_train=1.0`.
+
+Conclusion:
+
+- The threshold mismatch is a real future-data risk, especially for code prompts without source tests where public-example fallback gives `0.95`.
+- It is **not** the main reason code was weak in this paper96 dynamic-OPD run.
+- The immediate code bottleneck is same-prompt expert coverage: only 17/32 code prompts have expert positives at `1.0`, and many policy all-fail code prompts do not match those recoverable prompts.
+- Do not blindly lower global OPD threshold as a "fix" for this run. A cleaner future fix is task-specific positive semantics: allow code OPD positive by `success == true` or task-specific threshold, and record both `positive_by_success` and `positive_by_reward_threshold` in the OPD summary.
+
+## 12:30 G Eval6 Complete
+
+Model: `dynscale-g-gp-target3-lr03-m02-best-iter7gate`
+
+Path: `/tmp/shared-storage/OnPolicy/runs/gated_grpo/dynscale_G_gp_target3_lr03_m02_20260515_dynloss_i15_v1/iter_008/baked_policy`
+
+| Task | Metric | Result |
+|---|---|---:|
+| Tool/BFCL | mean | `0.7810` |
+| Memory/HotpotQA | mean F1 | `0.7589` |
+| Code/CURE | LiveBench code_acc | `0.3594` |
+| Code/CURE | LiveCodeBench code_acc | `0.3151` |
+| Code/CURE | mean code_acc | `0.3372` |
+
+Comparison:
+
+- G has better Memory than E/F, but worse Code than 2026-05-14 best (`0.3372` vs `0.3487`).
+- This supports the core diagnosis: a high-memory proxy checkpoint can still lose code formal performance if the learned gate geometry is memory-heavy rather than code+memory separated.
+
+## 13:02 H9 Eval6 Complete
+
+Model: `dynscale-h-gp-target3-lr025-m02-best-iter8gate`
+
+Path: `/tmp/shared-storage/OnPolicy/runs/gated_grpo/dynscale_H_gp_target3_lr025_m02_20260515_dynloss_i15_v1/iter_009/baked_policy`
+
+| Task | Metric | Result |
+|---|---|---:|
+| Tool/BFCL | mean | `0.7810` |
+| Memory/HotpotQA | mean F1 | `0.7635` |
+| Code/CURE | LiveBench code_acc | `0.3887` |
+| Code/CURE | LiveCodeBench code_acc | `0.3058` |
+| Code/CURE | mean code_acc | `0.3472` |
+
+Comparison:
+
+- H9 is the closest 2026-05-15 candidate to the 2026-05-14 best on Memory (`0.7635` vs `0.7649`).
+- H9 Code is slightly below the 2026-05-14 best (`0.3472` vs `0.3487`) and below E/F.
+- This reinforces the conclusion that 2026-05-15 dynamic-loss settings can find usable proxy checkpoints, but they did not reproduce the 2026-05-14 best gate geometry.
+
+## 12:39 K Direct-Parameter Diagnostic Launch
+
+User request: try full task-vector coefficient fine-tuning without common+residual.
+
+Strategy name:
+
+```text
+STRATEGY=parameter
+```
+
+Why:
+
+- `parameter` trains one direct coefficient per mergeable parameter/expert: `196 × 3 = 588` effective coefficients.
+- `global-parameter` is not the requested setting. It trains global expert strengths plus parameter-specific residuals.
+- `global-coefficient` trains only 3 direct expert coefficients.
+
+Launched run:
+
+| Item | Value |
+|---|---|
+| run | `dynscale_K_parameter_direct_signal_20260515_i8_v1` |
+| run_dir | `/tmp/shared-storage/OnPolicy/runs/gated_grpo/dynscale_K_parameter_direct_signal_20260515_i8_v1` |
+| tmux | `opvec_dynscale_K_parameter_direct_signal_20260515_i8_v1` |
+| GPUs | `0,1` |
+| parameterization | `parameter` |
+| effective learnable coefficients | `588` |
+| prompts / samples | `96 × 4` |
+| iterations | `8` |
+| init | all effective coefficients `1/3` |
+| optimizer | SGD, momentum `0.2` |
+| LR / prior / max delta | `0.01 / 0.02 / 0.1` |
+| signal | dynamic OPD, dynamic NLL retention, GRPO frontier |
+
+Interpretation rule:
+
+- This is a parameterization diagnostic, not a result-shaped hyperparameter search.
+- If `parameter` still moves mainly along memory-heavy directions, the main bottleneck is confirmed to be training signal / recoverable sample distribution rather than common+residual coupling.
+- If it separates code/memory/tool by module while keeping formal metrics, then direct 588 coefficients are a viable paper setting.
+
+13:28 stop decision:
+
+- Rollout-1 completed in `388.6s`.
+- Rollout-1 reward mean: code `0.4711`, memory `0.3984`, tool `0.3998`; overall `0.4231`.
+- Rollout-1 all-fail rows: code `7`, memory `8`, tool `6`.
+- Dynamic OPD selected `17` all-fail/expert-positive rows: code `4`, memory `6`, tool `7`.
+- Iter-1 update completed and wrote `gate_updates.summary.json`.
+- Iter-1 gate stats:
+  - tool: mean `0.333296`, std `0.000136`, min `0.332766`, max `0.333753`.
+  - memory: mean `0.333747`, std `0.000564`, min `0.330369`, max `0.335478`.
+  - code: mean `0.333347`, std `0.000037`, min `0.333294`, max `0.333823`.
+- Iter-1 optimizer stats: `grad_norm_max=1.18779`, `gate_delta_max=0.002964`, `clip_frac_mean=0.0`.
+- Rollout-2 completed, but reward declined: code `0.3545`, memory `0.4062`, tool `0.4009`; overall `0.3872`.
+- Rollout-2 dynamic OPD again selected `17` rows: code `3`, memory `7`, tool `7`.
+- Iter-2 update started and was actively computing, but was stopped before summary because the diagnostic already showed high cost plus extremely weak first-step coefficient movement.
+- Stop command: `tmux kill-session -t opvec_dynscale_K_parameter_direct_signal_20260515_i8_v1`.
+- GPU 0/1 were released after stop; the frontend monitor remained alive.
+
+Interpretation:
+
+- Direct 588-parameter tuning does create nonzero local variation, but the first-step scale is too small to justify continuing this run under the current signal.
+- The only visibly larger movement is memory, while code/tool remain essentially pinned to `1/3`; this matches the broader 2026-05-15 diagnosis that the training signal is memory-heavy rather than that common+residual coupling alone is the bottleneck.
+- Because rollout-2 reward fell, especially code, this run was not a promising candidate for formal Eval6. The useful result is diagnostic: under the current OPD/GRPO/retention construction, `parameter` is more expensive and does not immediately produce useful local specialization.

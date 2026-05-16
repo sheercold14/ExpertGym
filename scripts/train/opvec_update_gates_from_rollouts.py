@@ -194,6 +194,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             raise SystemExit(f"--optimizer-state-in not found: {state_path}")
     retention_weight = float(args.retention_loss_weight if args.retention_loss_weight is not None else config["loss"].get("lambda_retention", 0.0))
     prior_weight = float(args.prior_loss_weight if args.prior_loss_weight is not None else config["loss"].get("lambda_prior", 0.0))
+    if args.pcgrad_gate_gradients and args.optimizer_step_scope != "epoch":
+        raise ValueError("--pcgrad-gate-gradients currently requires --optimizer-step-scope epoch")
     task_weights = _merged_float_mapping(config.get("calibration", {}).get("task_loss_weight", {}), args.task_weight)
     category_weights = _parse_task_weights(args.category_weight)
     source_weights = _parse_task_weights(args.source_weight)
@@ -267,6 +269,34 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         loss_normalizer=update_batcher.loss_normalizer,
         length_normalize=retention_length_normalize,
     )
+    if args.pcgrad_gate_gradients:
+        update_batcher.pcgrad_recompute_fn = lambda: _replace_gate_grads_with_pcgrad(
+            torch=torch,
+            model=model,
+            tokenizer=tokenizer,
+            gate_manager=gate_manager,
+            optimizer=optimizer,
+            rows=rows,
+            opd_rows=opd_rows,
+            opd_all_success_rows=opd_all_success_rows,
+            retention_rows=retention_rows,
+            raw_rows=raw_rows,
+            config=config,
+            args=args,
+            device=device,
+            max_logprob_tokens=int(args.max_logprob_tokens),
+            update_batcher=update_batcher,
+            task_weights=task_weights,
+            category_weights=category_weights,
+            source_weights=source_weights,
+            advantage_task_scales=advantage_task_scales,
+            opd_scale_plan=opd_scale_plan,
+            retention_scale_plan=retention_scale_plan,
+            retention_weight=retention_weight,
+            prior_weight=prior_weight,
+            opd_length_normalize=opd_length_normalize,
+            retention_length_normalize=retention_length_normalize,
+        )
     log_rows = []
     epoch_summaries = []
     early_stop_hits = 0
@@ -854,7 +884,9 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         "installed_modules": installed,
         "gate_parameterization": gate_parameterization,
         "device_map": args.device_map,
-        "parameter_coefficients": 0 if param_names is None else len(param_names) * 3,
+        "parameter_coefficients": 0
+        if param_names is None
+        else len(param_names) * len(tuple(getattr(gate_manager, "expert_names", ("tool", "memory", "code")))),
         "init_gate_checkpoint": args.init_gate_checkpoint,
         "filled_missing_old_logprobs": filled_old_logprobs,
         "final_gates": gate_manager.gate_values(),
@@ -927,6 +959,14 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "positive_reward_threshold": args.positive_reward_threshold,
         },
     }
+    if args.pcgrad_gate_gradients:
+        pcgrad_rows = [item for item in log_rows if item.get("pcgrad_enabled")]
+        summary["pcgrad"] = {
+            "enabled": True,
+            "eps": float(args.pcgrad_eps),
+            "tasks": list(args.pcgrad_task or []),
+            "conflict_count_max": max((int(item.get("pcgrad_conflict_count", 0)) for item in pcgrad_rows), default=0),
+        }
     write_json(output.with_suffix(".summary.json"), summary)
     write_json(output.with_suffix(".gates.json"), {"gates": summary["final_gates"]})
     if args.optimizer_state_out:
@@ -1371,6 +1411,7 @@ class _UpdateBatcher:
         self.pending_log_indices: list[int] = []
         self.optimizer_steps = 0
         self.skipped_optimizer_steps = 0
+        self.pcgrad_recompute_fn = None
         self.optimizer.zero_grad(set_to_none=True)
 
     @property
@@ -1395,6 +1436,13 @@ class _UpdateBatcher:
             return
         if self.optimizer_step_scope == "epoch" and not force:
             return
+        pcgrad_stats = None
+        if bool(getattr(self.args, "pcgrad_gate_gradients", False)):
+            if self.optimizer_step_scope != "epoch":
+                raise ValueError("--pcgrad-gate-gradients currently requires --optimizer-step-scope epoch")
+            if self.pcgrad_recompute_fn is None:
+                raise RuntimeError("PCGrad requested but no gate-gradient recompute function was installed")
+            pcgrad_stats = self.pcgrad_recompute_fn()
         grad_norm = self.torch.nn.utils.clip_grad_norm_(self.gate_manager.parameters(), self.grad_clip_norm)
         grad_norm_value = float(grad_norm.detach().cpu().item())
         skipped_step = grad_norm_value <= self.min_grad_norm_for_step
@@ -1421,8 +1469,730 @@ class _UpdateBatcher:
             log_rows[index]["batch_loss_scale"] = self.loss_scale
             log_rows[index]["optimizer_step_scope"] = self.optimizer_step_scope
             log_rows[index]["loss_normalizer"] = self.loss_normalizer
+            if pcgrad_stats is not None:
+                log_rows[index]["pcgrad_enabled"] = True
+                log_rows[index]["pcgrad_conflict_count"] = pcgrad_stats["conflict_count"]
+                log_rows[index]["pcgrad_task_grad_norms"] = pcgrad_stats["task_grad_norms"]
+                log_rows[index]["pcgrad_regularizer_grad_norm"] = pcgrad_stats["regularizer_grad_norm"]
+                log_rows[index]["pcgrad_pre_cosines"] = pcgrad_stats["pre_cosines"]
+                log_rows[index]["pcgrad_post_cosines"] = pcgrad_stats["post_cosines"]
         self.pending_log_indices.clear()
         self.optimizer.zero_grad(set_to_none=True)
+
+
+def _gate_params(gate_manager):
+    return [param for param in gate_manager.parameters() if param.requires_grad]
+
+
+def _flatten_grads(grads, params):
+    if not params:
+        raise ValueError("No trainable gate parameters found")
+    import torch
+
+    flat = []
+    for grad, param in zip(grads, params):
+        if grad is None:
+            flat.append(param.detach().new_zeros(param.shape).reshape(-1))
+        else:
+            flat.append(grad.detach().to(device=param.device, dtype=param.dtype).reshape(-1))
+    return torch.cat(flat)
+
+
+def _flatten_current_gate_grads(params):
+    return _flatten_grads([param.grad for param in params], params)
+
+
+def _unflatten_flat_grad(flat_grad, params):
+    grads = []
+    offset = 0
+    for param in params:
+        numel = int(param.numel())
+        grads.append(flat_grad[offset : offset + numel].view_as(param).to(device=param.device, dtype=param.dtype))
+        offset += numel
+    if offset != int(flat_grad.numel()):
+        raise ValueError("Flat gradient size does not match gate parameters")
+    return grads
+
+
+def _write_flat_grad_to_gate_params_(flat_grad, params) -> None:
+    for param, grad in zip(params, _unflatten_flat_grad(flat_grad, params)):
+        param.grad = grad.detach().clone()
+
+
+def _cosine_value(torch, left, right, eps: float) -> float:
+    left_norm = torch.linalg.vector_norm(left)
+    right_norm = torch.linalg.vector_norm(right)
+    denom = left_norm * right_norm
+    if float(denom.detach().cpu().item()) <= float(eps):
+        return 0.0
+    return float((torch.dot(left, right) / (denom + float(eps))).detach().cpu().item())
+
+
+def _pcgrad_cosines(torch, task_grads: dict[str, object], eps: float) -> dict[str, float]:
+    tasks = sorted(task_grads)
+    values = {}
+    for idx, left_task in enumerate(tasks):
+        for right_task in tasks[idx + 1 :]:
+            values[f"{left_task}|{right_task}"] = _cosine_value(
+                torch,
+                task_grads[left_task].float(),
+                task_grads[right_task].float(),
+                eps,
+            )
+    return values
+
+
+def _pcgrad_project(task_grads: dict[str, object], eps: float):
+    """Project conflicting task gradients and return projected gradients plus diagnostics."""
+    if not task_grads:
+        return {}, {
+            "conflict_count": 0,
+            "task_grad_norms": {},
+            "pre_cosines": {},
+            "post_cosines": {},
+        }
+    import torch
+
+    tasks = sorted(task_grads)
+    projected = {task: task_grads[task].detach().clone() for task in tasks}
+    task_grad_norms = {
+        task: float(torch.linalg.vector_norm(task_grads[task].float()).detach().cpu().item())
+        for task in tasks
+    }
+    pre_cosines = _pcgrad_cosines(torch, task_grads, eps)
+    conflict_count = 0
+    for task_a in tasks:
+        grad_a = projected[task_a]
+        if task_grad_norms[task_a] <= float(eps):
+            continue
+        for task_b in tasks:
+            if task_a == task_b:
+                continue
+            grad_b = task_grads[task_b]
+            norm_b_sq = torch.dot(grad_b.float(), grad_b.float())
+            if float(norm_b_sq.detach().cpu().item()) <= float(eps):
+                continue
+            dot = torch.dot(grad_a.float(), grad_b.float())
+            if float(dot.detach().cpu().item()) < 0.0:
+                grad_a = grad_a - (dot / (norm_b_sq + float(eps))).to(dtype=grad_a.dtype) * grad_b
+                conflict_count += 1
+        projected[task_a] = grad_a
+    post_cosines = _pcgrad_cosines(torch, projected, eps)
+    return projected, {
+        "conflict_count": int(conflict_count),
+        "task_grad_norms": task_grad_norms,
+        "pre_cosines": pre_cosines,
+        "post_cosines": post_cosines,
+    }
+
+
+def _combine_pcgrad_task_and_regularizer_grads(
+    task_grads: dict[str, object],
+    regularizer_grad,
+    *,
+    eps: float,
+    project_tasks: set[str] | None = None,
+):
+    import torch
+
+    if project_tasks is None:
+        project_tasks = set(task_grads)
+    projected_input = {task: grad for task, grad in task_grads.items() if task in project_tasks}
+    projected, stats = _pcgrad_project(projected_input, eps)
+    final_grad = regularizer_grad.detach().clone()
+    for task in sorted(task_grads):
+        final_grad = final_grad + projected.get(task, task_grads[task])
+    stats["task_grad_norms"] = {
+        task: float(torch.linalg.vector_norm(task_grads[task].float()).detach().cpu().item())
+        for task in sorted(task_grads)
+    }
+    stats["regularizer_grad_norm"] = float(torch.linalg.vector_norm(regularizer_grad.float()).detach().cpu().item())
+    stats["projected_task_grad_norms"] = {
+        task: float(torch.linalg.vector_norm(projected.get(task, task_grads[task]).float()).detach().cpu().item())
+        for task in sorted(task_grads)
+    }
+    stats["project_tasks"] = sorted(project_tasks)
+    return final_grad, projected, stats
+
+
+def _replace_gate_grads_with_pcgrad(
+    *,
+    torch,
+    model,
+    tokenizer,
+    gate_manager,
+    optimizer,
+    rows: list[dict],
+    opd_rows: list[dict],
+    opd_all_success_rows: list[dict],
+    retention_rows: list[dict],
+    raw_rows: list[dict],
+    config: dict,
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    update_batcher: _UpdateBatcher,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    advantage_task_scales: dict[str, float],
+    opd_scale_plan: dict,
+    retention_scale_plan: dict,
+    retention_weight: float,
+    prior_weight: float,
+    opd_length_normalize: bool,
+    retention_length_normalize: bool,
+) -> dict:
+    """Recompute task-specific gate gradients, apply PCGrad, and replace p.grad."""
+    params = _gate_params(gate_manager)
+    observed_tasks = _observed_pcgrad_tasks(rows, opd_rows, opd_all_success_rows, retention_rows, raw_rows)
+    if args.pcgrad_task:
+        requested = {str(task) for task in args.pcgrad_task}
+        unknown = sorted(requested - observed_tasks)
+        if unknown:
+            raise ValueError(f"--pcgrad-task contains tasks not observed in this update: {unknown}")
+        project_tasks = requested
+    else:
+        project_tasks = set(observed_tasks)
+    task_grads = {}
+    prior_scale_sum = 0.0
+    for task in sorted(observed_tasks):
+        optimizer.zero_grad(set_to_none=True)
+        task_stats = _backward_pcgrad_task_losses(
+            torch,
+            model,
+            tokenizer,
+            rows=rows,
+            opd_rows=opd_rows,
+            opd_all_success_rows=opd_all_success_rows,
+            retention_rows=retention_rows,
+            config=config,
+            args=args,
+            task=task,
+            device=device,
+            max_logprob_tokens=max_logprob_tokens,
+            update_batcher=update_batcher,
+            task_weights=task_weights,
+            category_weights=category_weights,
+            source_weights=source_weights,
+            advantage_task_scales=advantage_task_scales,
+            opd_scale_plan=opd_scale_plan,
+            retention_scale_plan=retention_scale_plan,
+            retention_weight=retention_weight,
+            opd_length_normalize=opd_length_normalize,
+            retention_length_normalize=retention_length_normalize,
+        )
+        task_grads[task] = _flatten_current_gate_grads(params)
+        prior_scale_sum += float(task_stats["prior_scale_sum"])
+    optimizer.zero_grad(set_to_none=True)
+    if float(prior_weight) != 0.0 and prior_scale_sum != 0.0:
+        (_gate_prior_loss(torch, gate_manager) * float(prior_weight) * prior_scale_sum).backward()
+        regularizer_grad = _flatten_current_gate_grads(params)
+    else:
+        regularizer_grad = _flatten_grads([None for _ in params], params)
+    optimizer.zero_grad(set_to_none=True)
+    final_grad, _projected, stats = _combine_pcgrad_task_and_regularizer_grads(
+        task_grads,
+        regularizer_grad,
+        eps=float(args.pcgrad_eps),
+        project_tasks=project_tasks,
+    )
+    _write_flat_grad_to_gate_params_(final_grad, params)
+    return stats
+
+
+def _observed_pcgrad_tasks(*row_sets: list[dict]) -> set[str]:
+    tasks = set()
+    for rows in row_sets:
+        for row in rows:
+            task = str(row.get("task", "") or "")
+            if task:
+                tasks.add(task)
+    return tasks
+
+
+def _backward_pcgrad_task_losses(
+    torch,
+    model,
+    tokenizer,
+    *,
+    rows: list[dict],
+    opd_rows: list[dict],
+    opd_all_success_rows: list[dict],
+    retention_rows: list[dict],
+    config: dict,
+    args: argparse.Namespace,
+    task: str,
+    device,
+    max_logprob_tokens: int,
+    update_batcher: _UpdateBatcher,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    advantage_task_scales: dict[str, float],
+    opd_scale_plan: dict,
+    retention_scale_plan: dict,
+    retention_weight: float,
+    opd_length_normalize: bool,
+    retention_length_normalize: bool,
+) -> dict[str, float]:
+    prior_scale_sum = 0.0
+    processed = 0
+    for row in rows:
+        if str(row.get("task", "")) != task:
+            continue
+        stats = _backward_pcgrad_frontier_row(
+            torch,
+            model,
+            tokenizer,
+            row=row,
+            config=config,
+            args=args,
+            device=device,
+            max_logprob_tokens=max_logprob_tokens,
+            update_batcher=update_batcher,
+            task_weights=task_weights,
+            category_weights=category_weights,
+            source_weights=source_weights,
+            advantage_task_scales=advantage_task_scales,
+        )
+        if stats["processed"] > 0:
+            prior_scale_sum += float(stats["prior_scale"])
+            processed += int(stats["processed"])
+    if opd_rows and (float(args.opd_loss_weight) != 0.0 or float(args.opd_pairwise_loss_weight) != 0.0):
+        for row in opd_rows:
+            if str(row.get("task", "")) != task:
+                continue
+            stats = _backward_pcgrad_opd_row(
+                torch,
+                model,
+                tokenizer,
+                row=row,
+                args=args,
+                device=device,
+                max_logprob_tokens=max_logprob_tokens,
+                update_batcher=update_batcher,
+                task_weights=task_weights,
+                category_weights=category_weights,
+                source_weights=source_weights,
+                opd_scale_plan=opd_scale_plan,
+                opd_length_normalize=opd_length_normalize,
+            )
+            if stats["processed"] > 0:
+                prior_scale_sum += float(stats["prior_scale"])
+                processed += int(stats["processed"])
+    if args.use_opd_all_success and opd_all_success_rows and float(args.opd_all_success_loss_weight) != 0.0:
+        for row in opd_all_success_rows:
+            if str(row.get("task", "")) != task:
+                continue
+            stats = _backward_pcgrad_opd_all_success_row(
+                torch,
+                model,
+                tokenizer,
+                row=row,
+                args=args,
+                device=device,
+                max_logprob_tokens=max_logprob_tokens,
+                update_batcher=update_batcher,
+                task_weights=task_weights,
+                category_weights=category_weights,
+                source_weights=source_weights,
+                retention_length_normalize=retention_length_normalize,
+            )
+            if stats["processed"] > 0:
+                prior_scale_sum += float(stats["prior_scale"])
+                processed += int(stats["processed"])
+    if args.use_retention and retention_weight > 0.0:
+        for row in retention_rows:
+            if str(row.get("task", "")) != task:
+                continue
+            stats = _backward_pcgrad_retention_row(
+                torch,
+                model,
+                tokenizer,
+                row=row,
+                args=args,
+                device=device,
+                max_logprob_tokens=max_logprob_tokens,
+                update_batcher=update_batcher,
+                task_weights=task_weights,
+                category_weights=category_weights,
+                source_weights=source_weights,
+                retention_scale_plan=retention_scale_plan,
+                retention_weight=retention_weight,
+                retention_length_normalize=retention_length_normalize,
+            )
+            processed += int(stats["processed"])
+    return {"processed": float(processed), "prior_scale_sum": prior_scale_sum}
+
+
+def _backward_pcgrad_frontier_row(
+    torch,
+    model,
+    tokenizer,
+    *,
+    row: dict,
+    config: dict,
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    update_batcher: _UpdateBatcher,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    advantage_task_scales: dict[str, float],
+) -> dict[str, float]:
+    prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+    task_name = str(row.get("task", ""))
+    best_response_only = args.ppo_loss_weight == 0.0 and (
+        float(args.best_response_loss_weight) != 0.0 or float(args.pairwise_loss_weight) != 0.0
+    )
+    valid_samples = _objective_samples(row["samples"], require_old_logprob=not best_response_only)
+    if len(valid_samples) < 2:
+        return {"processed": 0.0, "prior_scale": 0.0}
+    rewards = [_sample_train_reward(sample, task=task_name) for sample in valid_samples]
+    category = _row_category(row)
+    source = str(row.get("source") or "")
+    task_weight = (
+        task_weights.get(str(row.get("task")), 1.0)
+        * category_weights.get(category, 1.0)
+        * source_weights.get(source, 1.0)
+    )
+    if best_response_only:
+        objective_stats = _backward_incremental_best_response_losses(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            valid_samples=valid_samples,
+            task=task_name,
+            device=device,
+            max_logprob_tokens=max_logprob_tokens,
+            task_weight=task_weight,
+            best_response_loss_weight=float(args.best_response_loss_weight),
+            pairwise_loss_weight=float(args.pairwise_loss_weight),
+            pairwise_margin=float(args.pairwise_margin),
+            length_normalize=bool(args.length_normalize_logprob),
+            positive_reward_threshold=args.positive_reward_threshold,
+            max_pairwise_pairs_per_row=args.max_pairwise_pairs_per_row,
+            loss_scale=update_batcher.loss_scale,
+        )
+        return {"processed": objective_stats["processed"], "prior_scale": update_batcher.loss_scale if objective_stats["processed"] >= 1 else 0.0}
+    advantage_values, _advantage_source = _row_advantage_values(
+        valid_samples,
+        rewards,
+        frontier_weight=_policy_frontier_multiplier(row, config, args),
+        config=config,
+        args=args,
+    )
+    advantages = torch.tensor(advantage_values, dtype=torch.float32, device=device)
+    advantage_task_scale = float(advantage_task_scales.get(str(row.get("task")), 1.0))
+    if advantage_task_scale != 1.0:
+        advantages = advantages * advantage_task_scale
+    if float(args.best_response_loss_weight) == 0.0 and float(args.pairwise_loss_weight) == 0.0:
+        objective_stats = _backward_incremental_grpo_losses(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            valid_samples=valid_samples,
+            advantages=advantages,
+            device=device,
+            max_logprob_tokens=max_logprob_tokens,
+            task_weight=task_weight,
+            ppo_loss_weight=float(args.ppo_loss_weight),
+            beta_kl=float(config["loss"]["beta_kl"]),
+            eps_clip=float(config["loss"]["eps_clip"]),
+            length_normalize_policy_logprob=bool(args.length_normalize_policy_logprob),
+            loss_granularity=str(args.loss_granularity),
+            loss_scale=update_batcher.loss_scale,
+        )
+        return {"processed": objective_stats["processed"], "prior_scale": update_batcher.loss_scale if objective_stats["processed"] >= 2 else 0.0}
+    processed = _backward_pcgrad_combined_frontier_loss(
+        torch,
+        model,
+        tokenizer,
+        prompt_text=prompt_text,
+        valid_samples=valid_samples,
+        advantages=advantages,
+        task_name=task_name,
+        task_weight=task_weight,
+        config=config,
+        args=args,
+        device=device,
+        max_logprob_tokens=max_logprob_tokens,
+        loss_scale=update_batcher.loss_scale,
+    )
+    return {"processed": processed, "prior_scale": update_batcher.loss_scale if processed >= 1 else 0.0}
+
+
+def _backward_pcgrad_combined_frontier_loss(
+    torch,
+    model,
+    tokenizer,
+    *,
+    prompt_text: str,
+    valid_samples: list[dict],
+    advantages,
+    task_name: str,
+    task_weight: float,
+    config: dict,
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    loss_scale: float,
+) -> float:
+    logp_entries = []
+    for sample_idx, sample in enumerate(valid_samples):
+        entry = _sample_response_logprob_entry(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            sample=sample,
+            device=device,
+            max_length=max_logprob_tokens,
+            loss_granularity=str(args.loss_granularity),
+        )
+        if entry is None:
+            continue
+        entry.update(
+            {
+                "sample_idx": sample_idx,
+                "sample": sample,
+                "reward": _sample_train_reward(sample, task=task_name),
+                "raw_reward": float(sample.get("reward", 0.0)),
+                "length": int(sample.get("length", 0) or 0),
+            }
+        )
+        logp_entries.append(entry)
+    if len(logp_entries) < 2:
+        return 0.0
+    denominator = float(len(logp_entries))
+    loss_tensor = logp_entries[0]["current"].new_tensor(0.0)
+    for entry in logp_entries:
+        sample_idx = int(entry["sample_idx"])
+        advantage = advantages[sample_idx]
+        if args.ppo_loss_weight != 0.0:
+            if args.loss_granularity == "token":
+                policy_loss = clipped_grpo_token_loss(
+                    torch,
+                    current_logprobs=entry["current_logprobs"],
+                    old_logprobs=entry["old_logprobs"],
+                    response_mask=entry["response_mask"],
+                    advantage=advantage,
+                    clip_epsilon=float(config["loss"]["eps_clip"]),
+                ) / denominator
+            else:
+                current = _entry_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+                old_logp = _entry_old_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+                ratio = torch.exp((current - old_logp).clamp(-20.0, 20.0))
+                clipped = torch.clamp(ratio, 1.0 - float(config["loss"]["eps_clip"]), 1.0 + float(config["loss"]["eps_clip"]))
+                policy_loss = -torch.minimum(ratio * advantage, clipped * advantage) / denominator
+            loss_tensor = loss_tensor + task_weight * float(args.ppo_loss_weight) * policy_loss
+        if args.loss_granularity == "token":
+            kl_loss = reverse_kl_token_penalty(
+                torch,
+                current_logprobs=entry["current_logprobs"],
+                old_logprobs=entry["old_logprobs"],
+                response_mask=entry["response_mask"],
+            ) / denominator
+        else:
+            current = _entry_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+            old_logp = _entry_old_score(entry, length_normalize=bool(args.length_normalize_policy_logprob))
+            log_ratio = (old_logp - current).clamp(-20.0, 20.0)
+            kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
+        loss_tensor = loss_tensor + task_weight * float(config["loss"]["beta_kl"]) * kl_loss
+    best_response_loss = _best_response_loss(
+        torch,
+        logp_entries,
+        length_normalize=bool(args.length_normalize_logprob),
+        positive_reward_threshold=args.positive_reward_threshold,
+    )
+    pairwise_loss = _pairwise_best_response_loss(
+        torch,
+        logp_entries,
+        margin=float(args.pairwise_margin),
+        length_normalize=bool(args.length_normalize_logprob),
+        positive_reward_threshold=args.positive_reward_threshold,
+    )
+    loss_tensor = loss_tensor + task_weight * float(args.best_response_loss_weight) * best_response_loss
+    loss_tensor = loss_tensor + task_weight * float(args.pairwise_loss_weight) * pairwise_loss
+    (loss_tensor * float(loss_scale)).backward()
+    return float(len(logp_entries))
+
+
+def _backward_pcgrad_opd_row(
+    torch,
+    model,
+    tokenizer,
+    *,
+    row: dict,
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    update_batcher: _UpdateBatcher,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    opd_scale_plan: dict,
+    opd_length_normalize: bool,
+) -> dict[str, float]:
+    prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+    valid_samples = _objective_samples(row.get("samples", []), require_old_logprob=False)
+    if len(valid_samples) < 2:
+        return {"processed": 0.0, "prior_scale": 0.0}
+    task_name = str(row.get("task", ""))
+    category = _row_category(row)
+    source = str(row.get("source") or "opd_distill")
+    task_weight = (
+        task_weights.get(str(row.get("task")), 1.0)
+        * category_weights.get(category, 1.0)
+        * source_weights.get(source, 1.0)
+    )
+    opd_row_scale = _opd_row_loss_scale(row, opd_scale_plan=opd_scale_plan, default_loss_scale=update_batcher.loss_scale)
+    objective_stats = _backward_incremental_best_response_losses(
+        torch,
+        model,
+        tokenizer,
+        prompt_text=prompt_text,
+        valid_samples=valid_samples,
+        task=task_name,
+        device=device,
+        max_logprob_tokens=max_logprob_tokens,
+        task_weight=task_weight,
+        best_response_loss_weight=float(args.opd_loss_weight),
+        pairwise_loss_weight=float(args.opd_pairwise_loss_weight),
+        pairwise_margin=float(args.opd_pairwise_margin),
+        length_normalize=opd_length_normalize,
+        positive_reward_threshold=args.opd_positive_reward_threshold,
+        max_pairwise_pairs_per_row=args.max_opd_pairwise_pairs_per_row,
+        loss_scale=opd_row_scale,
+        component_scale=_opd_component_scale(row, opd_scale_plan=opd_scale_plan),
+    )
+    return {"processed": objective_stats["processed"], "prior_scale": opd_row_scale if objective_stats["processed"] >= 1 else 0.0}
+
+
+def _backward_pcgrad_opd_all_success_row(
+    torch,
+    model,
+    tokenizer,
+    *,
+    row: dict,
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    update_batcher: _UpdateBatcher,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    retention_length_normalize: bool,
+) -> dict[str, float]:
+    prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+    valid_samples = _objective_samples(row.get("samples", []), require_old_logprob=False)
+    if not valid_samples:
+        return {"processed": 0.0, "prior_scale": 0.0}
+    task_name = str(row.get("task", ""))
+    category = _row_category(row)
+    source = str(row.get("source") or "opd_all_success")
+    task_weight = (
+        task_weights.get(str(row.get("task")), 1.0)
+        * category_weights.get(category, 1.0)
+        * source_weights.get(source, 1.0)
+    )
+    objective_stats = _backward_incremental_best_response_losses(
+        torch,
+        model,
+        tokenizer,
+        prompt_text=prompt_text,
+        valid_samples=valid_samples,
+        task=task_name,
+        device=device,
+        max_logprob_tokens=max_logprob_tokens,
+        task_weight=task_weight,
+        best_response_loss_weight=float(args.opd_all_success_loss_weight),
+        pairwise_loss_weight=0.0,
+        pairwise_margin=0.0,
+        length_normalize=retention_length_normalize,
+        positive_reward_threshold=args.opd_all_success_positive_reward_threshold,
+        max_pairwise_pairs_per_row=0,
+        loss_scale=update_batcher.loss_scale,
+    )
+    return {"processed": objective_stats["processed"], "prior_scale": update_batcher.loss_scale if objective_stats["processed"] >= 1 else 0.0}
+
+
+def _backward_pcgrad_retention_row(
+    torch,
+    model,
+    tokenizer,
+    *,
+    row: dict,
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+    update_batcher: _UpdateBatcher,
+    task_weights: dict[str, float],
+    category_weights: dict[str, float],
+    source_weights: dict[str, float],
+    retention_scale_plan: dict,
+    retention_weight: float,
+    retention_length_normalize: bool,
+) -> dict[str, float]:
+    prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+    valid_samples = _objective_samples(row["samples"], require_old_logprob=args.retention_objective == "kl")
+    if not valid_samples:
+        return {"processed": 0.0}
+    task_name = str(row.get("task", ""))
+    category = _row_category(row)
+    source = str(row.get("source") or "")
+    task_weight = (
+        task_weights.get(str(row.get("task")), 1.0)
+        * category_weights.get(category, 1.0)
+        * source_weights.get(source, 1.0)
+    )
+    if args.retention_objective == "nll":
+        objective_stats = _backward_incremental_best_response_losses(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            valid_samples=valid_samples,
+            task=task_name,
+            device=device,
+            max_logprob_tokens=max_logprob_tokens,
+            task_weight=task_weight,
+            best_response_loss_weight=retention_weight,
+            pairwise_loss_weight=0.0,
+            pairwise_margin=0.0,
+            length_normalize=retention_length_normalize,
+            positive_reward_threshold=args.retention_positive_reward_threshold,
+            max_pairwise_pairs_per_row=0,
+            loss_scale=_retention_row_loss_scale(row, retention_scale_plan=retention_scale_plan, default_loss_scale=update_batcher.loss_scale),
+            component_scale=_retention_component_scale(row, retention_scale_plan=retention_scale_plan),
+        )
+        return {"processed": objective_stats["processed"]}
+    processed = 0
+    denominator = float(len(valid_samples))
+    for sample in valid_samples:
+        logp = _sample_response_logprob_tensor(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=prompt_text,
+            sample=sample,
+            device=device,
+            max_length=max_logprob_tokens,
+        )
+        if logp is None:
+            continue
+        old_logp = torch.tensor(float(sample["old_logprob"]), dtype=torch.float32, device=device)
+        current = logp.float()
+        log_ratio = (old_logp - current).clamp(-20.0, 20.0)
+        kl_loss = (torch.exp(log_ratio) - log_ratio - 1.0) / denominator
+        sample_loss = task_weight * retention_weight * kl_loss
+        (sample_loss * update_batcher.loss_scale).backward()
+        processed += 1
+    return {"processed": float(processed)}
 
 
 def parse_args() -> argparse.Namespace:
@@ -1477,6 +2247,24 @@ def parse_args() -> argparse.Namespace:
             "epoch keeps mini-batches as gradient-accumulation chunks and applies one optimizer.step() "
             "after all rows in an update epoch."
         ),
+    )
+    parser.add_argument(
+        "--pcgrad-gate-gradients",
+        action="store_true",
+        default=False,
+        help="Enable optional PCGrad projection across task-specific gate gradients before optimizer.step().",
+    )
+    parser.add_argument(
+        "--pcgrad-eps",
+        type=float,
+        default=1e-12,
+        help="Numerical epsilon used by PCGrad projection.",
+    )
+    parser.add_argument(
+        "--pcgrad-task",
+        action="append",
+        default=[],
+        help="Optional task allowlist for PCGrad, e.g. --pcgrad-task tool --pcgrad-task memory --pcgrad-task code. If empty, use all observed tasks.",
     )
     parser.add_argument(
         "--loss-granularity",
@@ -1768,6 +2556,8 @@ def parse_args() -> argparse.Namespace:
         )
     if int(args.update_batch_size) < 1:
         parser.error("--update-batch-size must be >= 1")
+    if args.pcgrad_gate_gradients and args.optimizer_step_scope != "epoch":
+        parser.error("--pcgrad-gate-gradients currently requires --optimizer-step-scope epoch")
     return args
 
 

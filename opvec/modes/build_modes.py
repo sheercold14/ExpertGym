@@ -44,6 +44,7 @@ def build_opvec4_modes(
 
     models = config["models"]
     experts = models["experts"]
+    expert_names = _ordered_expert_names(experts)
     modes_cfg = config.get("modes", {})
     output = Path(output_dir or modes_cfg["artifact_dir"]).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -65,6 +66,7 @@ def build_opvec4_modes(
         "mode_set": "opvec4",
         "base_model": str(base_dir),
         "experts": dict(experts),
+        "expert_names": expert_names,
         "selection": {
             "include_regex": list(modes_cfg.get("include_regex") or []),
             "exclude_regex": list(modes_cfg.get("exclude_regex") or []),
@@ -91,7 +93,7 @@ def build_opvec4_modes(
     base_weight_map = base_index["weight_map"]
     diagnostics: dict[str, Any] = {"experts": {}, "params": {}, "total_l2_sq_by_expert": defaultdict(float)}
 
-    for expert_name in ["tool", "memory", "code"]:
+    for expert_name in expert_names:
         expert_dir = Path(experts[expert_name]).expanduser()
         expert_weight_map = load_safetensors_index(expert_dir)["weight_map"]
         missing = [param for param in params if param not in expert_weight_map]
@@ -148,6 +150,14 @@ def write_mode_outputs(output: Path, manifest: Mapping[str, Any], diagnostics: M
 def basis_storage_path(expert_name: str, param_name: str) -> str:
     safe = param_name.replace(".", "__")
     return f"expert_deltas/{expert_name}/{safe}.pt"
+
+
+def _ordered_expert_names(experts: Mapping[str, Any]) -> list[str]:
+    names = [expert for expert in ("tool", "memory", "code") if expert in experts]
+    names.extend(str(expert) for expert in experts if str(expert) not in names)
+    if not names:
+        raise ValueError("models.experts must contain at least one expert")
+    return names
 
 
 def load_safetensors_index(model_dir: Path) -> dict[str, Any]:

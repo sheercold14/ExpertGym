@@ -29,6 +29,7 @@ class GatedLinear:
                 for param in self.base_linear.parameters():
                     param.requires_grad_(False)
                 target_weight = self.base_linear.weight
+                self.delta_expert_names = tuple(str(name) for name in delta_tensors)
                 for expert_name, delta in delta_tensors.items():
                     if list(delta.shape) != list(self.base_linear.weight.shape):
                         raise ValueError(f"Delta shape mismatch for {expert_name}")
@@ -41,9 +42,11 @@ class GatedLinear:
                     coeffs = self.gate_manager.expert_coefficients(param_name=self.param_name)
                 except TypeError:
                     coeffs = self.gate_manager.expert_coefficients()
-                for expert_name in ["tool", "memory", "code"]:
+                for expert_name in self.delta_expert_names:
                     buffer_name = f"delta_{expert_name}"
                     if not hasattr(self, buffer_name):
+                        continue
+                    if expert_name not in coeffs:
                         continue
                     coeff = coeffs[expert_name]
                     delta = getattr(self, buffer_name)

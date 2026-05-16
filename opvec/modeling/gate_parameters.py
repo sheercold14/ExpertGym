@@ -24,19 +24,18 @@ class TorchGateManager:
         *,
         common_bounds: tuple[float, float] = (-0.10, 1.50),
         residual_bounds: tuple[float, float] = (-0.50, 0.50),
+        expert_names: tuple[str, ...] = EXPERT_NAMES,
     ):
         nn = torch_module.nn
+        experts = _expert_names_tuple(expert_names)
 
         class _Manager(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.expert_names = experts
                 initial_common = float(init_values.get("common", 0.5))
                 self.raw_common = nn.Parameter(torch_module.tensor([initial_common], dtype=torch_module.float32))
-                initial_residual = [
-                    float(init_values.get("tool_residual", 0.0)),
-                    float(init_values.get("memory_residual", 0.0)),
-                    float(init_values.get("code_residual", 0.0)),
-                ]
+                initial_residual = [float(init_values.get(f"{expert}_residual", 0.0)) for expert in self.expert_names]
                 self.raw_residual = nn.Parameter(
                     torch_module.tensor(
                         initial_residual,
@@ -48,20 +47,14 @@ class TorchGateManager:
 
             def effective_gates(self):
                 residual = self.raw_residual - self.raw_residual.mean()
-                return {
-                    "common": self.raw_common[0],
-                    "tool_residual": residual[0],
-                    "memory_residual": residual[1],
-                    "code_residual": residual[2],
-                }
+                values = {"common": self.raw_common[0]}
+                for expert_idx, expert in enumerate(self.expert_names):
+                    values[f"{expert}_residual"] = residual[expert_idx]
+                return values
 
             def expert_coefficients(self):
                 gates = self.effective_gates()
-                return {
-                    "tool": gates["common"] + gates["tool_residual"],
-                    "memory": gates["common"] + gates["memory_residual"],
-                    "code": gates["common"] + gates["code_residual"],
-                }
+                return {expert: gates["common"] + gates[f"{expert}_residual"] for expert in self.expert_names}
 
             def gate_values(self):
                 gates = self.effective_gates()
@@ -90,16 +83,19 @@ class TorchLayerBandGateManager:
         layer_bands: Mapping[str, tuple[int, int]] | None = None,
         common_bounds: tuple[float, float] = (-0.10, 1.50),
         residual_bounds: tuple[float, float] = (-0.50, 0.50),
+        expert_names: tuple[str, ...] = EXPERT_NAMES,
     ):
         nn = torch_module.nn
         bands = dict(layer_bands or DEFAULT_LAYER_BANDS)
         band_names = tuple(bands.keys())
+        experts = _expert_names_tuple(expert_names)
 
         class _Manager(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.band_names = band_names
                 self.layer_bands = bands
+                self.expert_names = experts
                 initial_common = [_init_value(init_values, band, "common", 0.5) for band in self.band_names]
                 self.raw_common = nn.Parameter(
                     torch_module.tensor(
@@ -110,7 +106,7 @@ class TorchLayerBandGateManager:
                 initial_residual = [
                     [
                         _init_value(init_values, band, f"{expert}_residual", 0.0)
-                        for expert in EXPERT_NAMES
+                        for expert in self.expert_names
                     ]
                     for band in self.band_names
                 ]
@@ -132,27 +128,20 @@ class TorchLayerBandGateManager:
                     band = self.band_for_param(param_name)
                 if band is not None:
                     idx = self.band_names.index(band)
-                    return {
-                        "common": self.raw_common[idx],
-                        "tool_residual": residual[idx, 0],
-                        "memory_residual": residual[idx, 1],
-                        "code_residual": residual[idx, 2],
-                    }
+                    values = {"common": self.raw_common[idx]}
+                    for expert_idx, expert in enumerate(self.expert_names):
+                        values[f"{expert}_residual"] = residual[idx, expert_idx]
+                    return values
                 values = {}
                 for idx, band_name in enumerate(self.band_names):
                     values[f"{band_name}.common"] = self.raw_common[idx]
-                    values[f"{band_name}.tool_residual"] = residual[idx, 0]
-                    values[f"{band_name}.memory_residual"] = residual[idx, 1]
-                    values[f"{band_name}.code_residual"] = residual[idx, 2]
+                    for expert_idx, expert in enumerate(self.expert_names):
+                        values[f"{band_name}.{expert}_residual"] = residual[idx, expert_idx]
                 return values
 
             def expert_coefficients(self, *, band: str | None = None, param_name: str | None = None):
                 gates = self.effective_gates(band=band, param_name=param_name)
-                return {
-                    "tool": gates["common"] + gates["tool_residual"],
-                    "memory": gates["common"] + gates["memory_residual"],
-                    "code": gates["common"] + gates["code_residual"],
-                }
+                return {expert: gates["common"] + gates[f"{expert}_residual"] for expert in self.expert_names}
 
             def gate_values(self):
                 gates = self.effective_gates()
@@ -180,18 +169,21 @@ class TorchParameterCoefficientManager:
         *,
         param_names: list[str],
         coefficient_bounds: tuple[float, float] = (-0.50, 1.50),
+        expert_names: tuple[str, ...] = EXPERT_NAMES,
     ):
         if not param_names:
             raise ValueError("TorchParameterCoefficientManager requires non-empty param_names")
         nn = torch_module.nn
         names = tuple(str(name) for name in param_names)
-        initial = _initial_parameter_coefficients(init_values, names)
+        experts = _expert_names_tuple(expert_names)
+        initial = _initial_parameter_coefficients(init_values, names, expert_names=experts)
 
         class _Manager(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.param_names = names
                 self.param_to_index = {name: index for index, name in enumerate(self.param_names)}
+                self.expert_names = experts
                 self.raw_coefficients = nn.Parameter(torch_module.tensor(initial, dtype=torch_module.float32))
                 self.register_buffer(
                     "initial_coefficients",
@@ -202,13 +194,13 @@ class TorchParameterCoefficientManager:
                 if param_name is None:
                     values = {}
                     for param_idx, name in enumerate(self.param_names):
-                        for expert_idx, expert in enumerate(EXPERT_NAMES):
+                        for expert_idx, expert in enumerate(self.expert_names):
                             values[f"{name}::{expert}"] = self.raw_coefficients[param_idx, expert_idx]
                     return values
                 if str(param_name) not in self.param_to_index:
                     raise KeyError(f"Unknown parameter coefficient name: {param_name}")
                 row = self.raw_coefficients[self.param_to_index[str(param_name)]]
-                return {expert: row[index] for index, expert in enumerate(EXPERT_NAMES)}
+                return {expert: row[index] for index, expert in enumerate(self.expert_names)}
 
             def expert_coefficients(self, *, param_name: str | None = None):
                 if param_name is None:
@@ -217,13 +209,13 @@ class TorchParameterCoefficientManager:
                     if str(param_name) not in self.param_to_index:
                         raise KeyError(f"Unknown parameter coefficient name: {param_name}")
                     values = self.raw_coefficients[self.param_to_index[str(param_name)]]
-                return {expert: values[index] for index, expert in enumerate(EXPERT_NAMES)}
+                return {expert: values[index] for index, expert in enumerate(self.expert_names)}
 
             def gate_values(self):
                 values = {}
                 detached = self.raw_coefficients.detach().cpu()
                 for param_idx, param_name in enumerate(self.param_names):
-                    for expert_idx, expert in enumerate(EXPERT_NAMES):
+                    for expert_idx, expert in enumerate(self.expert_names):
                         values[f"{param_name}::{expert}"] = float(detached[param_idx, expert_idx].item())
                 return values
 
@@ -246,13 +238,16 @@ class TorchGlobalCoefficientManager:
         init_values: Mapping[str, float],
         *,
         coefficient_bounds: tuple[float, float] = (-0.50, 1.50),
+        expert_names: tuple[str, ...] = EXPERT_NAMES,
     ):
         nn = torch_module.nn
-        initial = _initial_global_coefficients(init_values)
+        experts = _expert_names_tuple(expert_names)
+        initial = _initial_global_coefficients(init_values, expert_names=experts)
 
         class _Manager(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.expert_names = experts
                 self.raw_coefficients = nn.Parameter(torch_module.tensor(initial, dtype=torch_module.float32))
                 self.register_buffer(
                     "initial_coefficients",
@@ -260,14 +255,14 @@ class TorchGlobalCoefficientManager:
                 )
 
             def effective_gates(self):
-                return {expert: self.raw_coefficients[index] for index, expert in enumerate(EXPERT_NAMES)}
+                return {expert: self.raw_coefficients[index] for index, expert in enumerate(self.expert_names)}
 
             def expert_coefficients(self, *, param_name: str | None = None):
                 return self.effective_gates()
 
             def gate_values(self):
                 detached = self.raw_coefficients.detach().cpu()
-                return {expert: float(detached[index].item()) for index, expert in enumerate(EXPERT_NAMES)}
+                return {expert: float(detached[index].item()) for index, expert in enumerate(self.expert_names)}
 
             def project_(self):
                 with torch_module.no_grad():
@@ -293,15 +288,18 @@ class TorchGlobalParameterCoefficientManager:
         coefficient_bounds: tuple[float, float] = (-0.50, 1.50),
         global_prior_scale: float = 0.10,
         residual_prior_scale: float = 1.00,
+        expert_names: tuple[str, ...] = EXPERT_NAMES,
     ):
         if not param_names:
             raise ValueError("TorchGlobalParameterCoefficientManager requires non-empty param_names")
         nn = torch_module.nn
         names = tuple(str(name) for name in param_names)
+        experts = _expert_names_tuple(expert_names)
         initial_global, initial_residual = _initial_global_parameter_coefficients(
             init_values,
             names,
             residual_bounds=residual_bounds,
+            expert_names=experts,
         )
 
         class _Manager(nn.Module):
@@ -309,6 +307,7 @@ class TorchGlobalParameterCoefficientManager:
                 super().__init__()
                 self.param_names = names
                 self.param_to_index = {name: index for index, name in enumerate(self.param_names)}
+                self.expert_names = experts
                 self.global_prior_scale = float(global_prior_scale)
                 self.residual_prior_scale = float(residual_prior_scale)
                 self.raw_global_coefficients = nn.Parameter(torch_module.tensor(initial_global, dtype=torch_module.float32))
@@ -329,16 +328,16 @@ class TorchGlobalParameterCoefficientManager:
                 coefficients = self.effective_coefficients()
                 if param_name is None:
                     values = {}
-                    for expert_idx, expert in enumerate(EXPERT_NAMES):
+                    for expert_idx, expert in enumerate(self.expert_names):
                         values[f"__global__::{expert}"] = self.raw_global_coefficients[expert_idx]
                     for param_idx, name in enumerate(self.param_names):
-                        for expert_idx, expert in enumerate(EXPERT_NAMES):
+                        for expert_idx, expert in enumerate(self.expert_names):
                             values[f"{name}::{expert}"] = coefficients[param_idx, expert_idx]
                     return values
                 if str(param_name) not in self.param_to_index:
                     raise KeyError(f"Unknown parameter coefficient name: {param_name}")
                 row = coefficients[self.param_to_index[str(param_name)]]
-                return {expert: row[index] for index, expert in enumerate(EXPERT_NAMES)}
+                return {expert: row[index] for index, expert in enumerate(self.expert_names)}
 
             def expert_coefficients(self, *, param_name: str | None = None):
                 if param_name is None:
@@ -347,16 +346,16 @@ class TorchGlobalParameterCoefficientManager:
                     if str(param_name) not in self.param_to_index:
                         raise KeyError(f"Unknown parameter coefficient name: {param_name}")
                     values = self.effective_coefficients()[self.param_to_index[str(param_name)]]
-                return {expert: values[index] for index, expert in enumerate(EXPERT_NAMES)}
+                return {expert: values[index] for index, expert in enumerate(self.expert_names)}
 
             def gate_values(self):
                 values = {}
                 detached_global = self.raw_global_coefficients.detach().cpu()
                 detached_effective = self.effective_coefficients().detach().cpu()
-                for expert_idx, expert in enumerate(EXPERT_NAMES):
+                for expert_idx, expert in enumerate(self.expert_names):
                     values[f"__global__::{expert}"] = float(detached_global[expert_idx].item())
                 for param_idx, param_name in enumerate(self.param_names):
-                    for expert_idx, expert in enumerate(EXPERT_NAMES):
+                    for expert_idx, expert in enumerate(self.expert_names):
                         values[f"{param_name}::{expert}"] = float(detached_effective[param_idx, expert_idx].item())
                 return values
 
@@ -410,6 +409,7 @@ def make_torch_gate_manager(
 ):
     """Construct a gate manager module from run config."""
 
+    expert_names = _expert_names_from_config(config)
     common_bounds = tuple(float(item) for item in config.get("gate_bounds", {}).get("common", (-0.10, 1.50)))
     residual_bounds = tuple(float(item) for item in config.get("gate_bounds", {}).get("residual", (-0.50, 0.50)))
     if parameterization == "global":
@@ -418,6 +418,7 @@ def make_torch_gate_manager(
             config.get("initial_gates", {}),
             common_bounds=common_bounds,  # type: ignore[arg-type]
             residual_bounds=residual_bounds,  # type: ignore[arg-type]
+            expert_names=expert_names,
         ).module
     if parameterization in {"layer-band", "layer_band"}:
         return TorchLayerBandGateManager(
@@ -426,6 +427,7 @@ def make_torch_gate_manager(
             layer_bands=_config_layer_bands(config),
             common_bounds=common_bounds,  # type: ignore[arg-type]
             residual_bounds=residual_bounds,  # type: ignore[arg-type]
+            expert_names=expert_names,
         ).module
     coefficient_bounds = tuple(
         float(item)
@@ -448,6 +450,7 @@ def make_torch_gate_manager(
             torch_module,
             config.get("initial_gates", {}),
             coefficient_bounds=coefficient_bounds,  # type: ignore[arg-type]
+            expert_names=expert_names,
         ).module
     if parameterization in {"parameter", "param", "param-coefficients", "parameter-coefficients"}:
         return TorchParameterCoefficientManager(
@@ -455,6 +458,7 @@ def make_torch_gate_manager(
             config.get("initial_gates", {}),
             param_names=list(param_names or []),
             coefficient_bounds=coefficient_bounds,  # type: ignore[arg-type]
+            expert_names=expert_names,
         ).module
     if parameterization in {
         "global-parameter",
@@ -488,6 +492,7 @@ def make_torch_gate_manager(
             coefficient_bounds=coefficient_bounds,  # type: ignore[arg-type]
             global_prior_scale=float(loss_config.get("global_coefficient_prior_scale", 0.10)),
             residual_prior_scale=float(loss_config.get("parameter_residual_prior_scale", 1.00)),
+            expert_names=expert_names,
         ).module
     raise ValueError(f"Unknown gate parameterization: {parameterization}")
 
@@ -509,21 +514,30 @@ def _config_layer_bands(config: Mapping[str, Any]) -> dict[str, tuple[int, int]]
     return bands
 
 
-def _initial_parameter_coefficients(init_values: Mapping[str, float], param_names: tuple[str, ...]) -> list[list[float]]:
-    fallback = _fallback_expert_coefficients(init_values)
+def _initial_parameter_coefficients(
+    init_values: Mapping[str, float],
+    param_names: tuple[str, ...],
+    *,
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
+) -> list[list[float]]:
+    fallback = _fallback_expert_coefficients(init_values, expert_names=expert_names)
     rows = []
     for param_name in param_names:
         row = []
-        for expert in EXPERT_NAMES:
+        for expert in expert_names:
             row.append(float(init_values.get(f"{param_name}::{expert}", fallback[expert])))
         rows.append(row)
     return rows
 
 
-def _initial_global_coefficients(init_values: Mapping[str, float]) -> list[float]:
-    fallback = _fallback_expert_coefficients(init_values)
+def _initial_global_coefficients(
+    init_values: Mapping[str, float],
+    *,
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
+) -> list[float]:
+    fallback = _fallback_expert_coefficients(init_values, expert_names=expert_names)
     values = []
-    for expert in EXPERT_NAMES:
+    for expert in expert_names:
         values.append(float(init_values.get(expert, init_values.get(f"global.{expert}", fallback[expert]))))
     return values
 
@@ -533,20 +547,21 @@ def _initial_global_parameter_coefficients(
     param_names: tuple[str, ...],
     *,
     residual_bounds: tuple[float, float],
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
 ) -> tuple[list[float], list[list[float]]]:
-    rows = _initial_parameter_coefficients(init_values, param_names)
-    explicit_global = [init_values.get(f"__global__::{expert}") for expert in EXPERT_NAMES]
+    rows = _initial_parameter_coefficients(init_values, param_names, expert_names=expert_names)
+    explicit_global = [init_values.get(f"__global__::{expert}") for expert in expert_names]
     if any(value is not None for value in explicit_global):
         global_values = [
             float(value) if value is not None else sum(row[expert_idx] for row in rows) / len(rows)
             for expert_idx, value in enumerate(explicit_global)
         ]
     else:
-        global_values = [sum(row[expert_idx] for row in rows) / len(rows) for expert_idx in range(len(EXPERT_NAMES))]
+        global_values = [sum(row[expert_idx] for row in rows) / len(rows) for expert_idx in range(len(expert_names))]
     residuals = []
     for param_name, row in zip(param_names, rows):
         residual_row = []
-        for expert_idx, expert in enumerate(EXPERT_NAMES):
+        for expert_idx, expert in enumerate(expert_names):
             residual_key = f"__residual__::{param_name}::{expert}"
             raw_residual = init_values.get(residual_key)
             if raw_residual is None:
@@ -558,12 +573,33 @@ def _initial_global_parameter_coefficients(
     return global_values, residuals
 
 
-def _fallback_expert_coefficients(init_values: Mapping[str, float]) -> dict[str, float]:
+def _fallback_expert_coefficients(
+    init_values: Mapping[str, float],
+    *,
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
+) -> dict[str, float]:
     common = float(init_values.get("common", 0.5))
-    residuals = {
-        "tool": float(init_values.get("tool_residual", 0.0)),
-        "memory": float(init_values.get("memory_residual", 0.0)),
-        "code": float(init_values.get("code_residual", 0.0)),
-    }
+    residuals = {expert: float(init_values.get(f"{expert}_residual", 0.0)) for expert in expert_names}
     mean_residual = sum(residuals.values()) / len(residuals)
     return {expert: common + residual - mean_residual for expert, residual in residuals.items()}
+
+
+def _expert_names_from_config(config: Mapping[str, Any]) -> tuple[str, ...]:
+    configured = config.get("expert_names") or config.get("modes", {}).get("expert_names")
+    if configured:
+        return _expert_names_tuple(tuple(str(item) for item in configured))
+    experts = config.get("models", {}).get("experts") if isinstance(config.get("models"), Mapping) else None
+    if isinstance(experts, Mapping) and experts:
+        ordered = [expert for expert in EXPERT_NAMES if expert in experts]
+        ordered.extend(str(expert) for expert in experts if str(expert) not in ordered)
+        return _expert_names_tuple(tuple(ordered))
+    return EXPERT_NAMES
+
+
+def _expert_names_tuple(expert_names: tuple[str, ...]) -> tuple[str, ...]:
+    names = tuple(str(name) for name in expert_names if str(name))
+    if not names:
+        raise ValueError("At least one expert name is required")
+    if len(set(names)) != len(names):
+        raise ValueError(f"Duplicate expert names are not allowed: {names}")
+    return names

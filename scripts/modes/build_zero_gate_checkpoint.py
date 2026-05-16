@@ -27,11 +27,13 @@ from opvec.modeling.manifest import manifest_param_names
 def main() -> None:
     args = parse_args()
     config = load_config(args.config) if args.config else None
+    expert_names = _manifest_expert_names(args.mode_manifest)
     gates, metadata = build_zero_gate_checkpoint(
         mode_manifest=args.mode_manifest,
         parameterization=args.gate_parameterization,
         config=config,
         include_bias=bool(args.include_bias),
+        expert_names=expert_names,
     )
     payload = {
         "format": "opvec_zero_gate_checkpoint_v1",
@@ -51,23 +53,21 @@ def build_zero_gate_checkpoint(
     parameterization: str,
     config: dict[str, Any] | None = None,
     include_bias: bool = False,
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     parameterization = normalize_parameterization(parameterization)
     if parameterization == "global-coefficient":
-        gates: dict[str, float] = {expert: 0.0 for expert in EXPERT_NAMES}
+        gates: dict[str, float] = {expert: 0.0 for expert in expert_names}
     else:
-        gates = {
-            "common": 0.0,
-            "tool_residual": 0.0,
-            "memory_residual": 0.0,
-            "code_residual": 0.0,
-        }
+        gates = {"common": 0.0}
+        for expert in expert_names:
+            gates[f"{expert}_residual"] = 0.0
     param_names: list[str] = []
 
     if parameterization == "layer-band":
         for band_name in _layer_band_names(config):
             gates[f"{band_name}.common"] = 0.0
-            for expert in EXPERT_NAMES:
+            for expert in expert_names:
                 gates[f"{band_name}.{expert}_residual"] = 0.0
 
     if parameterization in {"parameter", "global-parameter"}:
@@ -78,16 +78,16 @@ def build_zero_gate_checkpoint(
                 "Use a real mode manifest with basis_entries, not a dry-run manifest."
             )
         if parameterization == "global-parameter":
-            for expert in EXPERT_NAMES:
+            for expert in expert_names:
                 gates[f"__global__::{expert}"] = 0.0
         for param_name in param_names:
-            for expert in EXPERT_NAMES:
+            for expert in expert_names:
                 gates[f"{param_name}::{expert}"] = 0.0
 
     return gates, {
         "num_mergeable_params": len(param_names),
         "num_gate_values": len(gates),
-        "experts": list(EXPERT_NAMES),
+        "experts": list(expert_names),
         "zero_init_meaning": "all task-vector coefficients are 0.0; policy starts as the base model",
     }
 
@@ -122,6 +122,19 @@ def _layer_band_names(config: dict[str, Any] | None) -> list[str]:
         return list(DEFAULT_LAYER_BANDS)
     raw = config.get("layer_bands") or config.get("modes", {}).get("layer_bands") or DEFAULT_LAYER_BANDS
     return [str(name) for name in raw.keys()]
+
+
+def _manifest_expert_names(mode_manifest: str | Path) -> tuple[str, ...]:
+    payload = json.loads(Path(mode_manifest).expanduser().read_text(encoding="utf-8"))
+    configured = payload.get("expert_names")
+    if isinstance(configured, list) and configured:
+        return tuple(str(item) for item in configured)
+    experts = payload.get("experts")
+    if isinstance(experts, dict) and experts:
+        ordered = [expert for expert in EXPERT_NAMES if expert in experts]
+        ordered.extend(str(expert) for expert in experts if str(expert) not in ordered)
+        return tuple(ordered)
+    return EXPERT_NAMES
 
 
 def parse_args() -> argparse.Namespace:

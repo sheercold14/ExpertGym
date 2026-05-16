@@ -541,6 +541,10 @@ def _update_command(
         cmd += ["--positive-reward-threshold", str(args.positive_reward_threshold)]
     if args.max_coefficient_delta_from_init is not None:
         cmd += ["--max-coefficient-delta-from-init", str(args.max_coefficient_delta_from_init)]
+    if args.pcgrad_gate_gradients:
+        cmd += ["--pcgrad-gate-gradients", "--pcgrad-eps", str(args.pcgrad_eps)]
+        for task in args.pcgrad_task or []:
+            cmd += ["--pcgrad-task", task]
     return cmd
 
 
@@ -887,6 +891,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--advantage-field-frontier-weight", dest="advantage_field_apply_frontier_weight", action="store_true")
     parser.add_argument("--no-advantage-field-frontier-weight", dest="advantage_field_apply_frontier_weight", action="store_false")
     parser.set_defaults(advantage_field_apply_frontier_weight=False)
+    parser.add_argument(
+        "--pcgrad-gate-gradients",
+        action="store_true",
+        default=False,
+        help="Enable optional PCGrad projection across task-specific gate gradients before optimizer.step().",
+    )
+    parser.add_argument("--pcgrad-eps", type=float, default=1.0e-12, help="Numerical epsilon used by PCGrad projection.")
+    parser.add_argument(
+        "--pcgrad-task",
+        action="append",
+        default=[],
+        help="Optional task allowlist for PCGrad. Repeat for multiple tasks.",
+    )
     parser.add_argument("--train-coefficient", action="append", default=[])
     parser.add_argument("--tool-min-margin-over-memory", type=float, default=0.0)
     parser.add_argument("--tool-min-margin-over-code", type=float, default=0.0)

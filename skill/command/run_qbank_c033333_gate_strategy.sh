@@ -15,10 +15,12 @@ Common overrides:
   RUN_NAME=...                         default qbank_c033333_<strategy>_i2_seed20260511
   RUN_DIR=...                          default $ROOT/runs/gated_grpo/$RUN_NAME
   CALIBRATION=...                      default $QB/calibration/calib100_seed20260511.prompts.jsonl
+  CONFIG=configs/gated_grpo.yaml
 
 Gate strategy:
   STRATEGY=global|global-coefficient|layer-band|parameter|global-parameter
   INIT_VALUE=0.3333333333333333        initial task-vector coefficient
+  INIT_GATE_CHECKPOINT=                optional explicit gate JSON; when set, skip constant init creation
   MAX_GATED_MODULES=                   empty means all modules; use 1 only for smoke tests
 
 Data / loop:
@@ -67,6 +69,9 @@ Update / objective:
   RETENTION_DYNAMIC_SCALE=0|1           auto-scale retention NLL per task to a fixed GRPO-relative target
   RETENTION_TASK_BALANCED_LOSS_SCALE=0|1 average retention by task instead of raw row count
   RETENTION_SCALE_TARGET=0.5             target retention/GRPO ratio when retention rows exist
+  PCGRAD_GATE_GRADIENTS=0|1              enable optional task PCGrad for gate gradients; requires OPTIMIZER_STEP_SCOPE=epoch
+  PCGRAD_EPS=1e-12
+  PCGRAD_TASKS=                          optional comma list: tool,memory,code
   OPD_DYNAMIC_SCALE=0|1                  auto-scale OPD per task from current OPD loss magnitudes
   OPD_TASK_BALANCED_LOSS_SCALE=0|1       average OPD by task instead of raw row count
   OPD_SCALE_TARGET_HIGH/MID/LOW/TAIL     target OPD/GRPO ratios by recoverable all-fail rate
@@ -159,6 +164,7 @@ export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 
 MODE="${MODE:-$ROOT/modes/opvec4/mode_manifest.json}"
+CONFIG="${CONFIG:-configs/gated_grpo.yaml}"
 QB="${QB:-$ROOT/data/question_bank/ta_avgvec_c033333_hotpotqa_v1}"
 CALIBRATION="${CALIBRATION:-$QB/calibration/calib100_seed20260511.prompts.jsonl}"
 INIT_VALUE="${INIT_VALUE:-0.3333333333333333}"
@@ -167,6 +173,10 @@ SAFE_STRATEGY="${STRATEGY//[^A-Za-z0-9_]/_}"
 RUN_NAME="${RUN_NAME:-qbank_c033333_${SAFE_STRATEGY}_i2_seed20260511}"
 RUN_DIR="${RUN_DIR:-$ROOT/runs/gated_grpo/$RUN_NAME}"
 INIT_GATE="$QB/init_gates/init_${SAFE_STRATEGY}_c033333.json"
+INIT_GATE_CHECKPOINT="${INIT_GATE_CHECKPOINT:-}"
+if [[ -n "$INIT_GATE_CHECKPOINT" ]]; then
+  INIT_GATE="$INIT_GATE_CHECKPOINT"
+fi
 
 GPU_LIST="${GPU_LIST:-0,1,2,3}"
 export CUDA_VISIBLE_DEVICES="$GPU_LIST"
@@ -250,6 +260,9 @@ RETENTION_SCALE_TARGET="${RETENTION_SCALE_TARGET:-0.5}"
 RETENTION_SCALE_MIN="${RETENTION_SCALE_MIN:-0.05}"
 RETENTION_SCALE_MAX="${RETENTION_SCALE_MAX:-100.0}"
 RETENTION_SCALE_EPS="${RETENTION_SCALE_EPS:-1e-6}"
+PCGRAD_GATE_GRADIENTS="${PCGRAD_GATE_GRADIENTS:-0}"
+PCGRAD_EPS="${PCGRAD_EPS:-1e-12}"
+PCGRAD_TASKS="${PCGRAD_TASKS:-}"
 OPD_DYNAMIC_SCALE="${OPD_DYNAMIC_SCALE:-0}"
 OPD_TASK_BALANCED_LOSS_SCALE="${OPD_TASK_BALANCED_LOSS_SCALE:-0}"
 OPD_SCALE_MIN="${OPD_SCALE_MIN:-0.05}"
@@ -439,6 +452,22 @@ OBJECTIVE_ARGS+=(
 if [[ "$LENGTH_NORMALIZE_POLICY_LOGPROB" == "1" || "$LENGTH_NORMALIZE_POLICY_LOGPROB" == "true" || "$LENGTH_NORMALIZE_POLICY_LOGPROB" == "yes" ]]; then
   OBJECTIVE_ARGS+=(--length-normalize-policy-logprob)
 fi
+PCGRAD_ARGS=()
+if is_truthy "$PCGRAD_GATE_GRADIENTS"; then
+  if [[ "$OPTIMIZER_STEP_SCOPE" != "epoch" ]]; then
+    echo "[error] PCGRAD_GATE_GRADIENTS=1 requires OPTIMIZER_STEP_SCOPE=epoch" >&2
+    exit 2
+  fi
+  PCGRAD_ARGS+=(--pcgrad-gate-gradients --pcgrad-eps "$PCGRAD_EPS")
+  if [[ -n "$PCGRAD_TASKS" ]]; then
+    IFS=',' read -r -a PCGRAD_TASK_LIST <<< "$PCGRAD_TASKS"
+    for pcgrad_task in "${PCGRAD_TASK_LIST[@]}"; do
+      if [[ -n "$pcgrad_task" ]]; then
+        PCGRAD_ARGS+=(--pcgrad-task "$pcgrad_task")
+      fi
+    done
+  fi
+fi
 if [[ "$STORE_TOKEN_LOGPROBS" == "auto" ]]; then
   if [[ "$LOSS_GRANULARITY" == "token" ]]; then
     OBJECTIVE_ARGS+=(--store-token-logprobs)
@@ -608,6 +637,7 @@ fi
 mkdir -p "$RUN_DIR" "$(dirname "$INIT_GATE")"
 
 echo "[run] strategy=$STRATEGY init=$INIT_VALUE"
+echo "[run] config=$CONFIG"
 echo "[run] calibration=$CALIBRATION"
 echo "[run] run_dir=$RUN_DIR"
 echo "[run] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -617,6 +647,7 @@ echo "[run] loss_granularity=$LOSS_GRANULARITY update_batch_size=$UPDATE_BATCH_S
 echo "[run] task_normalize_advantages=$TASK_NORMALIZE_ADVANTAGES advantage_normalization=$ADVANTAGE_NORMALIZATION use_frontier_weight=$USE_FRONTIER_WEIGHT advantage_field_frontier_weight=$ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT"
 echo "[run] length_norm policy=$LENGTH_NORMALIZE_POLICY_LOGPROB legacy=$LENGTH_NORMALIZE_LOGPROB opd=$OPD_LENGTH_NORMALIZE_LOGPROB retention=$RETENTION_LENGTH_NORMALIZE_LOGPROB"
 echo "[run] retention_dynamic_scale=$RETENTION_DYNAMIC_SCALE retention_task_balanced=$RETENTION_TASK_BALANCED_LOSS_SCALE retention_target=$RETENTION_SCALE_TARGET"
+echo "[run] pcgrad_gate_gradients=$PCGRAD_GATE_GRADIENTS pcgrad_eps=$PCGRAD_EPS pcgrad_tasks=${PCGRAD_TASKS:-all-observed}"
 echo "[run] opd_dynamic_scale=$OPD_DYNAMIC_SCALE opd_task_balanced=$OPD_TASK_BALANCED_LOSS_SCALE scale_targets=$OPD_SCALE_TARGET_HIGH/$OPD_SCALE_TARGET_MID/$OPD_SCALE_TARGET_LOW/$OPD_SCALE_TARGET_TAIL"
 echo "[run] frontier_order=$FRONTIER_ORDER frontier_shuffle_seed=${FRONTIER_SHUFFLE_SEED:-auto}"
 echo "[run] task_weights=tool:$TASK_WEIGHT_TOOL,memory:$TASK_WEIGHT_MEMORY,code:$TASK_WEIGHT_CODE quotas=tool:$FRONTIER_TOOL_QUOTA,memory:$FRONTIER_MEMORY_QUOTA,code:$FRONTIER_CODE_QUOTA"
@@ -627,15 +658,19 @@ echo "[run] opd_all_success=$USE_OPD_ALL_SUCCESS opd_all_success_loss=$OPD_ALL_S
 echo "[run] tokens=default:$MAX_NEW_TOKENS,tool:$TOOL_MAX_NEW_TOKENS,code:$CODE_MAX_NEW_TOKENS,memory_update:$MEMORY_UPDATE_MAX_NEW_TOKENS,memory_final:$MEMORY_FINAL_MAX_NEW_TOKENS"
 echo "[run] rollout_shards=$ROLLOUT_SHARDS rollout_gpus=$ROLLOUT_GPUS vllm_batch_size=$ROLLOUT_BATCH_SIZE"
 
-"$PY" scripts/modes/build_constant_gate_checkpoint.py \
-  --config configs/gated_grpo.yaml \
-  --mode-manifest "$MODE" \
-  --gate-parameterization "$STRATEGY" \
-  --value "$INIT_VALUE" \
-  --output "$INIT_GATE" >/dev/null
+if [[ -z "$INIT_GATE_CHECKPOINT" ]]; then
+  "$PY" scripts/modes/build_constant_gate_checkpoint.py \
+    --config "$CONFIG" \
+    --mode-manifest "$MODE" \
+    --gate-parameterization "$STRATEGY" \
+    --value "$INIT_VALUE" \
+    --output "$INIT_GATE" >/dev/null
+else
+  echo "[run] using explicit init gate checkpoint: $INIT_GATE"
+fi
 
 "$PY" scripts/train/opvec_gated_grpo_bake_vllm_loop.py \
-  --config configs/gated_grpo.yaml \
+  --config "$CONFIG" \
   --mode-manifest "$MODE" \
   --seed-manifest "$CALIBRATION" \
   "${FILTER_ARGS[@]}" \
@@ -678,6 +713,7 @@ echo "[run] rollout_shards=$ROLLOUT_SHARDS rollout_gpus=$ROLLOUT_GPUS vllm_batch
   --prior-loss-weight "$PRIOR_LOSS_WEIGHT" \
   --max-coefficient-delta-from-init "$MAX_COEFF_DELTA" \
   --behavior-span-reward-weight "$BEHAVIOR_SPAN_REWARD_WEIGHT" \
+  "${PCGRAD_ARGS[@]}" \
   "${DYNAMIC_OPD_ARGS[@]}" \
   "${FRONTIER_QUOTA_ARGS[@]}" \
   "${TASK_WEIGHT_ARGS[@]}" \
