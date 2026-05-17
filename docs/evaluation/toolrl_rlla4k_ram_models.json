@@ -1,0 +1,18 @@
+{
+  "models": [
+    {
+      "name": "ram-arm-r-v2",
+      "role": "ram",
+      "path": "/mnt/cache/wuruixiao/users/lsc/data/ram/MergedModel/arm-r-v2",
+      "enabled": true,
+      "notes": "RAM-Merged ARM-R-v2 checkpoint for ToolRL rlla_4k test smoke."
+    },
+    {
+      "name": "expertgym-opdB-gp-nopc-step012-continue-i19",
+      "role": "expertgym",
+      "path": "/tmp/shared-storage/OnPolicy/runs/gated_grpo/opdB_gp_nopc_step012_continue5_20260515/iter_019/baked_policy",
+      "enabled": true,
+      "notes": "ExpertGym OPD-B global-parameter no-PCGuard continue iter 19 checkpoint for ToolRL rlla_4k comparison."
+    }
+  ]
+}

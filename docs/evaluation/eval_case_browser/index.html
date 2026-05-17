@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eval Case Browser</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --text: #17202e;
+      --muted: #667085;
+      --blue: #246bce;
+      --green: #20865b;
+      --red: #c74343;
+      --orange: #b56a16;
+      --purple: #7758b3;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--sans); background: var(--bg); color: var(--text); }
+    header { padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 4; }
+    h1 { margin: 0 0 10px; font-size: 20px; letter-spacing: 0; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+    select, input { height: 32px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--text); padding: 0 9px; font: inherit; }
+    input[type="search"] { width: 260px; }
+    main { padding: 18px 24px 28px; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; align-items: start; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+    .span-12 { grid-column: span 12; }
+    .span-7 { grid-column: span 7; }
+    .span-5 { grid-column: span 5; }
+    .span-4 { grid-column: span 4; }
+    .span-8 { grid-column: span 8; }
+    .metric-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfcfe; min-height: 78px; }
+    .metric .label { color: var(--muted); font-size: 12px; display: block; }
+    .metric .value { font-size: 24px; margin-top: 5px; font-weight: 650; }
+    .metric .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 8px 7px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; background: #fafbfc; position: sticky; top: 83px; z-index: 2; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover { background: #f4f8ff; }
+    tr.selected { background: #eaf2ff; }
+    .pill { display: inline-flex; align-items: center; min-height: 22px; border-radius: 999px; padding: 2px 8px; border: 1px solid var(--line); background: #fff; font-size: 12px; margin: 1px 3px 1px 0; white-space: nowrap; }
+    .ok { color: var(--green); font-weight: 650; }
+    .bad { color: var(--red); font-weight: 650; }
+    .status-left_correct_right_wrong { color: var(--green); }
+    .status-left_wrong_right_correct { color: var(--orange); }
+    .status-both_wrong { color: var(--red); }
+    .status-both_correct { color: var(--blue); }
+    pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px; line-height: 1.42; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .detail-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; }
+    .detail-card h3 { margin: 0 0 8px; font-size: 14px; }
+    .muted { color: var(--muted); }
+    .bar { height: 9px; background: #e8edf5; border-radius: 999px; overflow: hidden; }
+    .bar > span { display: block; height: 100%; background: var(--blue); }
+    .tag-cloud { display: flex; flex-wrap: wrap; gap: 6px; }
+    button { height: 32px; border: 1px solid var(--line); border-radius: 6px; background: #fff; padding: 0 10px; font: inherit; cursor: pointer; }
+    button:hover { background: #f3f6fb; }
+    .split-note { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-top: 8px; }
+    @media (max-width: 1100px) {
+      .span-7, .span-5, .span-4, .span-8 { grid-column: span 12; }
+      .metric-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .detail-grid { grid-template-columns: 1fr; }
+      th { position: static; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Eval Case Browser</h1>
+    <div class="toolbar">
+      <label>left <select id="leftModel"></select></label>
+      <label>right <select id="rightModel"></select></label>
+      <label>benchmark <select id="benchmarkFilter"><option value="">all</option></select></label>
+      <label>category <select id="categoryFilter"><option value="">all</option></select></label>
+      <label>status <select id="statusFilter"><option value="">all</option></select></label>
+      <label>tag <select id="tagFilter"><option value="">all</option></select></label>
+      <label>language <select id="languageFilter"><option value="">all</option></select></label>
+      <input id="searchBox" type="search" placeholder="search case/function/question">
+      <button id="resetBtn">reset</button>
+    </div>
+  </header>
+  <main>
+    <div class="grid">
+      <section class="panel span-12">
+        <div id="metrics" class="metric-row"></div>
+        <div id="notes" class="split-note"></div>
+      </section>
+      <section class="panel span-7">
+        <h2 style="font-size:16px;margin:0 0 10px">Pairwise Cases</h2>
+        <div style="max-height:620px; overflow:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>case</th>
+                <th>benchmark</th>
+                <th>category</th>
+                <th>status</th>
+                <th>tags</th>
+                <th>question</th>
+              </tr>
+            </thead>
+            <tbody id="caseTable"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel span-5">
+        <h2 style="font-size:16px;margin:0 0 10px">Aggregates</h2>
+        <div id="aggregateTables"></div>
+      </section>
+      <section class="panel span-12">
+        <h2 style="font-size:16px;margin:0 0 10px">Calibration Candidate Queue</h2>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">
+          Leakage-safe blueprint only: no official prompt, no ground truth, no model output.
+        </div>
+        <div style="max-height:360px; overflow:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>source</th>
+                <th>priority</th>
+                <th>tags</th>
+                <th>goal</th>
+                <th>synthetic requirements</th>
+              </tr>
+            </thead>
+            <tbody id="candidateTable"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel span-12">
+        <h2 style="font-size:16px;margin:0 0 10px">Case Detail</h2>
+        <div id="caseDetail" class="muted">select a case</div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const state = { data: null, selectedCaseId: null };
+    const statusLabels = {
+      both_correct: 'both correct',
+      left_correct_right_wrong: 'left correct / right wrong',
+      left_wrong_right_correct: 'left wrong / right correct',
+      both_wrong: 'both wrong',
+    };
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+    const fmt = (v) => v === null || v === undefined || Number.isNaN(Number(v)) ? 'n/a' : Number(v).toFixed(4);
+    const byId = (id) => document.getElementById(id);
+
+    async function init() {
+      const res = await fetch('/data/app_data.json', { cache: 'no-store' });
+      state.data = await res.json();
+      fillControls();
+      bindControls();
+      render();
+    }
+
+    function fillControls() {
+      const { models, default_pair, categories, metrics } = state.data;
+      for (const id of ['leftModel', 'rightModel']) {
+        const el = byId(id);
+        el.innerHTML = models.map(m => `<option value="${esc(m.model_id)}">${esc(m.display_name)}</option>`).join('');
+      }
+      byId('leftModel').value = default_pair.left;
+      byId('rightModel').value = default_pair.right;
+      byId('benchmarkFilter').innerHTML += (state.data.benchmarks || []).map(c => `<option>${esc(c)}</option>`).join('');
+      byId('categoryFilter').innerHTML += categories.map(c => `<option>${esc(c)}</option>`).join('');
+      const statuses = Object.keys(statusLabels);
+      byId('statusFilter').innerHTML += statuses.map(s => `<option value="${s}">${esc(statusLabels[s])}</option>`).join('');
+      const tags = Object.keys(metrics.failure_tag_counts || {}).sort();
+      byId('tagFilter').innerHTML += tags.map(t => `<option>${esc(t)}</option>`).join('');
+      const langs = Object.keys(metrics.language_counts || {}).sort();
+      byId('languageFilter').innerHTML += langs.map(l => `<option>${esc(l)}</option>`).join('');
+    }
+
+    function bindControls() {
+      for (const id of ['leftModel', 'rightModel', 'benchmarkFilter', 'categoryFilter', 'statusFilter', 'tagFilter', 'languageFilter', 'searchBox']) {
+        byId(id).addEventListener('input', () => { state.selectedCaseId = null; render(); });
+      }
+      byId('resetBtn').addEventListener('click', () => {
+        byId('leftModel').value = state.data.default_pair.left;
+        byId('rightModel').value = state.data.default_pair.right;
+        for (const id of ['benchmarkFilter', 'categoryFilter', 'statusFilter', 'tagFilter', 'languageFilter', 'searchBox']) byId(id).value = '';
+        state.selectedCaseId = null;
+        render();
+      });
+    }
+
+    function currentPairRows() {
+      const left = byId('leftModel').value;
+      const right = byId('rightModel').value;
+      return state.data.cases.map(c => {
+        const l = c.models[left];
+        const r = c.models[right];
+        const status = l.valid && r.valid ? 'both_correct' : l.valid ? 'left_correct_right_wrong' : r.valid ? 'left_wrong_right_correct' : 'both_wrong';
+        return {
+          case_id: c.case_id,
+          benchmark: c.benchmark,
+          task_family: c.task_family,
+          category: c.category,
+          language: c.language,
+          function_names: c.function_names,
+          num_reference_calls: c.num_reference_calls,
+          question_preview: c.question.slice(0, 260),
+          status,
+          left_valid: !!l.valid,
+          right_valid: !!r.valid,
+          left_error_type: l.error_type,
+          right_error_type: r.error_type,
+          left_code_success_rate: l.code_success_rate,
+          right_code_success_rate: r.code_success_rate,
+          left_bon_hidden_test_acc: l.bon_hidden_test_acc,
+          right_bon_hidden_test_acc: r.bon_hidden_test_acc,
+          failure_tags: Array.from(new Set([...(l.failure_tags || []), ...(r.failure_tags || []), ...(c.failure_tags || [])])).sort(),
+        };
+      });
+    }
+
+    function filteredRows() {
+      const benchmark = byId('benchmarkFilter').value;
+      const cat = byId('categoryFilter').value;
+      const status = byId('statusFilter').value;
+      const tag = byId('tagFilter').value;
+      const lang = byId('languageFilter').value;
+      const q = byId('searchBox').value.trim().toLowerCase();
+      return currentPairRows().filter(row => {
+        if (benchmark && row.benchmark !== benchmark) return false;
+        if (cat && row.category !== cat) return false;
+        if (status && row.status !== status) return false;
+        if (tag && !row.failure_tags.includes(tag)) return false;
+        if (lang && row.language !== lang) return false;
+        if (q) {
+          const hay = [row.case_id, row.category, row.language, row.question_preview, row.function_names.join(' '), row.failure_tags.join(' ')].join(' ').toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    }
+
+    function render() {
+      const rows = filteredRows();
+      renderMetrics(rows);
+      renderAggregates(rows);
+      renderTable(rows);
+      renderCandidates(rows);
+      renderDetail();
+    }
+
+    function renderMetrics(rows) {
+      const left = byId('leftModel').value;
+      const right = byId('rightModel').value;
+      const models = state.data.metrics.models;
+      const counts = countBy(rows, r => r.status);
+      byId('metrics').innerHTML = [
+        metricCard('filtered cases', rows.length, `${state.data.cases.length} total`),
+        metricCard('left tool mean', fmt(models[left]?.tool_mean), left),
+        metricCard('right tool mean', fmt(models[right]?.tool_mean), right),
+        metricCard('left code BoN', fmt(models[left]?.code_mean_bon_acc), left),
+        metricCard('right code BoN', fmt(models[right]?.code_mean_bon_acc), right),
+        metricCard('left correct / right wrong', counts.left_correct_right_wrong || 0, 'calibration candidates'),
+      ].join('');
+      byId('notes').innerHTML = [
+        `left=${esc(labelOf(left))}`,
+        `right=${esc(labelOf(right))}`,
+        `CURE cases=${rows.filter(r => r.benchmark === 'CURE').length}`,
+        `live cases=${rows.filter(r => r.category.startsWith('live_')).length}`,
+        `both wrong=${counts.both_wrong || 0}`,
+      ].map(x => `<span>${x}</span>`).join('');
+    }
+
+    function metricCard(label, value, sub) {
+      return `<div class="metric"><span class="label">${esc(label)}</span><div class="value">${esc(value)}</div><div class="sub">${esc(sub)}</div></div>`;
+    }
+
+    function renderAggregates(rows) {
+      const catCounts = countBy(rows, r => r.category);
+      const benchCounts = countBy(rows, r => r.benchmark);
+      const statusCounts = countBy(rows, r => r.status);
+      const tagCounts = {};
+      for (const row of rows) for (const tag of row.failure_tags) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+      byId('aggregateTables').innerHTML = [
+        smallCountTable('benchmark', benchCounts),
+        smallCountTable('status', statusCounts, statusLabels),
+        smallCountTable('category', catCounts),
+        smallCountTable('failure tags', Object.fromEntries(Object.entries(tagCounts).sort((a,b) => b[1]-a[1]).slice(0, 16))),
+      ].join('<br>');
+    }
+
+    function smallCountTable(title, counts, labelMap={}) {
+      const total = Object.values(counts).reduce((a,b) => a + Number(b), 0) || 1;
+      const rows = Object.entries(counts).sort((a,b) => b[1]-a[1]).map(([k,v]) => `
+        <tr><td>${esc(labelMap[k] || k)}</td><td style="width:52px">${v}</td><td><div class="bar"><span style="width:${100*v/total}%"></span></div></td></tr>
+      `).join('');
+      return `<h3 style="font-size:14px;margin:10px 0 6px">${esc(title)}</h3><table><tbody>${rows}</tbody></table>`;
+    }
+
+    function renderTable(rows) {
+      const body = byId('caseTable');
+      body.innerHTML = rows.slice(0, 600).map(row => `
+        <tr class="clickable ${state.selectedCaseId === row.case_id ? 'selected' : ''}" data-id="${esc(row.case_id)}">
+          <td><span class="pill">${esc(row.case_id)}</span><br><span class="muted">${esc(row.language)} · ${row.num_reference_calls} calls</span></td>
+          <td>${esc(row.benchmark)}<br><span class="muted">${esc(row.task_family || '')}</span></td>
+          <td>${esc(row.category)}<br><span class="muted">${esc(row.function_names.slice(0,3).join(', '))}</span></td>
+          <td class="status-${esc(row.status)}">${esc(statusLabels[row.status] || row.status)}</td>
+          <td>${row.failure_tags.slice(0,4).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</td>
+          <td>${esc(row.question_preview)}</td>
+        </tr>
+      `).join('');
+      body.querySelectorAll('tr[data-id]').forEach(tr => {
+        tr.addEventListener('click', () => { state.selectedCaseId = tr.dataset.id; render(); });
+      });
+    }
+
+    function renderCandidates(rows) {
+      const candidateById = new Map((state.data.calibration_candidates || []).map(c => [c.source_case_id, c]));
+      const selectedIds = new Set(rows.map(r => r.case_id));
+      const candidates = Array.from(candidateById.values()).filter(c => selectedIds.has(c.source_case_id));
+      const priorityRank = { high: 0, medium: 1, low: 2 };
+      candidates.sort((a, b) =>
+        (priorityRank[a.priority] ?? 9) - (priorityRank[b.priority] ?? 9) ||
+        String(a.source_category).localeCompare(String(b.source_category)) ||
+        String(a.source_case_id).localeCompare(String(b.source_case_id))
+      );
+      byId('candidateTable').innerHTML = candidates.slice(0, 220).map(c => `
+        <tr class="clickable ${state.selectedCaseId === c.source_case_id ? 'selected' : ''}" data-id="${esc(c.source_case_id)}">
+          <td><span class="pill">${esc(c.source_case_id)}</span><br><span class="muted">${esc(c.source_benchmark || '')} · ${esc(c.source_category)} · ${esc(c.source_language)} · ${esc(c.num_reference_calls ?? c.num_reference_tests ?? '')}</span></td>
+          <td><span class="pill">${esc(c.priority)}</span><br><span class="muted">${esc(statusLabels[c.status] || c.status)}</span></td>
+          <td>${(c.failure_tags || []).slice(0,5).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</td>
+          <td>${esc(c.calibration_goal)}</td>
+          <td>${(c.synthetic_requirements || []).slice(0,5).map(x => `<div>· ${esc(x)}</div>`).join('')}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="5" class="muted">no candidates under current filters</td></tr>';
+      byId('candidateTable').querySelectorAll('tr[data-id]').forEach(tr => {
+        tr.addEventListener('click', () => { state.selectedCaseId = tr.dataset.id; render(); });
+      });
+    }
+
+    function renderDetail() {
+      const id = state.selectedCaseId;
+      const target = byId('caseDetail');
+      if (!id) { target.innerHTML = '<span class="muted">select a case</span>'; return; }
+      const c = state.data.cases.find(x => x.case_id === id);
+      if (!c) { target.innerHTML = '<span class="muted">case not found</span>'; return; }
+      const left = byId('leftModel').value;
+      const right = byId('rightModel').value;
+      if (c.benchmark === 'CURE') {
+        target.innerHTML = codeCaseDetail(c, left, right);
+        return;
+      }
+      target.innerHTML = `
+        <div class="detail-grid">
+          <div class="detail-card">
+            <h3>${esc(c.case_id)} · ${esc(c.category)} · ${esc(c.language)}</h3>
+            <div class="tag-cloud">${(c.failure_tags || []).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</div>
+            <h3>Prompt</h3><pre>${esc(c.question)}</pre>
+            <h3>Function schema</h3><pre>${esc(JSON.stringify(c.prompt.function, null, 2))}</pre>
+            <h3>Ground truth</h3><pre>${esc(JSON.stringify(c.ground_truth, null, 2))}</pre>
+          </div>
+          ${modelDetail(left, c.models[left])}
+          ${modelDetail(right, c.models[right])}
+        </div>
+      `;
+    }
+
+    function codeCaseDetail(c, left, right) {
+      return `
+        <div class="detail-grid">
+          <div class="detail-card">
+            <h3>${esc(c.case_id)} · ${esc(c.category)}</h3>
+            <div class="tag-cloud">${(c.failure_tags || []).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</div>
+            <h3>Question</h3><pre>${esc(c.question)}</pre>
+            <h3>Skill tags</h3><div class="tag-cloud">${(c.code_tags || []).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</div>
+          </div>
+          ${codeModelDetail(left, c.models[left])}
+          ${codeModelDetail(right, c.models[right])}
+        </div>
+      `;
+    }
+
+    function codeModelDetail(modelId, row) {
+      const codePreviews = (row.generated_code_preview || []).map((text, idx) => `<h3>Generated code ${idx}</h3><pre>${esc(text)}</pre>`).join('');
+      return `<div class="detail-card">
+        <h3>${esc(labelOf(modelId))} <span class="${row.valid ? 'ok' : 'bad'}">${row.valid ? 'BoN correct' : 'BoN wrong'}</span></h3>
+        <div class="tag-cloud">${(row.failure_tags || []).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</div>
+        <p class="muted">
+          sample acc=${fmt(row.code_success_rate)} · any pass=${esc(row.any_code_success)} · hidden test acc=${fmt(row.hidden_test_acc)}<br>
+          BoN idx=${esc(row.bon_code_index)} · BoN hidden test acc=${fmt(row.bon_hidden_test_acc)}
+        </p>
+        <h3>Hidden-test bool table</h3><pre>${esc(JSON.stringify(row.test_bool_table || null, null, 2))}</pre>
+        <h3>Generated-test bool table</h3><pre>${esc(JSON.stringify(row.case_bool_table || null, null, 2))}</pre>
+        ${codePreviews}
+        <p class="muted">source: ${esc(row.output_file || '')}</p>
+      </div>`;
+    }
+
+    function modelDetail(modelId, row) {
+      return `<div class="detail-card">
+        <h3>${esc(labelOf(modelId))} <span class="${row.valid ? 'ok' : 'bad'}">${row.valid ? 'correct' : 'wrong'}</span></h3>
+        <div class="tag-cloud">${(row.failure_tags || []).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</div>
+        <p class="muted">${esc(row.error_type || '')}</p>
+        <h3>Raw output</h3><pre>${esc(row.raw_output || '')}</pre>
+        <h3>Decoded calls</h3><pre>${esc(JSON.stringify(row.decoded_calls || null, null, 2))}</pre>
+        <h3>Error</h3><pre>${esc(JSON.stringify(row.error || null, null, 2))}</pre>
+        <p class="muted">score: ${esc(row.score_file || '')}<br>result: ${esc(row.result_file || '')}</p>
+      </div>`;
+    }
+
+    function countBy(rows, fn) {
+      const out = {};
+      for (const row of rows) {
+        const k = fn(row);
+        out[k] = (out[k] || 0) + 1;
+      }
+      return out;
+    }
+
+    function labelOf(modelId) {
+      return state.data.models.find(m => m.model_id === modelId)?.display_name || modelId;
+    }
+
+    init().catch(err => {
+      document.body.innerHTML = `<pre>${esc(err.stack || err)}</pre>`;
+    });
+  </script>
+</body>
+</html>

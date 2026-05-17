@@ -1,0 +1,49 @@
+{
+  "format": "eval_case_browser_registry_v1",
+  "bfcl_data_root": "/mnt/cache/wuruixiao/users/lsc/gorilla/berkeley-function-call-leaderboard/bfcl_eval/data",
+  "default_pair": {
+    "left": "best-ever-tame-cg-r1calib-global-v2",
+    "right": "expertgym-B-codeaug-opd-i18"
+  },
+  "models": [
+    {
+      "model_id": "best-ever-tame-cg-r1calib-global-v2",
+      "display_name": "Best-ever TAME cg+r1",
+      "tool_score_root": "/tmp/shared-storage/TAME/experiments/tame-r1-core-20260504/diagnostics/calibration_global_r1_v2/bfcl/score/tame-cg-r1calib-global-v2-20260504",
+      "tool_result_root": "/tmp/shared-storage/TAME/experiments/tame-r1-core-20260504/diagnostics/calibration_global_r1_v2/bfcl/result/tame-cg-r1calib-global-v2-20260504",
+      "code_summary_path": "/tmp/shared-storage/TAME/experiments/tame-r1-core-20260504/diagnostics/calibration_global_r1_v2/code_eval/tame-code-cure-full/tame-cg-r1calib-global-v2-20260504/tame-cg-r1calib-global-v2-20260504/summary.json",
+      "code_outputs": {
+        "LiveBench": "/mnt/cache/wuruixiao/users/lsc/CURE/evaluation/temp_data/outputs-eval-.tmp.shared-storage.TAME.experiments.tame-r1-core-20260504.baked_cg_plus_r1code_calib_global_v2-LiveBench.json",
+        "LiveCodeBench": "/mnt/cache/wuruixiao/users/lsc/CURE/evaluation/temp_data/outputs-eval-.tmp.shared-storage.TAME.experiments.tame-r1-core-20260504.baked_cg_plus_r1code_calib_global_v2-LiveCodeBench.json"
+      },
+      "summary_path": "/tmp/shared-storage/TAME/experiments/tame-r1-core-20260504/diagnostics/calibration_global_r1_v2/summary/evaluation_summary.json",
+      "tags": ["best-ever", "tame", "cg+r1"]
+    },
+    {
+      "model_id": "expertgym-B-codeaug-opd-i18",
+      "display_name": "ExpertGym B codeaug OPD i18",
+      "tool_score_root": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1\u2014feedback/evaluation/eval-batch/eval6-20260502-125748/runs/expertgym-abcB-gp-codeaug-opd-i18-20260516/tool/score/expertgym-abcB-gp-codeaug-opd-i18-20260516",
+      "tool_result_root": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1\u2014feedback/evaluation/eval-batch/eval6-20260502-125748/runs/expertgym-abcB-gp-codeaug-opd-i18-20260516/tool/result/expertgym-abcB-gp-codeaug-opd-i18-20260516",
+      "code_summary_path": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1\u2014feedback/evaluation/eval6-code-cure-full/expertgym-abcB-gp-codeaug-opd-i18-20260516/eval6-20260502-125748/summary.json",
+      "code_outputs": {
+        "LiveBench": "/mnt/cache/wuruixiao/users/lsc/CURE/evaluation/temp_data/outputs-eval-.tmp.shared-storage.OnPolicy.runs.gated_grpo.expB_gp_code_opd_aug_20260516.iter_018.baked_policy-LiveBench.json",
+        "LiveCodeBench": "/mnt/cache/wuruixiao/users/lsc/CURE/evaluation/temp_data/outputs-eval-.tmp.shared-storage.OnPolicy.runs.gated_grpo.expB_gp_code_opd_aug_20260516.iter_018.baked_policy-LiveCodeBench.json"
+      },
+      "summary_path": "/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/evaluation/20260516_tonight_abc_eval6.md",
+      "tags": ["expertgym", "B", "opd-only", "codeaug"]
+    },
+    {
+      "model_id": "ta-c075",
+      "display_name": "TA 0.75",
+      "tool_score_root": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1\u2014feedback/evaluation/eval-batch/ta-scale-sweep-20260502-232830/runs/ta-c075/tool/score/ta-c075",
+      "tool_result_root": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1\u2014feedback/evaluation/eval-batch/ta-scale-sweep-20260502-232830/runs/ta-c075/tool/result/ta-c075",
+      "code_summary_path": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1\u2014feedback/evaluation/ta-scale-sweep-code-cure-full/ta-c075/ta-scale-sweep-20260502-232830/summary.json",
+      "code_outputs": {
+        "LiveBench": "/mnt/cache/wuruixiao/users/lsc/CURE/evaluation/temp_data/outputs-eval-.tmp.shared-storage.AgentMerging_plan.experiments.task_arithmetic.ta_scale_sweep_c075.model-LiveBench.json",
+        "LiveCodeBench": "/mnt/cache/wuruixiao/users/lsc/CURE/evaluation/temp_data/outputs-eval-.tmp.shared-storage.AgentMerging_plan.experiments.task_arithmetic.ta_scale_sweep_c075.model-LiveCodeBench.json"
+      },
+      "summary_path": "/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1\u2014feedback/evaluation/eval-batch/ta-scale-sweep-20260502-232830/ta_scale_sweep_report_zh.md",
+      "tags": ["baseline", "task-arithmetic", "c075"]
+    }
+  ]
+}

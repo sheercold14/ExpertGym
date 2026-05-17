@@ -8,6 +8,13 @@
 |---|---|---|
 | `eval6-20260502-125748_zh.md` | eval6 中文总表，保持原大表结构 | `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/aggregate_report_zh.md` |
 
+## 单次实验报告
+
+| 文件 | 内容 | 原始来源 |
+|---|---|---|
+| `20260516_tonight_abc_eval6.md` | 2026-05-16 A/B/C 受控实验正式 eval6 结果 | Tool/Memory/Code 三类 `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_abc_20260516_addons.py` |
+| `20260517_defg_eval6.md` | 2026-05-17 D/E/F/G 正式 eval6 结果，当前 Tool+Memory 完成，Code pending | Tool/Memory `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_defg_20260517_addons.py` |
+
 ## 记录格式
 
 每个正式评测报告保持和原 eval6 大表一致的结构：
@@ -26,12 +33,12 @@
 - 单次实验评测报告：`YYYYMMDD_<experiment_name>_eval6.md`。
 - 未完成的评测可以先写 `pending`，但必须标明已完成和缺失的子项；完成后再替换为正式数值。
 
-## 当前进行中
+## 最近完成
 
-`2026-05-16` A/B/C 受控实验的正式 eval6 正在运行。训练报告在：
+`2026-05-16` A/B/C 受控实验正式 eval6 已完成。训练报告在：
 
 `/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/report/20260516_tonight_abc.md`
 
-待 CURE 完成后，将新增：
+评测报告：
 
 `/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/evaluation/20260516_tonight_abc_eval6.md`

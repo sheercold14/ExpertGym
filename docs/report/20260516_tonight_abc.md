@@ -69,17 +69,16 @@ code__9ef2816bdb2e521f
 
 - 三组都能把 proxy overall 从约 `0.42` 推到 `0.66-0.70`，说明 OPD/retention/GRPO 组合可以继续推动 task vector，训练不是失效状态。
 - A 的 best overall 最高，主要来自 memory 和 tool；但 code 从首轮到末轮下降 `-0.1016`，说明加入 GRPO 后没有解决 code proxy 不稳。
-- B 的 code OPD 扩充有效：best code reward `0.4379` 是三组最高，final code gate mean `0.3898` 也最高；但 code reward 仍波动，说明只扩充 expert positive 不能保证 CURE 泛化。
+- B 的 code OPD 扩充在 best-overall checkpoint 口径下有效：B-iter18 的 code proxy `0.4379` 高于 A-iter18 的 `0.3809` 和 C-iter16 的 `0.4268`，final code gate mean `0.3898` 也最高；但 code reward 仍波动，说明只扩充 expert positive 不能保证 CURE 泛化。
+- 如果按全训练过程的 code 单项峰值统计，则 A-iter4 `0.4555`、B-iter4 `0.4473`、C-iter1 `0.4424`；因此不能把 B-iter18 的 `0.4379` 理解为所有 iteration 里的最高 code reward。
 - C 加 reasoning vector 后没有超过 B。reasoning gate 从 `0` 被推到正值，但 best 时只有约 `0.0529`，final 约 `0.0453`；它增加了梯度/耗时，却没有带来更高三任务 proxy。
 - 当前最值得正式评测的是 A-iter18 和 B-iter18；C-iter16 作为 reasoning-vector ablation 保留。
 
 ## 正式评测
 
-已启动 eval6 add-on：
+eval6 add-on 已完成，正式结果见：
 
-```bash
-tmux attach -t eval_expertgym_abc_20260516
-```
+`/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/evaluation/20260516_tonight_abc_eval6.md`
 
 评测 runner：
 
@@ -93,4 +92,10 @@ tmux attach -t eval_expertgym_abc_20260516
 | `expertgym-abcB-gp-codeaug-opd-i18-20260516` | `/tmp/shared-storage/OnPolicy/runs/gated_grpo/expB_gp_code_opd_aug_20260516/iter_018/baked_policy` |
 | `expertgym-abcC-gp-reasoning-codeaug-i16-20260516` | `/tmp/shared-storage/OnPolicy/runs/gated_grpo/expC_gp_reasoning_code_opd_aug_20260516/iter_016/baked_policy` |
 
-待正式 eval6 完成后，继续补 Tool/BFCL、Memory/HotpotQA、Code/CURE 结果。
+| eval name | Tool 均值 | Memory F1 | Code Acc | Code BoN |
+|---|---:|---:|---:|---:|
+| `expertgym-abcA-gp-grpo-opd-i18-20260516` | `0.7823` | `0.7346` | `0.3431` | `0.3919` |
+| `expertgym-abcB-gp-codeaug-opd-i18-20260516` | `0.7823` | `0.7118` | `0.3370` | `0.3871` |
+| `expertgym-abcC-gp-reasoning-codeaug-i16-20260516` | `0.7898` | `0.6862` | `0.3186` | `0.3675` |
+
+正式 eval6 结论：C 的 Tool 均值最高；A 的 Memory F1 与 Code 综合最好；B 的 code expert positive pool 扩充没有转化为超过 A 的正式 Code/CURE 结果。
