@@ -159,7 +159,7 @@ def build_state() -> dict[str, Any]:
     ranking = candidate_ranking(evals)
     guidance = build_guidance(evals, ranking)
     return {
-        "format": "stage1_formal_eval_dashboard_v1",
+        "format": "stage1_formal_eval_dashboard_v2",
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "evals": evals,
         "runs": [],
@@ -169,12 +169,13 @@ def build_state() -> dict[str, Any]:
     }
 
 
-def build_eval_state(eval_id: str, spec: dict[str, str]) -> dict[str, Any]:
+def build_eval_state(eval_id: str, spec: dict[str, Any]) -> dict[str, Any]:
     root = Path(spec["path"])
     logs = root / "logs"
     tool = parse_tool_log(logs / "tool_bfcl.log")
     memory = parse_memory_log(logs / "memory_hotpotqa.log")
     code = parse_code_eval(root, spec.get("checkpoint", ""))
+    training = parse_trc_training(spec)
     composite_values = []
     if tool.get("status") == "done" and isinstance(tool.get("mean_accuracy"), (int, float)):
         composite_values.append(tool["mean_accuracy"])
@@ -196,6 +197,7 @@ def build_eval_state(eval_id: str, spec: dict[str, str]) -> dict[str, Any]:
         "tool": tool,
         "memory": memory,
         "code": code,
+        "training": training,
         "completed_axes": sum(1 for axis in (tool, memory, code) if axis.get("status") == "done"),
         "pending_axes": [name for name, axis in (("Tool", tool), ("Memory", memory), ("Code", code)) if axis.get("status") != "done"],
         "composite_mean": statistics.mean(composite_values) if composite_values else None,
@@ -390,6 +392,116 @@ def parse_code_artifact(path: Path, suite: str) -> dict[str, Any] | None:
     }
 
 
+def parse_trc_training(spec: dict[str, Any]) -> dict[str, Any]:
+    run_root = Path(str(spec.get("train_run") or ""))
+    setting = spec.get("setting") if isinstance(spec.get("setting"), dict) else {}
+    target_epoch = as_int(setting.get("epoch"))
+    if not run_root.exists() or target_epoch <= 0:
+        return {"status": "pending", "run_root": str(run_root), "target_epoch": target_epoch}
+
+    epochs = []
+    metrics_path = run_root / "trc_metrics.jsonl"
+    try:
+        with metrics_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if item.get("event") != "epoch":
+                    continue
+                epoch = as_int(item.get("epoch"))
+                if epoch <= target_epoch:
+                    epochs.append(compact_trc_epoch(item))
+    except OSError:
+        pass
+    epochs = sorted(epochs, key=lambda item: item.get("epoch") or 0)
+
+    gates_path = run_root / f"epoch_{target_epoch:03d}.gates.json"
+    gates_payload = read_json(gates_path)
+    if not isinstance(gates_payload, dict):
+        gates_payload = read_json(run_root / "trc_gates.json")
+    summary = gates_payload.get("epoch_summary") if isinstance(gates_payload, dict) else {}
+    if not isinstance(summary, dict):
+        summary = epochs[-1].get("raw_summary", {}) if epochs else {}
+    gate_values = gates_payload.get("gates") if isinstance(gates_payload, dict) else {}
+    if not isinstance(gate_values, dict):
+        gate_values = summary.get("gate_values") if isinstance(summary.get("gate_values"), dict) else {}
+    gate_means = summary.get("gate_means") if isinstance(summary.get("gate_means"), dict) else gate_means_from_values(gate_values)
+    task_loss = summary.get("task_loss") if isinstance(summary.get("task_loss"), dict) else {}
+    return {
+        "status": "done" if gate_values else "partial",
+        "run_root": str(run_root),
+        "target_epoch": target_epoch,
+        "metrics_path": str(metrics_path),
+        "gates_path": str(gates_path),
+        "epochs": epochs,
+        "gate_means": {expert: as_float(gate_means.get(expert)) for expert in EXPERTS},
+        "layer_gate_rows": layer_gate_rows(gate_values),
+        "losses": {
+            "mean_residual_loss": as_float(summary.get("mean_residual_loss")),
+            "mean_total_loss": as_float(summary.get("mean_total_loss")),
+            "mean_base_drift_loss": as_float(summary.get("mean_base_drift_loss")),
+            "mean_gate_anchor_loss": as_float(summary.get("mean_gate_anchor_loss")),
+            "mean_coefficient_floor_loss": as_float(summary.get("mean_coefficient_floor_loss")),
+        },
+        "task_loss": compact_task_loss(task_loss),
+        "mtime": max_mtime([metrics_path, gates_path, run_root / "trc_gates.json"]),
+    }
+
+
+def compact_trc_epoch(item: dict[str, Any]) -> dict[str, Any]:
+    task_loss = item.get("task_loss") if isinstance(item.get("task_loss"), dict) else {}
+    gate_means = item.get("gate_means") if isinstance(item.get("gate_means"), dict) else {}
+    return {
+        "epoch": as_int(item.get("epoch")),
+        "elapsed_seconds": as_float(item.get("elapsed_seconds")),
+        "mean_residual_loss": as_float(item.get("mean_residual_loss")),
+        "mean_total_loss": as_float(item.get("mean_total_loss")),
+        "mean_base_drift_loss": as_float(item.get("mean_base_drift_loss")),
+        "mean_gate_anchor_loss": as_float(item.get("mean_gate_anchor_loss")),
+        "mean_coefficient_floor_loss": as_float(item.get("mean_coefficient_floor_loss")),
+        "gate_means": {expert: as_float(gate_means.get(expert)) for expert in EXPERTS},
+        "task_loss": compact_task_loss(task_loss),
+    }
+
+
+def compact_task_loss(task_loss: dict[str, Any]) -> dict[str, Any]:
+    output = {}
+    for expert in EXPERTS:
+        item = task_loss.get(expert) if isinstance(task_loss.get(expert), dict) else {}
+        output[expert] = {
+            "rows": as_int(item.get("rows")),
+            "span_tokens": as_float(item.get("span_tokens")),
+            "residual_loss": as_float(item.get("residual_loss")),
+            "total_loss": as_float(item.get("total_loss")),
+            "base_drift_loss": as_float(item.get("base_drift_loss")),
+        }
+    return output
+
+
+def gate_means_from_values(gate_values: dict[str, Any]) -> dict[str, float | None]:
+    rows = layer_gate_rows(gate_values)
+    return {
+        expert: statistics.mean([row[expert] for row in rows if isinstance(row.get(expert), float)])
+        if any(isinstance(row.get(expert), float) for row in rows)
+        else None
+        for expert in EXPERTS
+    }
+
+
+def layer_gate_rows(gate_values: dict[str, Any]) -> list[dict[str, Any]]:
+    layers: dict[int, dict[str, Any]] = {}
+    for key, value in gate_values.items():
+        match = re.fullmatch(r"layer(\d+)\.(tool|memory|code)", str(key))
+        if not match:
+            continue
+        layer = int(match.group(1))
+        expert = match.group(2)
+        layers.setdefault(layer, {"layer": layer})[expert] = as_float(value)
+    return [layers[layer] for layer in sorted(layers)]
+
+
 def collect_bools(value: Any, output: list[bool]) -> None:
     if isinstance(value, bool):
         output.append(value)
@@ -539,6 +651,7 @@ def build_guidance(evals: list[dict[str, Any]], ranking: list[dict[str, Any]]) -
         "本页只显示本轮 stage-1 TRC 候选的正式评测口径；M1/M2 等训练诊断组已隐藏，不参与当前模型选择。",
         "排序按已完成轴的 Tool mean、Memory F1、Code Acc 均值给出；凡有 pending 的候选只能作为临时排序，不能作为最终结论。",
         "Tool 采用 BFCL 四个子类平均，并单独显示 live mean；Memory 采用 HotpotQA 四个子集平均 EM/F1；Code 采用 CURE 的 LiveBench/LiveCodeBench Acc、TP、BoN。",
+        "Gate 系数按候选 checkpoint 对应的 target epoch 读取：anchor_i4 是 epoch 4，anchor_i8/dir_i8 是 epoch 8；训练动态只展示 TRC run，不展示 M1/M2。",
     ]
     if ranking:
         best = ranking[0]
@@ -720,6 +833,10 @@ INDEX_HTML = r"""<!doctype html>
       <div id="settings"></div>
     </section>
     <section>
+      <h2>TRC gate 系数 / 训练动态</h2>
+      <div id="training" class="cards"></div>
+    </section>
+    <section>
       <h2>评测对照</h2>
       <div id="evals"></div>
     </section>
@@ -826,6 +943,63 @@ function renderSettings(evals) {
     rows
   );
 }
+function renderTraining(evals) {
+  document.getElementById('training').innerHTML = evals.map(ev => {
+    const t = ev.training || {};
+    const gm = t.gate_means || {};
+    const losses = t.losses || {};
+    const epochs = t.epochs || [];
+    const gateSeries = epochs.map(e => {
+      const g = e.gate_means || {};
+      return {iteration:`e${e.epoch}`, tool:g.tool, memory:g.memory, code:g.code};
+    });
+    const epochRows = epochs.map(e => {
+      const g = e.gate_means || {};
+      const tl = e.task_loss || {};
+      return `<tr>
+        <td>${fmtInt(e.epoch)}</td>
+        <td class="num">${fmtNum(e.mean_residual_loss)}</td>
+        <td class="num">${fmtNum(e.mean_total_loss)}</td>
+        <td class="num">${fmtNum((tl.tool||{}).residual_loss)}</td>
+        <td class="num">${fmtNum((tl.memory||{}).residual_loss)}</td>
+        <td class="num">${fmtNum((tl.code||{}).residual_loss)}</td>
+        <td class="num">${fmtNum(g.tool)}</td>
+        <td class="num">${fmtNum(g.memory)}</td>
+        <td class="num">${fmtNum(g.code)}</td>
+      </tr>`;
+    });
+    const layerRows = (t.layer_gate_rows || []).map(r => `<tr>
+      <td>${fmtInt(r.layer)}</td>
+      <td class="num">${fmtNum(r.tool)}</td>
+      <td class="num">${fmtNum(r.memory)}</td>
+      <td class="num">${fmtNum(r.code)}</td>
+    </tr>`);
+    const taskRows = ['tool','memory','code'].map(k => {
+      const row = (t.task_loss || {})[k] || {};
+      return `<tr><td>${k}</td><td class="num">${fmtInt(row.rows)}</td><td class="num">${fmtNum(row.span_tokens)}</td><td class="num">${fmtNum(row.residual_loss)}</td><td class="num">${fmtNum(row.total_loss)}</td><td class="num">${fmtNum(row.base_drift_loss)}</td></tr>`;
+    });
+    return `<div class="run">
+      <h2>${esc(ev.label)} <span class="pill">target epoch ${fmtInt(t.target_epoch)}</span></h2>
+      ${gateSeries.length ? spark(gateSeries) : '<div class="warn">training curve pending</div>'}
+      <div class="kv">
+        <div class="muted">gate mean</div><div>tool <b>${fmtNum(gm.tool)}</b> · memory <b>${fmtNum(gm.memory)}</b> · code <b>${fmtNum(gm.code)}</b></div>
+        <div class="muted">loss</div><div>residual ${fmtNum(losses.mean_residual_loss)} · total ${fmtNum(losses.mean_total_loss)} · base ${fmtNum(losses.mean_base_drift_loss)}</div>
+        <div class="muted">regularizer</div><div>gate anchor ${fmtNum(losses.mean_gate_anchor_loss)} · coeff floor ${fmtNum(losses.mean_coefficient_floor_loss)}</div>
+        <div class="muted">files</div><div class="small">${esc(t.gates_path || '')}<br>${esc(t.metrics_path || '')}</div>
+      </div>
+      <h3 class="small">目标 epoch task loss</h3>
+      ${table([{t:'task'},{t:'rows',cls:'num'},{t:'span tok',cls:'num'},{t:'residual',cls:'num'},{t:'total',cls:'num'},{t:'base drift',cls:'num'}], taskRows)}
+      <h3 class="small">epoch 动态</h3>
+      <div style="max-height:230px; overflow:auto">
+        ${table([{t:'epoch'},{t:'resid',cls:'num'},{t:'total',cls:'num'},{t:'tool loss',cls:'num'},{t:'mem loss',cls:'num'},{t:'code loss',cls:'num'},{t:'tool gate',cls:'num'},{t:'mem gate',cls:'num'},{t:'code gate',cls:'num'}], epochRows.length ? epochRows : ['<tr><td colspan="9" class="warn">pending</td></tr>'])}
+      </div>
+      <h3 class="small">layer gate coefficients</h3>
+      <div style="max-height:300px; overflow:auto">
+        ${table([{t:'layer'},{t:'tool',cls:'num'},{t:'memory',cls:'num'},{t:'code',cls:'num'}], layerRows.length ? layerRows : ['<tr><td colspan="4" class="warn">pending</td></tr>'])}
+      </div>
+    </div>`;
+  }).join('');
+}
 function renderEvals(evals) {
   document.getElementById('evals').innerHTML = evals.map(ev => {
     const toolRows = (ev.tool.rows||[]).map(r=>`<tr><td>${esc(r.name)}</td><td class="num">${fmtPct(r.accuracy)}</td><td class="num">${fmtInt(r.correct)}/${fmtInt(r.total)}</td></tr>`);
@@ -848,6 +1022,7 @@ async function refresh() {
   renderRanking(state.ranking || []);
   document.getElementById('ideas').innerHTML = (state.ideas||[]).map(x=>`<li>${esc(x)}</li>`).join('');
   renderSettings(state.evals || []);
+  renderTraining(state.evals || []);
   renderEvals(state.evals || []);
 }
 refresh();
