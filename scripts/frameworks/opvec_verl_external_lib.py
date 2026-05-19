@@ -20,7 +20,7 @@ OPVEC_MODE_MANIFEST=/path/to/mode_manifest.json
 
 Optional environment variables
 ------------------------------
-OPVEC_GATE_PARAMETERIZATION=global|layer-band|parameter|global-parameter
+OPVEC_GATE_PARAMETERIZATION=global|layer-band|layer-band-parameter|parameter|global-parameter
 OPVEC_GATE_CHECKPOINT=/path/to/gates.json
 OPVEC_MAX_GATED_MODULES=0      # 0/empty means all modules; use 1 for smoke tests
 OPVEC_FREEZE_BASE=1            # default: freeze non-gate parameters
@@ -140,6 +140,20 @@ def _env_truthy(name: str, *, default: bool) -> bool:
 def _normalize_gate_parameterization(value: str) -> str:
     aliases = {
         "layer_band": "layer-band",
+        "layer_band_coefficient": "layer-band-coefficient",
+        "layer-band-coefficients": "layer-band-coefficient",
+        "layer_band_coefficients": "layer-band-coefficient",
+        "layer-band-direct": "layer-band-coefficient",
+        "layer_band_direct": "layer-band-coefficient",
+        "layer_band_parameter": "layer-band-parameter",
+        "layer-band-param": "layer-band-parameter",
+        "layer_band_param": "layer-band-parameter",
+        "layer-band-residual": "layer-band-parameter",
+        "layer_band_residual": "layer-band-parameter",
+        "layer-band-hierarchical": "layer-band-parameter",
+        "layer_band_hierarchical": "layer-band-parameter",
+        "hierarchical-layer-band": "layer-band-parameter",
+        "hierarchical_layer_band": "layer-band-parameter",
         "param": "parameter",
         "param-coefficients": "parameter",
         "parameter-coefficients": "parameter",

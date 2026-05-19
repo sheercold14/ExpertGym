@@ -1,0 +1,141 @@
+# 4-expert Gated-GRPO with a corrected DeepSeek-R1 reasoning task vector.
+#
+# Important: reasoning delta is computed against Qwen2.5-Math-7B, because
+# DeepSeek-R1-Distill-Qwen-7B is distilled from the Math base.  The runtime
+# merge anchor remains Qwen2.5-7B-Instruct, matching tool/memory/code.
+
+run:
+  name: opvec-4expert-r1math-layer28
+  seed: 20260519
+
+storage:
+  root: ${ONPOLICY_STORAGE_ROOT}
+
+models:
+  base: /mnt/cache/wuruixiao/models/Qwen2.5-7b-instruct
+  delta_bases:
+    reasoning: /mnt/cache/wuruixiao/models/Qwen2.5-Math-7B
+  experts:
+    tool: /mnt/cache/wuruixiao/models/Qwen2.5-7B-Instruct-ToolRL-grpo-cold
+    memory: /mnt/cache/wuruixiao/models/RL-MemoryAgent-7B
+    code: /mnt/cache/wuruixiao/models/ReasonFlux-Coder-7B
+    reasoning: /mnt/cache/wuruixiao/models/DeepSeek-R1-Distill-Qwen-7B
+  reference_policy: /tmp/shared-storage/AgentMerging_plan/experiments/conflict_gated_residual/ITER_019_cg_tool_extra020/model
+
+modes:
+  mode_set: opvec4_r1math
+  artifact_dir: ${ONPOLICY_STORAGE_ROOT}/modes/opvec4_r1math_raw_20260519
+  expert_names: [tool, memory, code, reasoning]
+  residual_zero_mean: true
+  include_regex:
+    - "^model\\.layers\\.[0-9]+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\\.weight$"
+  exclude_regex:
+    - ".*lm_head.*"
+    - ".*norm.*"
+    - ".*embed_tokens.*"
+    - ".*bias.*"
+  delta_dtype: float32
+
+layer_bands:
+  layer0: [0, 0]
+  layer1: [1, 1]
+  layer2: [2, 2]
+  layer3: [3, 3]
+  layer4: [4, 4]
+  layer5: [5, 5]
+  layer6: [6, 6]
+  layer7: [7, 7]
+  layer8: [8, 8]
+  layer9: [9, 9]
+  layer10: [10, 10]
+  layer11: [11, 11]
+  layer12: [12, 12]
+  layer13: [13, 13]
+  layer14: [14, 14]
+  layer15: [15, 15]
+  layer16: [16, 16]
+  layer17: [17, 17]
+  layer18: [18, 18]
+  layer19: [19, 19]
+  layer20: [20, 20]
+  layer21: [21, 21]
+  layer22: [22, 22]
+  layer23: [23, 23]
+  layer24: [24, 24]
+  layer25: [25, 25]
+  layer26: [26, 26]
+  layer27: [27, 27]
+
+initial_gates:
+  common: 0.25
+  tool_residual: 0.0833
+  memory_residual: 0.0833
+  code_residual: 0.0833
+  reasoning_residual: -0.25
+
+gate_bounds:
+  common: [0.00, 1.20]
+  residual: [-0.50, 0.50]
+  coefficient: [0.00, 1.20]
+  global_coefficient: [0.00, 1.20]
+  parameter_residual: [-0.10, 0.10]
+
+data:
+  seed_manifest: ${ONPOLICY_STORAGE_ROOT}/data/seed_prompt_manifest.jsonl
+  behavior_matrix: ${ONPOLICY_STORAGE_ROOT}/data/behavior_matrix.jsonl
+  rollout_store: ${ONPOLICY_STORAGE_ROOT}/runs/gated_grpo/onpolicy_rollouts.jsonl
+
+rollout:
+  samples_per_prompt: 4
+  temperature: 0.7
+  top_p: 0.95
+  max_new_tokens:
+    tool: 512
+    memory: 2048
+    code: 4096
+
+frontier:
+  min_frontier_weight: 0.20
+  min_reward_std: 0.05
+  drop_all_success_from_policy_loss: true
+  drop_all_failure_without_contract_signal: true
+
+loss:
+  ppo_loss_weight: 0.0
+  opd_loss_weight: 1.0
+  eps_clip: 0.2
+  beta_kl: 0.02
+  lambda_prior: 0.0
+  lambda_retention: 0.10
+  lambda_invalid: 0.10
+  advantage_eps: 1.0e-6
+
+reward:
+  behavior_span_weight: 0.00
+
+calibration:
+  frontier_task_quota:
+    tool: 32
+    memory: 32
+    code: 32
+  task_loss_weight:
+    tool: 0.5
+    memory: 2.0
+    code: 1.5
+
+optimizer:
+  name: sgd
+  lr: 0.25
+  momentum: 0.2
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+
+train:
+  max_steps: 1
+  prompt_batch_size: 96
+  retention_batch_size: 32
+  eval_interval: 1
+  bake_interval: 1
+
+evaluation:
+  model_name: opvec-4expert-r1math-layer28

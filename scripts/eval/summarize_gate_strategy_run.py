@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.eval.summarize_rollouts import summarize_rollouts
 
-EXPERTS = ("tool", "memory", "code")
+DEFAULT_EXPERTS = ("tool", "memory", "code")
 
 
 def main() -> None:
@@ -156,7 +156,7 @@ def _alerts(
         if update and not update.get("gate_grad_nonzero"):
             alerts.append({"level": "error", "iteration": item["iteration"], "reason": "gate_grad_zero"})
         frontier_counts = update.get("frontier_task_counts") or {}
-        for task in EXPERTS:
+        for task in DEFAULT_EXPERTS:
             if frontier_counts and int(frontier_counts.get(task, 0)) == 0:
                 alerts.append({"level": "warn", "iteration": item["iteration"], "task": task, "reason": "no_frontier_rows"})
     if len(iteration_summaries) >= 2:
@@ -208,33 +208,51 @@ def _gate_stats(gates: dict[str, float], *, init_value: float) -> dict[str, Any]
 
 
 def _effective_coefficients(gates: dict[str, float]) -> list[tuple[str, str, float]]:
+    experts = _infer_experts(gates)
     param_keys = [key for key in gates if "::" in key and not key.startswith("__global__::")]
     if param_keys:
         output = []
         for key in sorted(param_keys):
             name, expert = key.rsplit("::", 1)
-            if expert in EXPERTS:
+            if expert in experts:
                 output.append((name, expert, float(gates[key])))
         return output
 
-    if all(expert in gates for expert in EXPERTS):
-        return [("global", expert, float(gates[expert])) for expert in EXPERTS]
+    if all(expert in gates for expert in experts):
+        return [("global", expert, float(gates[expert])) for expert in experts]
 
     band_names = sorted({key.split(".", 1)[0] for key in gates if "." in key and "::" not in key})
     if band_names:
         output = []
         for band in band_names:
             common = float(gates.get(f"{band}.common", gates.get("common", 0.5)))
-            residuals = [float(gates.get(f"{band}.{expert}_residual", gates.get(f"{expert}_residual", 0.0))) for expert in EXPERTS]
+            residuals = [float(gates.get(f"{band}.{expert}_residual", gates.get(f"{expert}_residual", 0.0))) for expert in experts]
             residual_mean = sum(residuals) / len(residuals)
-            for expert, residual in zip(EXPERTS, residuals):
+            for expert, residual in zip(experts, residuals):
                 output.append((band, expert, common + residual - residual_mean))
         return output
 
     common = float(gates.get("common", 0.5))
-    residuals = [float(gates.get(f"{expert}_residual", 0.0)) for expert in EXPERTS]
+    residuals = [float(gates.get(f"{expert}_residual", 0.0)) for expert in experts]
     residual_mean = sum(residuals) / len(residuals)
-    return [("global", expert, common + residual - residual_mean) for expert, residual in zip(EXPERTS, residuals)]
+    return [("global", expert, common + residual - residual_mean) for expert, residual in zip(experts, residuals)]
+
+
+def _infer_experts(gates: dict[str, float]) -> tuple[str, ...]:
+    experts = []
+    for key in sorted(gates):
+        if "::" in key and not key.startswith("__global__::"):
+            expert = key.rsplit("::", 1)[1]
+        elif key.endswith("_residual"):
+            tail = key.split(".", 1)[1] if "." in key else key
+            expert = tail[: -len("_residual")]
+        elif "." not in key and key not in {"common"}:
+            expert = key
+        else:
+            continue
+        if expert and expert not in experts:
+            experts.append(expert)
+    return tuple(experts) if experts else DEFAULT_EXPERTS
 
 
 def _load_gates(path: Path) -> dict[str, float]:

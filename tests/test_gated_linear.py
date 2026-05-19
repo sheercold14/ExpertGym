@@ -93,6 +93,50 @@ class GatedLinearTest(unittest.TestCase):
         self.assertAlmostEqual(float(early(x).item()), 0.0, places=6)
         self.assertGreater(float(late(x).item()), 0.0)
 
+    def test_layer_band_direct_coefficients_use_param_name(self):
+        import torch
+
+        from opvec.modeling.gate_parameters import TorchLayerBandCoefficientManager
+        from opvec.modeling.gated_linear import GatedLinear
+
+        base = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            base.weight.zero_()
+        deltas = {
+            "tool": torch.ones_like(base.weight),
+            "memory": torch.zeros_like(base.weight),
+            "code": torch.zeros_like(base.weight),
+        }
+        gates = TorchLayerBandCoefficientManager(
+            torch,
+            {
+                "early.tool": 0.1,
+                "early.memory": 0.2,
+                "early.code": 0.3,
+                "late.tool": 0.8,
+                "late.memory": 0.2,
+                "late.code": 0.3,
+            },
+        ).module
+        early = GatedLinear(
+            torch,
+            base,
+            deltas,
+            gates,
+            param_name="model.layers.0.mlp.down_proj.weight",
+        ).module
+        late = GatedLinear(
+            torch,
+            base,
+            deltas,
+            gates,
+            param_name="model.layers.27.mlp.down_proj.weight",
+        ).module
+
+        x = torch.ones(1, 1)
+        self.assertAlmostEqual(float(early(x).item()), 0.1, places=6)
+        self.assertAlmostEqual(float(late(x).item()), 0.8, places=6)
+
     def test_parameter_coefficients_are_param_specific_and_trainable(self):
         import torch
 
@@ -204,6 +248,58 @@ class GatedLinearTest(unittest.TestCase):
         self.assertAlmostEqual(float(wrapped_b(x).item()), 0.65, places=6)
 
         loss = (wrapped_a(x) + wrapped_b(x)).sum()
+        loss.backward()
+        self.assertIsNotNone(gates.raw_global_coefficients.grad)
+        self.assertIsNotNone(gates.raw_residual_coefficients.grad)
+        self.assertGreater(float(gates.raw_global_coefficients.grad.abs().sum().item()), 0.0)
+        self.assertGreater(float(gates.raw_residual_coefficients.grad.abs().sum().item()), 0.0)
+
+    def test_layer_band_parameter_coefficients_use_global_plus_layer_residual(self):
+        import torch
+
+        from opvec.modeling.gate_parameters import TorchLayerBandParameterCoefficientManager
+        from opvec.modeling.gated_linear import GatedLinear
+
+        base = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            base.weight.zero_()
+        deltas = {
+            "tool": torch.ones_like(base.weight),
+            "memory": torch.zeros_like(base.weight),
+            "code": torch.zeros_like(base.weight),
+        }
+        gates = TorchLayerBandParameterCoefficientManager(
+            torch,
+            {
+                "__global__::tool": 0.7,
+                "early.tool": 0.75,
+                "late.tool": 0.65,
+                "common": 0.5,
+            },
+        ).module
+        early = GatedLinear(
+            torch,
+            base,
+            deltas,
+            gates,
+            param_name="model.layers.0.mlp.down_proj.weight",
+        ).module
+        late = GatedLinear(
+            torch,
+            base,
+            deltas,
+            gates,
+            param_name="model.layers.27.mlp.down_proj.weight",
+        ).module
+
+        x = torch.ones(1, 1)
+        self.assertAlmostEqual(float(gates.expert_coefficients()["tool"].detach().item()), 0.7, places=6)
+        self.assertAlmostEqual(float(early(x).item()), 0.75, places=6)
+        self.assertAlmostEqual(float(late(x).item()), 0.65, places=6)
+        self.assertIn("__global__::tool", gates.gate_values())
+        self.assertIn("early.tool", gates.gate_values())
+
+        loss = (early(x) + late(x)).sum()
         loss.backward()
         self.assertIsNotNone(gates.raw_global_coefficients.grad)
         self.assertIsNotNone(gates.raw_residual_coefficients.grad)

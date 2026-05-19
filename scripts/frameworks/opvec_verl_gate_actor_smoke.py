@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode-manifest", required=True)
     parser.add_argument(
         "--gate-parameterization",
-        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        choices=["global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"],
         default="global",
     )
     parser.add_argument("--init-gate-checkpoint", default=None)

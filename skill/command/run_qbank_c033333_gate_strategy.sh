@@ -18,13 +18,14 @@ Common overrides:
   CONFIG=configs/gated_grpo.yaml
 
 Gate strategy:
-  STRATEGY=global|global-coefficient|layer-band|parameter|global-parameter
+  STRATEGY=global|global-coefficient|layer-band|layer-band-coefficient|layer-band-parameter|parameter|global-parameter
   INIT_VALUE=0.3333333333333333        initial task-vector coefficient
   INIT_GATE_CHECKPOINT=                optional explicit gate JSON; when set, skip constant init creation
   MAX_GATED_MODULES=                   empty means all modules; use 1 only for smoke tests
 
 Data / loop:
   NUM_ITERS=20
+  START_ITERATION=1
   NUM_PROMPTS=100
   SAMPLES_PER_PROMPT=4
   TASKS=                               optional comma list: tool,memory,code
@@ -72,6 +73,12 @@ Update / objective:
   PCGRAD_GATE_GRADIENTS=0|1              enable optional task PCGrad for gate gradients; requires OPTIMIZER_STEP_SCOPE=epoch
   PCGRAD_EPS=1e-12
   PCGRAD_TASKS=                          optional comma list: tool,memory,code
+  TOOL_NULLSPACE_GATE_GRADIENTS=0|1      project total gate gradient away from Tool behavior-span gradients
+  TOOL_NULLSPACE_REPLAY_ROLLOUT=         optional comma-separated Tool positive rollout JSONL paths
+  TOOL_NULLSPACE_ROWS=16
+  TOOL_NULLSPACE_MIN_ROWS=1
+  TOOL_NULLSPACE_RANK=0                  0 uses all numerical ranks
+  TOOL_NULLSPACE_EPS=1e-6
   OPD_DYNAMIC_SCALE=0|1                  auto-scale OPD per task from current OPD loss magnitudes
   OPD_TASK_BALANCED_LOSS_SCALE=0|1       average OPD by task instead of raw row count
   OPD_SCALE_TARGET_HIGH/MID/LOW/TAIL     target OPD/GRPO ratios by recoverable all-fail rate
@@ -89,13 +96,18 @@ Update / objective:
   MAX_PAIRWISE_PAIRS_PER_ROW=0
   MIN_GRAD_NORM_FOR_STEP=0.0
   MAX_COEFF_DELTA=                     default depends on STRATEGY
+  MAX_COEFF_DELTA_BY_EXPERT=           optional comma list, e.g. reasoning=0.002
+  COEFF_BOUND_BY_EXPERT=               optional comma list, e.g. reasoning=0.0:0.003
 
 Frontier / task balance:
   FRONTIER_ORDER=as-is|shuffle|task-interleaved
   FRONTIER_SHUFFLE_SEED=               empty means seed + iteration - 1
-  FRONTIER_TOOL_QUOTA=32
-  FRONTIER_MEMORY_QUOTA=32
-  FRONTIER_CODE_QUOTA=32
+  FRONTIER_SAMPLE_BEFORE_LIMIT=0|1     randomly sample before applying frontier quotas
+  IGNORE_CONFIG_FRONTIER_TASK_QUOTA=1  default 1; unset CLI quota means all frontier rows
+  FRONTIER_ROWS_PER_TASK=              optional shorthand, e.g. 4 sets all three task quotas
+  FRONTIER_TOOL_QUOTA=                 empty means no tool cap
+  FRONTIER_MEMORY_QUOTA=               empty means no memory cap
+  FRONTIER_CODE_QUOTA=                 empty means no code cap
   MAX_FRONTIER_ROWS_PER_TASK=
   USE_RETENTION=0|1                   default 0; all-success rows become KL retention rows when enabled
   RETENTION_OBJECTIVE=kl|nll           kl is legacy; nll preserves all-success rows with non-zero NLL gradient
@@ -103,6 +115,8 @@ Frontier / task balance:
   RETENTION_POSITIVE_REWARD_THRESHOLD=1.0
   MAX_RETENTION_ROWS=                 recommended 64 when USE_RETENTION=1
   MAX_RETENTION_ROWS_PER_TASK=        optional per-task cap before MAX_RETENTION_ROWS
+  RETENTION_SAMPLE_BEFORE_LIMIT=0|1   randomly sample before applying retention caps
+  RETENTION_SHUFFLE_SEED=             empty means use frontier shuffle seed
   OPD_DISTILL_ROLLOUT=                optional comma-separated OPD distill JSONL paths
   OPD_LOSS_WEIGHT=0.0                 sequence expert-positive likelihood loss for OPD rows
   OPD_PAIRWISE_LOSS_WEIGHT=0.0        pairwise expert-positive vs current-negative loss for OPD rows
@@ -115,6 +129,7 @@ Frontier / task balance:
   DYNAMIC_OPD_PER_TASK=32
   DYNAMIC_OPD_MAX_POSITIVES_PER_ROW=1
   DYNAMIC_OPD_MAX_NEGATIVES_PER_ROW=2
+  DYNAMIC_OPD_REQUIRE_ALL_TASKS=0|1 skip dynamic OPD for an update unless every dynamic OPD task has rows
   USE_OPD_ALL_SUCCESS=0|1             add auxiliary OPD loss on all-success rows
   OPD_ALL_SUCCESS_LOSS_WEIGHT=0.0
   OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD=1.0
@@ -182,6 +197,7 @@ GPU_LIST="${GPU_LIST:-0,1,2,3}"
 export CUDA_VISIBLE_DEVICES="$GPU_LIST"
 
 NUM_ITERS="${NUM_ITERS:-20}"
+START_ITERATION="${START_ITERATION:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-100}"
 SAMPLES_PER_PROMPT="${SAMPLES_PER_PROMPT:-4}"
 TASKS="${TASKS:-}"
@@ -223,6 +239,16 @@ case "$STRATEGY" in
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
     MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.1}"
     ;;
+  layer-band-coefficient)
+    LR="${LR:-0.02}"
+    PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
+    MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.1}"
+    ;;
+  layer-band-parameter)
+    LR="${LR:-0.02}"
+    PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
+    MAX_COEFF_DELTA="${MAX_COEFF_DELTA:-0.1}"
+    ;;
   parameter)
     LR="${LR:-0.01}"
     PRIOR_LOSS_WEIGHT="${PRIOR_LOSS_WEIGHT:-0.02}"
@@ -246,6 +272,8 @@ OPTIMIZER_STEP_SCOPE="${OPTIMIZER_STEP_SCOPE:-batch}"
 LOSS_GRANULARITY="${LOSS_GRANULARITY:-token}"
 FRONTIER_ORDER="${FRONTIER_ORDER:-task-interleaved}"
 FRONTIER_SHUFFLE_SEED="${FRONTIER_SHUFFLE_SEED:-}"
+FRONTIER_SAMPLE_BEFORE_LIMIT="${FRONTIER_SAMPLE_BEFORE_LIMIT:-0}"
+IGNORE_CONFIG_FRONTIER_TASK_QUOTA="${IGNORE_CONFIG_FRONTIER_TASK_QUOTA:-1}"
 STORE_TOKEN_LOGPROBS="${STORE_TOKEN_LOGPROBS:-0}"
 TASK_NORMALIZE_ADVANTAGES="${TASK_NORMALIZE_ADVANTAGES:-0}"
 ADVANTAGE_NORMALIZATION="${ADVANTAGE_NORMALIZATION:-centered}"
@@ -263,6 +291,13 @@ RETENTION_SCALE_EPS="${RETENTION_SCALE_EPS:-1e-6}"
 PCGRAD_GATE_GRADIENTS="${PCGRAD_GATE_GRADIENTS:-0}"
 PCGRAD_EPS="${PCGRAD_EPS:-1e-12}"
 PCGRAD_TASKS="${PCGRAD_TASKS:-}"
+TOOL_NULLSPACE_GATE_GRADIENTS="${TOOL_NULLSPACE_GATE_GRADIENTS:-0}"
+TOOL_NULLSPACE_REPLAY_ROLLOUT="${TOOL_NULLSPACE_REPLAY_ROLLOUT:-}"
+TOOL_NULLSPACE_ROWS="${TOOL_NULLSPACE_ROWS:-16}"
+TOOL_NULLSPACE_MIN_ROWS="${TOOL_NULLSPACE_MIN_ROWS:-1}"
+TOOL_NULLSPACE_RANK="${TOOL_NULLSPACE_RANK:-0}"
+TOOL_NULLSPACE_EPS="${TOOL_NULLSPACE_EPS:-1e-6}"
+TOOL_NULLSPACE_POSITIVE_REWARD_THRESHOLD="${TOOL_NULLSPACE_POSITIVE_REWARD_THRESHOLD:-1.0}"
 OPD_DYNAMIC_SCALE="${OPD_DYNAMIC_SCALE:-0}"
 OPD_TASK_BALANCED_LOSS_SCALE="${OPD_TASK_BALANCED_LOSS_SCALE:-0}"
 OPD_SCALE_MIN="${OPD_SCALE_MIN:-0.05}"
@@ -285,10 +320,13 @@ PAIRWISE_LOSS_WEIGHT="${PAIRWISE_LOSS_WEIGHT:-0.0}"
 PAIRWISE_MARGIN="${PAIRWISE_MARGIN:-0.0}"
 MAX_PAIRWISE_PAIRS_PER_ROW="${MAX_PAIRWISE_PAIRS_PER_ROW:-0}"
 MIN_GRAD_NORM_FOR_STEP="${MIN_GRAD_NORM_FOR_STEP:-0.0}"
+MAX_COEFF_DELTA_BY_EXPERT="${MAX_COEFF_DELTA_BY_EXPERT:-}"
+COEFF_BOUND_BY_EXPERT="${COEFF_BOUND_BY_EXPERT:-}"
 BEHAVIOR_SPAN_REWARD_WEIGHT="${BEHAVIOR_SPAN_REWARD_WEIGHT:-0.0}"
-FRONTIER_TOOL_QUOTA="${FRONTIER_TOOL_QUOTA:-32}"
-FRONTIER_MEMORY_QUOTA="${FRONTIER_MEMORY_QUOTA:-32}"
-FRONTIER_CODE_QUOTA="${FRONTIER_CODE_QUOTA:-32}"
+FRONTIER_ROWS_PER_TASK="${FRONTIER_ROWS_PER_TASK:-}"
+FRONTIER_TOOL_QUOTA="${FRONTIER_TOOL_QUOTA:-$FRONTIER_ROWS_PER_TASK}"
+FRONTIER_MEMORY_QUOTA="${FRONTIER_MEMORY_QUOTA:-$FRONTIER_ROWS_PER_TASK}"
+FRONTIER_CODE_QUOTA="${FRONTIER_CODE_QUOTA:-$FRONTIER_ROWS_PER_TASK}"
 MAX_FRONTIER_ROWS_PER_TASK="${MAX_FRONTIER_ROWS_PER_TASK:-}"
 USE_RETENTION="${USE_RETENTION:-0}"
 RETENTION_OBJECTIVE="${RETENTION_OBJECTIVE:-kl}"
@@ -296,6 +334,8 @@ RETENTION_LOSS_WEIGHT="${RETENTION_LOSS_WEIGHT:-}"
 RETENTION_POSITIVE_REWARD_THRESHOLD="${RETENTION_POSITIVE_REWARD_THRESHOLD:-1.0}"
 MAX_RETENTION_ROWS="${MAX_RETENTION_ROWS:-}"
 MAX_RETENTION_ROWS_PER_TASK="${MAX_RETENTION_ROWS_PER_TASK:-}"
+RETENTION_SAMPLE_BEFORE_LIMIT="${RETENTION_SAMPLE_BEFORE_LIMIT:-0}"
+RETENTION_SHUFFLE_SEED="${RETENTION_SHUFFLE_SEED:-}"
 OPD_DISTILL_ROLLOUT="${OPD_DISTILL_ROLLOUT:-}"
 OPD_LOSS_WEIGHT="${OPD_LOSS_WEIGHT:-0.0}"
 OPD_PAIRWISE_LOSS_WEIGHT="${OPD_PAIRWISE_LOSS_WEIGHT:-0.0}"
@@ -312,6 +352,7 @@ DYNAMIC_OPD_MAX_POSITIVES_PER_ROW="${DYNAMIC_OPD_MAX_POSITIVES_PER_ROW:-1}"
 DYNAMIC_OPD_MAX_NEGATIVES_PER_ROW="${DYNAMIC_OPD_MAX_NEGATIVES_PER_ROW:-2}"
 DYNAMIC_OPD_PER_TASK="${DYNAMIC_OPD_PER_TASK:-32}"
 DYNAMIC_OPD_QUOTA="${DYNAMIC_OPD_QUOTA:-}"
+DYNAMIC_OPD_REQUIRE_ALL_TASKS="${DYNAMIC_OPD_REQUIRE_ALL_TASKS:-0}"
 USE_OPD_ALL_SUCCESS="${USE_OPD_ALL_SUCCESS:-0}"
 OPD_ALL_SUCCESS_LOSS_WEIGHT="${OPD_ALL_SUCCESS_LOSS_WEIGHT:-0.0}"
 OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD="${OPD_ALL_SUCCESS_POSITIVE_REWARD_THRESHOLD:-1.0}"
@@ -468,6 +509,25 @@ if is_truthy "$PCGRAD_GATE_GRADIENTS"; then
     done
   fi
 fi
+TOOL_NULLSPACE_ARGS=()
+if is_truthy "$TOOL_NULLSPACE_GATE_GRADIENTS"; then
+  TOOL_NULLSPACE_ARGS+=(
+    --tool-nullspace-gate-gradients
+    --tool-nullspace-rows "$TOOL_NULLSPACE_ROWS"
+    --tool-nullspace-min-rows "$TOOL_NULLSPACE_MIN_ROWS"
+    --tool-nullspace-rank "$TOOL_NULLSPACE_RANK"
+    --tool-nullspace-eps "$TOOL_NULLSPACE_EPS"
+    --tool-nullspace-positive-reward-threshold "$TOOL_NULLSPACE_POSITIVE_REWARD_THRESHOLD"
+  )
+  if [[ -n "$TOOL_NULLSPACE_REPLAY_ROLLOUT" ]]; then
+    IFS=',' read -r -a TOOL_NULLSPACE_REPLAY_LIST <<< "$TOOL_NULLSPACE_REPLAY_ROLLOUT"
+    for replay_path in "${TOOL_NULLSPACE_REPLAY_LIST[@]}"; do
+      if [[ -n "$replay_path" ]]; then
+        TOOL_NULLSPACE_ARGS+=(--tool-nullspace-replay-rollout "$replay_path")
+      fi
+    done
+  fi
+fi
 if [[ "$STORE_TOKEN_LOGPROBS" == "auto" ]]; then
   if [[ "$LOSS_GRANULARITY" == "token" ]]; then
     OBJECTIVE_ARGS+=(--store-token-logprobs)
@@ -482,6 +542,18 @@ fi
 FRONTIER_ORDER_ARGS=(--frontier-order "$FRONTIER_ORDER")
 if [[ -n "$FRONTIER_SHUFFLE_SEED" ]]; then
   FRONTIER_ORDER_ARGS+=(--frontier-shuffle-seed "$FRONTIER_SHUFFLE_SEED")
+fi
+if is_truthy "$FRONTIER_SAMPLE_BEFORE_LIMIT"; then
+  FRONTIER_ORDER_ARGS+=(--sample-frontier-before-limit)
+fi
+if is_truthy "$IGNORE_CONFIG_FRONTIER_TASK_QUOTA"; then
+  FRONTIER_ORDER_ARGS+=(--ignore-config-frontier-task-quota)
+fi
+if is_truthy "$RETENTION_SAMPLE_BEFORE_LIMIT"; then
+  FRONTIER_ORDER_ARGS+=(--sample-retention-before-limit)
+fi
+if [[ -n "$RETENTION_SHUFFLE_SEED" ]]; then
+  FRONTIER_ORDER_ARGS+=(--retention-shuffle-seed "$RETENTION_SHUFFLE_SEED")
 fi
 
 UPDATE_EXTRA_ARGS=(
@@ -565,6 +637,9 @@ if [[ -n "$DYNAMIC_OPD_EXPERT_ROLLOUT" ]]; then
       fi
     done
   fi
+  if is_truthy "$DYNAMIC_OPD_REQUIRE_ALL_TASKS"; then
+    DYNAMIC_OPD_ARGS+=(--dynamic-opd-require-all-tasks)
+  fi
 fi
 if is_truthy "$USE_OPD_ALL_SUCCESS"; then
   UPDATE_EXTRA_ARGS+=(--use-opd-all-success)
@@ -598,6 +673,22 @@ if [[ "$TOOL_MIN_MARGIN_OVER_CODE" != "0" && "$TOOL_MIN_MARGIN_OVER_CODE" != "0.
 fi
 if [[ -n "$POSITIVE_REWARD_THRESHOLD" ]]; then
   UPDATE_EXTRA_ARGS+=(--positive-reward-threshold "$POSITIVE_REWARD_THRESHOLD")
+fi
+if [[ -n "$MAX_COEFF_DELTA_BY_EXPERT" ]]; then
+  IFS=',' read -r -a MAX_COEFF_DELTA_BY_EXPERT_LIST <<< "$MAX_COEFF_DELTA_BY_EXPERT"
+  for expert_delta in "${MAX_COEFF_DELTA_BY_EXPERT_LIST[@]}"; do
+    if [[ -n "$expert_delta" ]]; then
+      UPDATE_EXTRA_ARGS+=(--max-coefficient-delta-from-init-by-expert "$expert_delta")
+    fi
+  done
+fi
+if [[ -n "$COEFF_BOUND_BY_EXPERT" ]]; then
+  IFS=',' read -r -a COEFF_BOUND_BY_EXPERT_LIST <<< "$COEFF_BOUND_BY_EXPERT"
+  for expert_bound in "${COEFF_BOUND_BY_EXPERT_LIST[@]}"; do
+    if [[ -n "$expert_bound" ]]; then
+      UPDATE_EXTRA_ARGS+=(--coefficient-bound-by-expert "$expert_bound")
+    fi
+  done
 fi
 if is_truthy "$RECOMPUTE_FRONTIER"; then
   UPDATE_EXTRA_ARGS+=(--recompute-frontier)
@@ -643,17 +734,20 @@ echo "[run] run_dir=$RUN_DIR"
 echo "[run] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[run] optimizer=$OPTIMIZER sgd_momentum=$SGD_MOMENTUM persist_optimizer_state=$PERSIST_OPTIMIZER_STATE"
 echo "[run] lr=$LR prior=$PRIOR_LOSS_WEIGHT max_delta=$MAX_COEFF_DELTA"
+echo "[run] max_delta_by_expert=${MAX_COEFF_DELTA_BY_EXPERT:-none}"
+echo "[run] coeff_bound_by_expert=${COEFF_BOUND_BY_EXPERT:-none}"
 echo "[run] loss_granularity=$LOSS_GRANULARITY update_batch_size=$UPDATE_BATCH_SIZE optimizer_step_scope=$OPTIMIZER_STEP_SCOPE store_token_logprobs=$STORE_TOKEN_LOGPROBS"
 echo "[run] task_normalize_advantages=$TASK_NORMALIZE_ADVANTAGES advantage_normalization=$ADVANTAGE_NORMALIZATION use_frontier_weight=$USE_FRONTIER_WEIGHT advantage_field_frontier_weight=$ADVANTAGE_FIELD_APPLY_FRONTIER_WEIGHT"
 echo "[run] length_norm policy=$LENGTH_NORMALIZE_POLICY_LOGPROB legacy=$LENGTH_NORMALIZE_LOGPROB opd=$OPD_LENGTH_NORMALIZE_LOGPROB retention=$RETENTION_LENGTH_NORMALIZE_LOGPROB"
 echo "[run] retention_dynamic_scale=$RETENTION_DYNAMIC_SCALE retention_task_balanced=$RETENTION_TASK_BALANCED_LOSS_SCALE retention_target=$RETENTION_SCALE_TARGET"
 echo "[run] pcgrad_gate_gradients=$PCGRAD_GATE_GRADIENTS pcgrad_eps=$PCGRAD_EPS pcgrad_tasks=${PCGRAD_TASKS:-all-observed}"
+echo "[run] tool_nullspace_gate_gradients=$TOOL_NULLSPACE_GATE_GRADIENTS rows=$TOOL_NULLSPACE_ROWS min_rows=$TOOL_NULLSPACE_MIN_ROWS rank=$TOOL_NULLSPACE_RANK replay=${TOOL_NULLSPACE_REPLAY_ROLLOUT:-none}"
 echo "[run] opd_dynamic_scale=$OPD_DYNAMIC_SCALE opd_task_balanced=$OPD_TASK_BALANCED_LOSS_SCALE scale_targets=$OPD_SCALE_TARGET_HIGH/$OPD_SCALE_TARGET_MID/$OPD_SCALE_TARGET_LOW/$OPD_SCALE_TARGET_TAIL"
-echo "[run] frontier_order=$FRONTIER_ORDER frontier_shuffle_seed=${FRONTIER_SHUFFLE_SEED:-auto}"
-echo "[run] task_weights=tool:$TASK_WEIGHT_TOOL,memory:$TASK_WEIGHT_MEMORY,code:$TASK_WEIGHT_CODE quotas=tool:$FRONTIER_TOOL_QUOTA,memory:$FRONTIER_MEMORY_QUOTA,code:$FRONTIER_CODE_QUOTA"
-echo "[run] retention=$USE_RETENTION retention_objective=$RETENTION_OBJECTIVE retention_loss_weight=${RETENTION_LOSS_WEIGHT:-none} retention_positive_threshold=${RETENTION_POSITIVE_REWARD_THRESHOLD:-none} max_retention_rows=${MAX_RETENTION_ROWS:-none} max_retention_rows_per_task=${MAX_RETENTION_ROWS_PER_TASK:-none}"
+echo "[run] frontier_order=$FRONTIER_ORDER frontier_shuffle_seed=${FRONTIER_SHUFFLE_SEED:-auto} frontier_sample_before_limit=$FRONTIER_SAMPLE_BEFORE_LIMIT ignore_config_frontier_task_quota=$IGNORE_CONFIG_FRONTIER_TASK_QUOTA"
+echo "[run] task_weights=tool:$TASK_WEIGHT_TOOL,memory:$TASK_WEIGHT_MEMORY,code:$TASK_WEIGHT_CODE quotas=tool:${FRONTIER_TOOL_QUOTA:-all},memory:${FRONTIER_MEMORY_QUOTA:-all},code:${FRONTIER_CODE_QUOTA:-all}"
+echo "[run] retention=$USE_RETENTION retention_objective=$RETENTION_OBJECTIVE retention_loss_weight=${RETENTION_LOSS_WEIGHT:-none} retention_positive_threshold=${RETENTION_POSITIVE_REWARD_THRESHOLD:-none} max_retention_rows=${MAX_RETENTION_ROWS:-none} max_retention_rows_per_task=${MAX_RETENTION_ROWS_PER_TASK:-none} retention_sample_before_limit=$RETENTION_SAMPLE_BEFORE_LIMIT retention_shuffle_seed=${RETENTION_SHUFFLE_SEED:-frontier}"
 echo "[run] opd_rollout=${OPD_DISTILL_ROLLOUT:-none} opd_loss=$OPD_LOSS_WEIGHT opd_pairwise=$OPD_PAIRWISE_LOSS_WEIGHT max_opd_rows=${MAX_OPD_DISTILL_ROWS:-none}"
-echo "[run] dynamic_opd_rollout=${DYNAMIC_OPD_EXPERT_ROLLOUT:-none} dynamic_opd_tasks=$DYNAMIC_OPD_TASKS dynamic_opd_per_task=$DYNAMIC_OPD_PER_TASK"
+echo "[run] dynamic_opd_rollout=${DYNAMIC_OPD_EXPERT_ROLLOUT:-none} dynamic_opd_tasks=$DYNAMIC_OPD_TASKS dynamic_opd_per_task=$DYNAMIC_OPD_PER_TASK require_all_tasks=$DYNAMIC_OPD_REQUIRE_ALL_TASKS"
 echo "[run] opd_all_success=$USE_OPD_ALL_SUCCESS opd_all_success_loss=$OPD_ALL_SUCCESS_LOSS_WEIGHT max_opd_all_success_rows=${MAX_OPD_ALL_SUCCESS_ROWS:-none}"
 echo "[run] tokens=default:$MAX_NEW_TOKENS,tool:$TOOL_MAX_NEW_TOKENS,code:$CODE_MAX_NEW_TOKENS,memory_update:$MEMORY_UPDATE_MAX_NEW_TOKENS,memory_final:$MEMORY_FINAL_MAX_NEW_TOKENS"
 echo "[run] rollout_shards=$ROLLOUT_SHARDS rollout_gpus=$ROLLOUT_GPUS vllm_batch_size=$ROLLOUT_BATCH_SIZE"
@@ -677,6 +771,7 @@ fi
   --run-dir "$RUN_DIR" \
   --run-id "$RUN_NAME" \
   --num-iters "$NUM_ITERS" \
+  --start-iteration "$START_ITERATION" \
   --num-prompts "$NUM_PROMPTS" \
   --samples-per-prompt "$SAMPLES_PER_PROMPT" \
   --use-manifest-order \
@@ -714,6 +809,7 @@ fi
   --max-coefficient-delta-from-init "$MAX_COEFF_DELTA" \
   --behavior-span-reward-weight "$BEHAVIOR_SPAN_REWARD_WEIGHT" \
   "${PCGRAD_ARGS[@]}" \
+  "${TOOL_NULLSPACE_ARGS[@]}" \
   "${DYNAMIC_OPD_ARGS[@]}" \
   "${FRONTIER_QUOTA_ARGS[@]}" \
   "${TASK_WEIGHT_ARGS[@]}" \

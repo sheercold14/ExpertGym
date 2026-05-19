@@ -78,18 +78,9 @@ def main() -> None:
             if dynamic_opd_rollout is not None
             else None
         )
-        update_cmd = _update_command(
-            args,
-            rollouts=rollouts,
-            updates=updates,
-            gate_checkpoint=gate_checkpoint,
-            optimizer_state_in=optimizer_state_checkpoint,
-            optimizer_state_out=optimizer_state_out,
-            iteration=iteration,
-            extra_opd_rollouts=[dynamic_opd_rollout] if dynamic_opd_rollout is not None else [],
-        )
-
         timings = {}
+        dynamic_opd_filter = None
+        update_cmd = None
         if args.dry_run:
             print("[dry-run]", _fmt_cmd(bake_cmd))
             if shard_specs:
@@ -103,6 +94,21 @@ def main() -> None:
                 print("[dry-run]", _fmt_cmd(collect_cmd))
             if dynamic_opd_cmd:
                 print("[dry-run][dynamic-opd]", _fmt_cmd(dynamic_opd_cmd))
+            if args.dynamic_opd_require_all_tasks and dynamic_opd_rollout is not None:
+                print(
+                    "[dry-run][dynamic-opd] require-all-tasks will be resolved from the generated summary before update",
+                    flush=True,
+                )
+            update_cmd = _update_command(
+                args,
+                rollouts=rollouts,
+                updates=updates,
+                gate_checkpoint=gate_checkpoint,
+                optimizer_state_in=optimizer_state_checkpoint,
+                optimizer_state_out=optimizer_state_out,
+                iteration=iteration,
+                extra_opd_rollouts=[dynamic_opd_rollout] if dynamic_opd_rollout is not None else [],
+            )
             print("[dry-run]", _fmt_cmd(update_cmd))
         else:
             timings["bake_seconds"] = _run_timed("bake", bake_cmd)
@@ -115,6 +121,17 @@ def main() -> None:
                 timings["collect_seconds"] = _run_timed("collect", collect_cmd)
             if dynamic_opd_cmd:
                 timings["dynamic_opd_seconds"] = _run_timed("dynamic-opd", dynamic_opd_cmd)
+            extra_opd_rollouts, dynamic_opd_filter = _active_dynamic_opd_rollouts(args, dynamic_opd_rollout)
+            update_cmd = _update_command(
+                args,
+                rollouts=rollouts,
+                updates=updates,
+                gate_checkpoint=gate_checkpoint,
+                optimizer_state_in=optimizer_state_checkpoint,
+                optimizer_state_out=optimizer_state_out,
+                iteration=iteration,
+                extra_opd_rollouts=extra_opd_rollouts,
+            )
             timings["update_seconds"] = _run_timed("update", update_cmd)
 
         next_gate = updates.with_suffix(".gates.json")
@@ -135,6 +152,7 @@ def main() -> None:
             "rollout_shards": _compact_shard_specs(shard_specs),
             "dynamic_opd_rollout": str(dynamic_opd_rollout) if dynamic_opd_rollout else None,
             "dynamic_opd_command": dynamic_opd_cmd,
+            "dynamic_opd_filter": dynamic_opd_filter,
             "timings": {**timings, "iteration_seconds": time.time() - iter_start},
         }
         if summary_path.exists():
@@ -364,7 +382,6 @@ def _update_command(
         str(args.update_epochs),
         "--max-logprob-tokens",
         str(args.max_logprob_tokens),
-        "--fill-missing-old-logprob",
         "--lr",
         str(args.lr),
         "--optimizer",
@@ -404,6 +421,11 @@ def _update_command(
         "--frontier-shuffle-seed",
         str(args.frontier_shuffle_seed if args.frontier_shuffle_seed is not None else int(args.seed + iteration - 1)),
     ]
+    needs_old_logprob = float(args.ppo_loss_weight) != 0.0 or (
+        bool(args.use_retention) and args.retention_objective == "kl"
+    )
+    if needs_old_logprob:
+        cmd.append("--fill-missing-old-logprob")
     if args.device_map:
         cmd += ["--device-map", args.device_map]
     if args.sgd_nesterov:
@@ -424,6 +446,10 @@ def _update_command(
         cmd += ["--task-weight", item]
     for item in args.frontier_task_quota or []:
         cmd += ["--frontier-task-quota", item]
+    if args.ignore_config_frontier_task_quota:
+        cmd.append("--ignore-config-frontier-task-quota")
+    if args.sample_frontier_before_limit:
+        cmd.append("--sample-frontier-before-limit")
     if args.max_frontier_rows_per_task is not None:
         cmd += ["--max-frontier-rows-per-task", str(args.max_frontier_rows_per_task)]
     if args.use_retention:
@@ -432,6 +458,10 @@ def _update_command(
         cmd += ["--max-retention-rows", str(args.max_retention_rows)]
     if args.max_retention_rows_per_task is not None:
         cmd += ["--max-retention-rows-per-task", str(args.max_retention_rows_per_task)]
+    if args.sample_retention_before_limit:
+        cmd.append("--sample-retention-before-limit")
+    if args.retention_shuffle_seed is not None:
+        cmd += ["--retention-shuffle-seed", str(args.retention_shuffle_seed)]
     if args.retention_loss_weight is not None:
         cmd += ["--retention-loss-weight", str(args.retention_loss_weight)]
     cmd += ["--retention-objective", args.retention_objective]
@@ -541,10 +571,30 @@ def _update_command(
         cmd += ["--positive-reward-threshold", str(args.positive_reward_threshold)]
     if args.max_coefficient_delta_from_init is not None:
         cmd += ["--max-coefficient-delta-from-init", str(args.max_coefficient_delta_from_init)]
+    for item in args.max_coefficient_delta_from_init_by_expert or []:
+        cmd += ["--max-coefficient-delta-from-init-by-expert", item]
+    for item in args.coefficient_bound_by_expert or []:
+        cmd += ["--coefficient-bound-by-expert", item]
     if args.pcgrad_gate_gradients:
         cmd += ["--pcgrad-gate-gradients", "--pcgrad-eps", str(args.pcgrad_eps)]
         for task in args.pcgrad_task or []:
             cmd += ["--pcgrad-task", task]
+    if args.tool_nullspace_gate_gradients:
+        cmd += [
+            "--tool-nullspace-gate-gradients",
+            "--tool-nullspace-rows",
+            str(args.tool_nullspace_rows),
+            "--tool-nullspace-min-rows",
+            str(args.tool_nullspace_min_rows),
+            "--tool-nullspace-rank",
+            str(args.tool_nullspace_rank),
+            "--tool-nullspace-eps",
+            str(args.tool_nullspace_eps),
+            "--tool-nullspace-positive-reward-threshold",
+            str(args.tool_nullspace_positive_reward_threshold),
+        ]
+        for item in args.tool_nullspace_replay_rollout or []:
+            cmd += ["--tool-nullspace-replay-rollout", item]
     return cmd
 
 
@@ -586,6 +636,60 @@ def _dynamic_opd_command(
     for item in args.dynamic_opd_quota or []:
         cmd += ["--quota", item]
     return cmd
+
+
+def _active_dynamic_opd_rollouts(
+    args: argparse.Namespace,
+    dynamic_opd_rollout: Path | None,
+) -> tuple[list[Path], dict[str, Any] | None]:
+    if dynamic_opd_rollout is None:
+        return [], None
+    if not args.dynamic_opd_require_all_tasks:
+        return [dynamic_opd_rollout], {
+            "enabled": False,
+            "used": True,
+            "rollout": str(dynamic_opd_rollout),
+        }
+
+    summary_path = dynamic_opd_rollout.with_suffix(".summary.json")
+    if not summary_path.exists():
+        raise FileNotFoundError(
+            "Dynamic OPD require-all-tasks needs the builder summary before update: "
+            f"{summary_path}"
+        )
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    selected_counts = {
+        str(task): int(count)
+        for task, count in (summary.get("selected_task_counts") or {}).items()
+    }
+    required_tasks = _parse_dynamic_opd_tasks(args.dynamic_opd_tasks)
+    missing_tasks = [task for task in required_tasks if int(selected_counts.get(task, 0)) <= 0]
+    info = {
+        "enabled": True,
+        "used": not missing_tasks,
+        "rollout": str(dynamic_opd_rollout),
+        "summary_path": str(summary_path),
+        "required_tasks": required_tasks,
+        "selected_task_counts": selected_counts,
+        "missing_tasks": missing_tasks,
+    }
+    if missing_tasks:
+        print(
+            "[dynamic-opd] require-all-tasks skipped this iteration before update: "
+            f"missing={missing_tasks} selected_counts={selected_counts}",
+            flush=True,
+        )
+        return [], info
+    print(
+        "[dynamic-opd] require-all-tasks passed: "
+        f"required={required_tasks} selected_counts={selected_counts}",
+        flush=True,
+    )
+    return [dynamic_opd_rollout], info
+
+
+def _parse_dynamic_opd_tasks(raw: str) -> list[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
 
 
 def _run_timed(label: str, cmd: list[str]) -> float:
@@ -803,6 +907,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pairwise-pairs-per-row", type=int, default=0)
     parser.add_argument("--min-grad-norm-for-step", type=float, default=0.0)
     parser.add_argument("--max-coefficient-delta-from-init", type=float, default=None)
+    parser.add_argument("--max-coefficient-delta-from-init-by-expert", action="append", default=[])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--device-map", default=None)
     parser.add_argument("--max-memory", action="append", default=[])
@@ -810,17 +915,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument(
         "--gate-parameterization",
-        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        choices=["global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"],
         default="global",
     )
     parser.add_argument("--init-gate-checkpoint", default=None)
     parser.add_argument("--max-gated-modules", type=int, default=None)
     parser.add_argument("--task-weight", action="append", default=[])
     parser.add_argument("--frontier-task-quota", action="append", default=[])
+    parser.add_argument("--ignore-config-frontier-task-quota", action="store_true")
+    parser.add_argument("--sample-frontier-before-limit", action="store_true")
     parser.add_argument("--max-frontier-rows-per-task", type=int, default=None)
     parser.add_argument("--use-retention", action="store_true")
     parser.add_argument("--max-retention-rows", type=int, default=None)
     parser.add_argument("--max-retention-rows-per-task", type=int, default=None)
+    parser.add_argument("--sample-retention-before-limit", action="store_true")
+    parser.add_argument("--retention-shuffle-seed", type=int, default=None)
     parser.add_argument("--retention-loss-weight", type=float, default=None)
     parser.add_argument("--retention-objective", choices=["kl", "nll"], default="kl")
     parser.add_argument("--retention-positive-reward-threshold", type=float, default=1.0)
@@ -849,6 +958,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamic-opd-per-task", type=int, default=32)
     parser.add_argument("--dynamic-opd-quota", action="append", default=[])
     parser.add_argument("--dynamic-opd-seed-offset", type=int, default=7919)
+    parser.add_argument(
+        "--dynamic-opd-require-all-tasks",
+        action="store_true",
+        default=False,
+        help=(
+            "When dynamic OPD is enabled, pass its rows to update only if every "
+            "task listed in --dynamic-opd-tasks has at least one selected OPD row."
+        ),
+    )
     parser.add_argument("--use-opd-all-success", action="store_true")
     parser.add_argument("--opd-all-success-loss-weight", type=float, default=0.0)
     parser.add_argument("--max-opd-all-success-rows", type=int, default=None)
@@ -904,6 +1022,18 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Optional task allowlist for PCGrad. Repeat for multiple tasks.",
     )
+    parser.add_argument(
+        "--tool-nullspace-gate-gradients",
+        action="store_true",
+        default=False,
+        help="Enable Tool behavior-span nullspace projection for gate gradients before optimizer.step().",
+    )
+    parser.add_argument("--tool-nullspace-replay-rollout", action="append", default=[])
+    parser.add_argument("--tool-nullspace-rows", type=int, default=16)
+    parser.add_argument("--tool-nullspace-min-rows", type=int, default=1)
+    parser.add_argument("--tool-nullspace-rank", type=int, default=0)
+    parser.add_argument("--tool-nullspace-eps", type=float, default=1.0e-6)
+    parser.add_argument("--tool-nullspace-positive-reward-threshold", type=float, default=1.0)
     parser.add_argument("--train-coefficient", action="append", default=[])
     parser.add_argument("--tool-min-margin-over-memory", type=float, default=0.0)
     parser.add_argument("--tool-min-margin-over-code", type=float, default=0.0)
@@ -911,6 +1041,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--behavior-span-reward-weight", type=float, default=None)
     parser.add_argument("--progress-every", type=int, default=4)
     parser.add_argument("--post-bake-sleep-seconds", type=float, default=0.0)
+    parser.add_argument("--coefficient-bound-by-expert", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 

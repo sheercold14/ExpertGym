@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -66,6 +67,9 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         raw_rows.extend(read_jsonl(rollout_path))
     for rollout_path in args.opd_distill_rollout or []:
         opd_rows.extend(read_jsonl(rollout_path))
+    tool_nullspace_replay_rows = []
+    for rollout_path in args.tool_nullspace_replay_rollout or []:
+        tool_nullspace_replay_rows.extend(read_jsonl(rollout_path))
     for row in raw_rows:
         if args.recompute_frontier:
             queue, row = classify_rollout_row(
@@ -87,12 +91,17 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
     raw_frontier_task_counts = _task_counts(rows)
     rows = _limit_frontier_rows(
         rows,
-        task_quota=_merged_task_quota(config, args.frontier_task_quota),
+        task_quota=_merged_task_quota(
+            config,
+            args.frontier_task_quota,
+            ignore_config=bool(args.ignore_config_frontier_task_quota),
+        ),
         max_per_task=(
             args.max_frontier_rows_per_task
             if args.max_frontier_rows_per_task is not None
             else config.get("calibration", {}).get("max_frontier_rows_per_task")
         ),
+        sample_seed=_frontier_shuffle_seed(args) if args.sample_frontier_before_limit else None,
     )
     rows = _order_frontier_rows(
         rows,
@@ -101,9 +110,17 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
     )
     frontier_task_counts = _task_counts(rows)
     if args.max_retention_rows_per_task is not None:
-        retention_rows = _limit_rows_per_task(retention_rows, int(args.max_retention_rows_per_task))
+        retention_rows = _limit_rows_per_task(
+            retention_rows,
+            int(args.max_retention_rows_per_task),
+            sample_seed=_retention_shuffle_seed(args) if args.sample_retention_before_limit else None,
+        )
     if args.max_retention_rows is not None:
-        retention_rows = retention_rows[: args.max_retention_rows]
+        retention_rows = _limit_rows(
+            retention_rows,
+            int(args.max_retention_rows),
+            sample_seed=_retention_shuffle_seed(args) if args.sample_retention_before_limit else None,
+        )
     if args.max_opd_distill_rows is not None:
         opd_rows = opd_rows[: args.max_opd_distill_rows]
     if args.max_opd_all_success_rows is not None:
@@ -208,8 +225,8 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         fallback=bool(args.length_normalize_logprob),
     )
     train_coefficients = _parse_train_coefficients(args.train_coefficient)
-    if train_coefficients and gate_parameterization not in {"global", "layer-band"}:
-        raise SystemExit("--train-coefficient only applies to --gate-parameterization global or layer-band; parameterized modes train every mergeable task-vector coefficient")
+    if train_coefficients and gate_parameterization not in {"global", "layer-band", "layer-band-coefficient", "layer-band-parameter"}:
+        raise SystemExit("--train-coefficient only applies to --gate-parameterization global, layer-band, layer-band-coefficient, or layer-band-parameter; parameterized modes train every mergeable task-vector coefficient")
     advantage_task_scales = _advantage_task_scales(
         rows,
         config,
@@ -296,6 +313,19 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             prior_weight=prior_weight,
             opd_length_normalize=opd_length_normalize,
             retention_length_normalize=retention_length_normalize,
+        )
+    if args.tool_nullspace_gate_gradients:
+        update_batcher.tool_nullspace_project_fn = lambda: _project_gate_grads_with_tool_nullspace(
+            torch=torch,
+            model=model,
+            tokenizer=tokenizer,
+            gate_manager=gate_manager,
+            optimizer=optimizer,
+            retention_rows=retention_rows,
+            replay_rows=tool_nullspace_replay_rows,
+            args=args,
+            device=device,
+            max_logprob_tokens=int(args.max_logprob_tokens),
         )
     log_rows = []
     epoch_summaries = []
@@ -870,14 +900,20 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
         "frontier_order": {
             "order": str(args.frontier_order),
             "seed": _frontier_shuffle_seed(args),
+            "sample_before_limit": bool(args.sample_frontier_before_limit),
         },
         "retention_rows": len(retention_rows),
+        "retention_sampling": {
+            "sample_before_limit": bool(args.sample_retention_before_limit),
+            "seed": _retention_shuffle_seed(args),
+        },
         "opd_distill_rows": len(opd_rows),
         "opd_distill_task_counts": _task_counts(opd_rows),
         "opd_scale_plan": opd_scale_plan,
         "retention_scale_plan": retention_scale_plan,
         "opd_all_success_rows": len(opd_all_success_rows),
         "opd_all_success_task_counts": _task_counts(opd_all_success_rows),
+        "tool_nullspace_replay_rows": len(tool_nullspace_replay_rows),
         "updates": len(log_rows),
         "optimizer_steps": update_batcher.optimizer_steps,
         "skipped_optimizer_steps": update_batcher.skipped_optimizer_steps,
@@ -910,6 +946,10 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "loss_normalizer": update_batcher.loss_normalizer,
             "loss_granularity": str(args.loss_granularity),
             "max_coefficient_delta_from_init": args.max_coefficient_delta_from_init,
+            "max_coefficient_delta_from_init_by_expert": _parse_expert_float_items(
+                args.max_coefficient_delta_from_init_by_expert
+            ),
+            "coefficient_bound_by_expert": _parse_expert_bounds_items(args.coefficient_bound_by_expert),
             "early_stop_grad_norm": args.early_stop_grad_norm,
             "early_stop_gate_delta": args.early_stop_gate_delta,
             "early_stop_patience": args.early_stop_patience,
@@ -966,6 +1006,21 @@ def update_gates(config: dict, args: argparse.Namespace) -> dict:
             "eps": float(args.pcgrad_eps),
             "tasks": list(args.pcgrad_task or []),
             "conflict_count_max": max((int(item.get("pcgrad_conflict_count", 0)) for item in pcgrad_rows), default=0),
+        }
+    if args.tool_nullspace_gate_gradients:
+        nullspace_rows = [item for item in log_rows if item.get("tool_nullspace_enabled")]
+        summary["tool_nullspace"] = {
+            "enabled": True,
+            "rows_requested": int(args.tool_nullspace_rows),
+            "min_rows": int(args.tool_nullspace_min_rows),
+            "rank_max": int(args.tool_nullspace_rank),
+            "eps": float(args.tool_nullspace_eps),
+            "replay_rows": len(tool_nullspace_replay_rows),
+            "rank_max_observed": max((int(item.get("tool_nullspace_rank", 0)) for item in nullspace_rows), default=0),
+            "removed_fraction_max": max(
+                (float(item.get("tool_nullspace_removed_fraction", 0.0)) for item in nullspace_rows),
+                default=0.0,
+            ),
         }
     write_json(output.with_suffix(".summary.json"), summary)
     write_json(output.with_suffix(".gates.json"), {"gates": summary["final_gates"]})
@@ -1306,6 +1361,20 @@ def _token_logprob_payload_from_details(details: dict | None) -> dict | None:
 def _normalize_gate_parameterization(value: str) -> str:
     aliases = {
         "layer_band": "layer-band",
+        "layer_band_coefficient": "layer-band-coefficient",
+        "layer-band-coefficients": "layer-band-coefficient",
+        "layer_band_coefficients": "layer-band-coefficient",
+        "layer-band-direct": "layer-band-coefficient",
+        "layer_band_direct": "layer-band-coefficient",
+        "layer_band_parameter": "layer-band-parameter",
+        "layer-band-param": "layer-band-parameter",
+        "layer_band_param": "layer-band-parameter",
+        "layer-band-residual": "layer-band-parameter",
+        "layer_band_residual": "layer-band-parameter",
+        "layer-band-hierarchical": "layer-band-parameter",
+        "layer_band_hierarchical": "layer-band-parameter",
+        "hierarchical-layer-band": "layer-band-parameter",
+        "hierarchical_layer_band": "layer-band-parameter",
         "param": "parameter",
         "param-coefficients": "parameter",
         "parameter-coefficients": "parameter",
@@ -1412,6 +1481,7 @@ class _UpdateBatcher:
         self.optimizer_steps = 0
         self.skipped_optimizer_steps = 0
         self.pcgrad_recompute_fn = None
+        self.tool_nullspace_project_fn = None
         self.optimizer.zero_grad(set_to_none=True)
 
     @property
@@ -1443,6 +1513,11 @@ class _UpdateBatcher:
             if self.pcgrad_recompute_fn is None:
                 raise RuntimeError("PCGrad requested but no gate-gradient recompute function was installed")
             pcgrad_stats = self.pcgrad_recompute_fn()
+        tool_nullspace_stats = None
+        if bool(getattr(self.args, "tool_nullspace_gate_gradients", False)):
+            if self.tool_nullspace_project_fn is None:
+                raise RuntimeError("Tool nullspace requested but no projection function was installed")
+            tool_nullspace_stats = self.tool_nullspace_project_fn()
         grad_norm = self.torch.nn.utils.clip_grad_norm_(self.gate_manager.parameters(), self.grad_clip_norm)
         grad_norm_value = float(grad_norm.detach().cpu().item())
         skipped_step = grad_norm_value <= self.min_grad_norm_for_step
@@ -1476,6 +1551,17 @@ class _UpdateBatcher:
                 log_rows[index]["pcgrad_regularizer_grad_norm"] = pcgrad_stats["regularizer_grad_norm"]
                 log_rows[index]["pcgrad_pre_cosines"] = pcgrad_stats["pre_cosines"]
                 log_rows[index]["pcgrad_post_cosines"] = pcgrad_stats["post_cosines"]
+            if tool_nullspace_stats is not None:
+                log_rows[index]["tool_nullspace_enabled"] = True
+                log_rows[index]["tool_nullspace_rows"] = tool_nullspace_stats["rows"]
+                log_rows[index]["tool_nullspace_source_counts"] = tool_nullspace_stats["source_counts"]
+                log_rows[index]["tool_nullspace_rank"] = tool_nullspace_stats["rank"]
+                log_rows[index]["tool_nullspace_singular_values"] = tool_nullspace_stats["singular_values"]
+                log_rows[index]["tool_nullspace_grad_norm_before"] = tool_nullspace_stats["grad_norm_before"]
+                log_rows[index]["tool_nullspace_grad_norm_after"] = tool_nullspace_stats["grad_norm_after"]
+                log_rows[index]["tool_nullspace_removed_norm"] = tool_nullspace_stats["removed_norm"]
+                log_rows[index]["tool_nullspace_removed_fraction"] = tool_nullspace_stats["removed_fraction"]
+                log_rows[index]["tool_nullspace_span_tokens"] = tool_nullspace_stats["span_tokens"]
         self.pending_log_indices.clear()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1699,6 +1785,271 @@ def _replace_gate_grads_with_pcgrad(
     )
     _write_flat_grad_to_gate_params_(final_grad, params)
     return stats
+
+
+def _project_gate_grads_with_tool_nullspace(
+    *,
+    torch,
+    model,
+    tokenizer,
+    gate_manager,
+    optimizer,
+    retention_rows: list[dict],
+    replay_rows: list[dict],
+    args: argparse.Namespace,
+    device,
+    max_logprob_tokens: int,
+) -> dict:
+    """Project the accumulated gate gradient away from protected Tool behavior spans."""
+
+    params = _gate_params(gate_manager)
+    total_grad = _flatten_current_gate_grads(params)
+    selected = _select_tool_nullspace_examples(
+        retention_rows=retention_rows,
+        replay_rows=replay_rows,
+        max_rows=int(args.tool_nullspace_rows),
+        positive_threshold=float(args.tool_nullspace_positive_reward_threshold),
+    )
+    source_counts = dict(Counter(item["source"] for item in selected))
+    span_tokens = 0
+    basis_grads = []
+    for item in selected:
+        optimizer.zero_grad(set_to_none=True)
+        stats = _backward_tool_behavior_span_nll(
+            torch,
+            model,
+            tokenizer,
+            prompt_text=item["prompt_text"],
+            sample=item["sample"],
+            device=device,
+            max_logprob_tokens=max_logprob_tokens,
+        )
+        if int(stats["processed"]) <= 0:
+            continue
+        span_tokens += int(stats["span_tokens"])
+        basis_grads.append(_flatten_current_gate_grads(params))
+    optimizer.zero_grad(set_to_none=True)
+    if len(basis_grads) < int(args.tool_nullspace_min_rows):
+        _write_flat_grad_to_gate_params_(total_grad, params)
+        before_norm = _flat_norm(torch, total_grad)
+        return {
+            "rows": len(basis_grads),
+            "source_counts": source_counts,
+            "rank": 0,
+            "singular_values": [],
+            "grad_norm_before": before_norm,
+            "grad_norm_after": before_norm,
+            "removed_norm": 0.0,
+            "removed_fraction": 0.0,
+            "span_tokens": span_tokens,
+        }
+    projected, stats = _project_flat_grad_away_from_basis_grads(
+        torch,
+        total_grad,
+        basis_grads,
+        eps=float(args.tool_nullspace_eps),
+        max_rank=int(args.tool_nullspace_rank),
+    )
+    _write_flat_grad_to_gate_params_(projected, params)
+    return {
+        "rows": len(basis_grads),
+        "source_counts": source_counts,
+        "rank": int(stats["rank"]),
+        "singular_values": stats["singular_values"],
+        "grad_norm_before": stats["grad_norm_before"],
+        "grad_norm_after": stats["grad_norm_after"],
+        "removed_norm": stats["removed_norm"],
+        "removed_fraction": stats["removed_fraction"],
+        "span_tokens": span_tokens,
+    }
+
+
+def _select_tool_nullspace_examples(
+    *,
+    retention_rows: list[dict],
+    replay_rows: list[dict],
+    max_rows: int,
+    positive_threshold: float,
+) -> list[dict]:
+    selected: list[dict] = []
+    seen_prompt_ids: set[str] = set()
+    for source, rows in (("current_retention", retention_rows), ("replay", replay_rows)):
+        for row in sorted(rows, key=lambda item: str(item.get("prompt_id") or "")):
+            if str(row.get("task") or "") != "tool":
+                continue
+            prompt_id = str(row.get("prompt_id") or "")
+            if prompt_id in seen_prompt_ids:
+                continue
+            sample = _best_positive_tool_sample(row, positive_threshold=positive_threshold)
+            if sample is None:
+                continue
+            prompt_text = row.get("rendered_prompt") or row.get("prompt") or ""
+            if not prompt_text:
+                continue
+            selected.append(
+                {
+                    "source": source,
+                    "prompt_id": prompt_id,
+                    "prompt_text": prompt_text,
+                    "sample": sample,
+                }
+            )
+            seen_prompt_ids.add(prompt_id)
+            if len(selected) >= int(max_rows):
+                return selected
+    return selected
+
+
+def _best_positive_tool_sample(row: dict, *, positive_threshold: float) -> dict | None:
+    positives = []
+    for sample in _objective_samples(row.get("samples", []), require_old_logprob=False):
+        if _sample_train_reward(sample, task="tool") < float(positive_threshold):
+            continue
+        if not str(sample.get("text") or "").strip():
+            continue
+        positives.append(sample)
+    if not positives:
+        return None
+    positives.sort(
+        key=lambda sample: (
+            -float(_sample_train_reward(sample, task="tool")),
+            int(sample.get("length", 0) or len(str(sample.get("text") or "").split())),
+            str(sample.get("sample_id") or ""),
+        )
+    )
+    return positives[0]
+
+
+def _backward_tool_behavior_span_nll(
+    torch,
+    model,
+    tokenizer,
+    *,
+    prompt_text: str,
+    sample: dict,
+    device,
+    max_logprob_tokens: int,
+) -> dict[str, int]:
+    response_text = str(sample.get("text") or "")
+    details = response_logprob_tensor_details_from_text(
+        torch,
+        model,
+        tokenizer,
+        prompt_text=prompt_text,
+        response_text=response_text,
+        device=device,
+        max_length=max_logprob_tokens,
+    )
+    if details is None:
+        return {"processed": 0, "span_tokens": 0}
+    logprobs = details["logprobs"].float()
+    mask_values = _tool_behavior_span_token_mask(
+        tokenizer,
+        response_text=response_text,
+        token_count=int(logprobs.numel()),
+    )
+    if not mask_values:
+        return {"processed": 0, "span_tokens": 0}
+    mask = torch.tensor(mask_values, dtype=logprobs.dtype, device=logprobs.device)
+    denom = mask.sum()
+    if float(denom.detach().cpu().item()) <= 0.0:
+        return {"processed": 0, "span_tokens": 0}
+    loss = -((logprobs * mask).sum() / denom)
+    loss.backward()
+    return {"processed": 1, "span_tokens": int(float(denom.detach().cpu().item()))}
+
+
+def _tool_behavior_span_token_mask(tokenizer, *, response_text: str, token_count: int) -> list[int]:
+    if token_count <= 0:
+        return []
+    spans = _tool_behavior_char_spans(response_text)
+    if not spans:
+        return [1 for _ in range(token_count)]
+    try:
+        encoded = tokenizer(
+            response_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offsets = list(encoded.get("offset_mapping") or [])
+    except Exception:
+        return [1 for _ in range(token_count)]
+    if len(offsets) != int(token_count):
+        return [1 for _ in range(token_count)]
+    mask = []
+    for start, end in offsets:
+        token_start = int(start)
+        token_end = int(end)
+        keep = any(token_start < span_end and token_end > span_start for span_start, span_end in spans)
+        mask.append(1 if keep else 0)
+    if not any(mask):
+        return [1 for _ in range(token_count)]
+    return mask
+
+
+def _tool_behavior_char_spans(text: str) -> list[tuple[int, int]]:
+    response = str(text or "")
+    spans = [(match.start(), match.end()) for match in re.finditer(r"<tool_call>.*?</tool_call>", response, flags=re.S)]
+    if spans:
+        return spans
+    stripped = response.strip()
+    if stripped.startswith("[") and "]" in stripped:
+        start = response.find("[")
+        end = response.rfind("]")
+        if end > start:
+            return [(start, end + 1)]
+    match = re.search(r"[A-Za-z_][A-Za-z0-9_.]*\s*\(", response)
+    if match:
+        return [(match.start(), len(response))]
+    return []
+
+
+def _project_flat_grad_away_from_basis_grads(torch, total_grad, basis_grads: list, *, eps: float, max_rank: int = 0):
+    matrix = torch.stack([grad.detach().to(device=total_grad.device).float() for grad in basis_grads], dim=0)
+    total = total_grad.detach().to(device=matrix.device).float()
+    if matrix.numel() == 0:
+        return total_grad, {
+            "rank": 0,
+            "singular_values": [],
+            "grad_norm_before": _flat_norm(torch, total_grad),
+            "grad_norm_after": _flat_norm(torch, total_grad),
+            "removed_norm": 0.0,
+            "removed_fraction": 0.0,
+        }
+    _u, singular_values, vh = torch.linalg.svd(matrix, full_matrices=False)
+    if int(max_rank) > 0:
+        rank = min(int(max_rank), int(vh.shape[0]))
+    else:
+        threshold = float(eps) * max(1.0, float(singular_values[0].detach().cpu().item()))
+        rank = int((singular_values > threshold).sum().detach().cpu().item())
+    rank = max(0, min(rank, int(vh.shape[0])))
+    if rank <= 0:
+        return total_grad, {
+            "rank": 0,
+            "singular_values": [float(value) for value in singular_values.detach().cpu().tolist()],
+            "grad_norm_before": _flat_norm(torch, total_grad),
+            "grad_norm_after": _flat_norm(torch, total_grad),
+            "removed_norm": 0.0,
+            "removed_fraction": 0.0,
+        }
+    basis = vh[:rank]
+    removed = basis.transpose(0, 1).matmul(basis.matmul(total))
+    projected = (total - removed).to(dtype=total_grad.dtype)
+    before = _flat_norm(torch, total_grad)
+    after = _flat_norm(torch, projected)
+    removed_norm = _flat_norm(torch, removed)
+    return projected, {
+        "rank": int(rank),
+        "singular_values": [float(value) for value in singular_values.detach().cpu().tolist()],
+        "grad_norm_before": before,
+        "grad_norm_after": after,
+        "removed_norm": removed_norm,
+        "removed_fraction": float(removed_norm / before) if before > 0.0 else 0.0,
+    }
+
+
+def _flat_norm(torch, vector) -> float:
+    return float(torch.linalg.vector_norm(vector.detach().float()).detach().cpu().item())
 
 
 def _observed_pcgrad_tasks(*row_sets: list[dict]) -> set[str]:
@@ -2267,6 +2618,26 @@ def parse_args() -> argparse.Namespace:
         help="Optional task allowlist for PCGrad, e.g. --pcgrad-task tool --pcgrad-task memory --pcgrad-task code. If empty, use all observed tasks.",
     )
     parser.add_argument(
+        "--tool-nullspace-gate-gradients",
+        action="store_true",
+        default=False,
+        help=(
+            "Project the accumulated gate gradient away from a Tool behavior-span gradient "
+            "subspace before gradient clipping and optimizer.step(). Default off."
+        ),
+    )
+    parser.add_argument(
+        "--tool-nullspace-replay-rollout",
+        action="append",
+        default=[],
+        help="Tool rollout JSONL used to fill the protected behavior-span bank when current all-success rows are insufficient.",
+    )
+    parser.add_argument("--tool-nullspace-rows", type=int, default=16)
+    parser.add_argument("--tool-nullspace-min-rows", type=int, default=1)
+    parser.add_argument("--tool-nullspace-rank", type=int, default=0, help="Maximum protected rank. 0 means use all numerical ranks.")
+    parser.add_argument("--tool-nullspace-eps", type=float, default=1.0e-6)
+    parser.add_argument("--tool-nullspace-positive-reward-threshold", type=float, default=1.0)
+    parser.add_argument(
         "--loss-granularity",
         choices=["sequence", "token"],
         default="sequence",
@@ -2305,6 +2676,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Hard per-parameter bound on how far trainable coefficients may move from their initialization.",
     )
+    parser.add_argument(
+        "--max-coefficient-delta-from-init-by-expert",
+        action="append",
+        default=[],
+        help="Optional expert-specific trust region, e.g. reasoning=0.002. Overrides the global delta for that expert.",
+    )
+    parser.add_argument(
+        "--coefficient-bound-by-expert",
+        action="append",
+        default=[],
+        help=(
+            "Optional absolute effective coefficient bound, e.g. reasoning=0.0:0.003. "
+            "Applied after optimizer.step(); default empty preserves the existing path."
+        ),
+    )
     parser.add_argument("--use-retention", action="store_true")
     parser.add_argument("--max-retention-rows", type=int, default=None)
     parser.add_argument("--max-retention-rows-per-task", type=int, default=None)
@@ -2338,6 +2724,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=1)
     parser.add_argument("--task-weight", action="append", default=[], help="Per-task loss weight, e.g. memory=2.0. Repeatable.")
     parser.add_argument("--frontier-task-quota", action="append", default=[], help="Max kept frontier rows per task, e.g. memory=64. Repeatable.")
+    parser.add_argument(
+        "--ignore-config-frontier-task-quota",
+        action="store_true",
+        help="Ignore calibration.frontier_task_quota from config; no CLI quotas then means use all frontier rows.",
+    )
     parser.add_argument("--max-frontier-rows-per-task", type=int, default=None, help="Shared cap for kept frontier rows per task.")
     parser.add_argument(
         "--frontier-order",
@@ -2354,6 +2745,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Seed for --frontier-order shuffle modes. Default 0 for standalone updater calls.",
+    )
+    parser.add_argument(
+        "--sample-frontier-before-limit",
+        action="store_true",
+        help="Randomly sample frontier rows before applying per-task frontier quotas.",
+    )
+    parser.add_argument(
+        "--sample-retention-before-limit",
+        action="store_true",
+        help="Randomly sample retention rows before applying retention row caps.",
+    )
+    parser.add_argument(
+        "--retention-shuffle-seed",
+        type=int,
+        default=None,
+        help="Seed for --sample-retention-before-limit. Defaults to --frontier-shuffle-seed when omitted.",
     )
     parser.add_argument("--category-weight", action="append", default=[], help="Per-category loss weight, e.g. tool:live_parallel=2.0. Repeatable.")
     parser.add_argument("--source-weight", action="append", default=[], help="Per-row-source loss weight, e.g. bfcl_success_anchor_frontier=0.2. Repeatable.")
@@ -2537,7 +2944,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument(
         "--gate-parameterization",
-        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        choices=["global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"],
         default="global",
     )
     parser.add_argument("--init-gate-checkpoint", default=None)
@@ -2558,6 +2965,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--update-batch-size must be >= 1")
     if args.pcgrad_gate_gradients and args.optimizer_step_scope != "epoch":
         parser.error("--pcgrad-gate-gradients currently requires --optimizer-step-scope epoch")
+    if int(args.tool_nullspace_rows) < 1:
+        parser.error("--tool-nullspace-rows must be >= 1")
+    if int(args.tool_nullspace_min_rows) < 1:
+        parser.error("--tool-nullspace-min-rows must be >= 1")
+    if int(args.tool_nullspace_rank) < 0:
+        parser.error("--tool-nullspace-rank must be >= 0")
     return args
 
 
@@ -2581,17 +2994,52 @@ def _parse_task_quota(items: list[str]) -> dict[str, int]:
     return quotas
 
 
+def _parse_expert_float_items(items: list[str] | None) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for item in items or []:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(f"Invalid expert float value: {part}")
+            expert, value = part.split("=", 1)
+            values[expert.strip()] = float(value)
+    return values
+
+
+def _parse_expert_bounds_items(items: list[str] | None) -> dict[str, tuple[float | None, float | None]]:
+    bounds: dict[str, tuple[float | None, float | None]] = {}
+    for item in items or []:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part or ":" not in part:
+                raise ValueError(f"Invalid expert coefficient bound: {part}; expected expert=min:max")
+            expert, value = part.split("=", 1)
+            lo_text, hi_text = value.split(":", 1)
+            lower = float(lo_text) if lo_text.strip() else None
+            upper = float(hi_text) if hi_text.strip() else None
+            if lower is not None and upper is not None and lower > upper:
+                raise ValueError(f"Invalid expert coefficient bound: {part}; lower > upper")
+            bounds[expert.strip()] = (lower, upper)
+    return bounds
+
+
 def _merged_float_mapping(config_values: dict | None, cli_items: list[str]) -> dict[str, float]:
     values = {str(key): float(value) for key, value in dict(config_values or {}).items()}
     values.update(_parse_task_weights(cli_items))
     return values
 
 
-def _merged_task_quota(config: dict, cli_items: list[str]) -> dict[str, int]:
-    values = {
-        str(key): int(value)
-        for key, value in dict(config.get("calibration", {}).get("frontier_task_quota", {}) or {}).items()
-    }
+def _merged_task_quota(config: dict, cli_items: list[str], *, ignore_config: bool = False) -> dict[str, int]:
+    values = {}
+    if not ignore_config:
+        values = {
+            str(key): int(value)
+            for key, value in dict(config.get("calibration", {}).get("frontier_task_quota", {}) or {}).items()
+        }
     values.update(_parse_task_quota(cli_items))
     return values
 
@@ -2893,6 +3341,7 @@ def _limit_frontier_rows(
     *,
     task_quota: dict[str, int],
     max_per_task: int | None,
+    sample_seed: int | None = None,
 ) -> list[dict]:
     if not task_quota and max_per_task is None:
         return rows
@@ -2900,20 +3349,35 @@ def _limit_frontier_rows(
     for row in rows:
         grouped[str(row.get("task"))].append(row)
     selected_by_task: dict[str, set[int]] = {}
+    rng = random.Random(int(sample_seed)) if sample_seed is not None else None
     for task, task_rows in grouped.items():
         limit = task_quota.get(task)
         if max_per_task is not None:
             limit = min(int(max_per_task), int(limit)) if limit is not None else int(max_per_task)
         if limit is None or limit < 0:
             selected_by_task[task] = {id(row) for row in task_rows}
+        elif rng is not None and int(limit) < len(task_rows):
+            selected_by_task[task] = {id(row) for row in rng.sample(task_rows, int(limit))}
         else:
             selected_by_task[task] = {id(row) for row in task_rows[: int(limit)]}
     return [row for row in rows if id(row) in selected_by_task.get(str(row.get("task")), set())]
 
 
-def _limit_rows_per_task(rows: list[dict], max_per_task: int) -> list[dict]:
+def _limit_rows_per_task(rows: list[dict], max_per_task: int, *, sample_seed: int | None = None) -> list[dict]:
     if max_per_task < 0:
         return rows
+    if sample_seed is not None:
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for row in rows:
+            grouped[str(row.get("task"))].append(row)
+        rng = random.Random(int(sample_seed))
+        selected_ids: set[int] = set()
+        for task_rows in grouped.values():
+            if max_per_task < len(task_rows):
+                selected_ids.update(id(row) for row in rng.sample(task_rows, max_per_task))
+            else:
+                selected_ids.update(id(row) for row in task_rows)
+        return [row for row in rows if id(row) in selected_ids]
     counts: Counter[str] = Counter()
     selected = []
     for row in rows:
@@ -2925,8 +3389,25 @@ def _limit_rows_per_task(rows: list[dict], max_per_task: int) -> list[dict]:
     return selected
 
 
+def _limit_rows(rows: list[dict], max_rows: int, *, sample_seed: int | None = None) -> list[dict]:
+    if max_rows < 0 or len(rows) <= max_rows:
+        return rows
+    if sample_seed is None:
+        return rows[:max_rows]
+    rng = random.Random(int(sample_seed))
+    selected_ids = {id(row) for row in rng.sample(rows, max_rows)}
+    return [row for row in rows if id(row) in selected_ids]
+
+
 def _frontier_shuffle_seed(args: argparse.Namespace) -> int:
     value = getattr(args, "frontier_shuffle_seed", None)
+    return 0 if value is None else int(value)
+
+
+def _retention_shuffle_seed(args: argparse.Namespace) -> int:
+    value = getattr(args, "retention_shuffle_seed", None)
+    if value is None:
+        value = getattr(args, "frontier_shuffle_seed", None)
     return 0 if value is None else int(value)
 
 
@@ -3078,7 +3559,6 @@ def _sample_train_reward(sample: dict, *, task: str | None = None) -> float:
 
 def _parse_train_coefficients(items: list[str]) -> set[str]:
     coefficients: set[str] = set()
-    valid_experts = {"tool", "memory", "code", "*"}
     for item in items:
         for part in item.split(","):
             value = part.strip()
@@ -3087,7 +3567,7 @@ def _parse_train_coefficients(items: list[str]) -> set[str]:
             if "." not in value:
                 raise ValueError(f"Invalid --train-coefficient value: {value}")
             band, expert = value.split(".", 1)
-            if expert not in valid_experts:
+            if not expert or (expert != "*" and not expert.replace("_", "").replace("-", "").isalnum()):
                 raise ValueError(f"Invalid expert in --train-coefficient value: {value}")
             coefficients.add(f"{band}.{expert}")
     return coefficients
@@ -3096,7 +3576,12 @@ def _parse_train_coefficients(items: list[str]) -> set[str]:
 def _project_after_optimizer_step_(torch, gate_manager, train_coefficients: set[str], anchor_gate_values: dict[str, float], args: argparse.Namespace) -> None:
     gate_manager.project_()
     _project_trainable_coefficients_(torch, gate_manager, train_coefficients, anchor_gate_values)
-    _project_max_delta_from_initial_(torch, gate_manager, args.max_coefficient_delta_from_init)
+    _project_max_delta_from_initial_(
+        torch,
+        gate_manager,
+        args.max_coefficient_delta_from_init,
+        max_delta_by_expert=_parse_expert_float_items(args.max_coefficient_delta_from_init_by_expert),
+    )
     _project_tool_margin_constraints_(
         torch,
         gate_manager,
@@ -3105,6 +3590,11 @@ def _project_after_optimizer_step_(torch, gate_manager, train_coefficients: set[
         max_delta=args.max_coefficient_delta_from_init,
         tool_min_margin_over_memory=float(args.tool_min_margin_over_memory),
         tool_min_margin_over_code=float(args.tool_min_margin_over_code),
+    )
+    _project_effective_coefficient_bounds_(
+        torch,
+        gate_manager,
+        _parse_expert_bounds_items(args.coefficient_bound_by_expert),
     )
 
 
@@ -3552,10 +4042,10 @@ def _project_trainable_coefficients_(torch, gate_manager, train_coefficients: se
             and callable(getattr(gate_manager, "expert_coefficients", None))
         ):
             raise ValueError("coefficient projection requires a global or layer-band gate manager")
-        experts = ("tool", "memory", "code")
+        experts = tuple(getattr(gate_manager, "expert_names", ("tool", "memory", "code")))
         with torch.no_grad():
             current = gate_manager.expert_coefficients()
-            anchor = _anchor_expert_coefficients(anchor_gate_values, "global")
+            anchor = _anchor_expert_coefficients(anchor_gate_values, "global", experts)
             coeffs = []
             for expert in experts:
                 if _coefficient_is_trainable(train_coefficients, "global", expert):
@@ -3574,11 +4064,63 @@ def _project_trainable_coefficients_(torch, gate_manager, train_coefficients: se
             gate_manager.raw_residual.copy_(coeff_tensor - common)
         gate_manager.project_()
         return
-    experts = ("tool", "memory", "code")
+    experts = tuple(getattr(gate_manager, "expert_names", ("tool", "memory", "code")))
+    if hasattr(gate_manager, "raw_global_coefficients") and hasattr(gate_manager, "raw_residual_coefficients"):
+        with torch.no_grad():
+            current_global = gate_manager.raw_global_coefficients
+            current_effective = gate_manager.effective_coefficients()
+            device = current_global.device
+            dtype = current_global.dtype
+            effective_rows = []
+            for band_idx, band in enumerate(band_names):
+                anchor = _anchor_expert_coefficients(anchor_gate_values, band, experts)
+                coeffs = []
+                for expert_idx, expert in enumerate(experts):
+                    if _coefficient_is_trainable(train_coefficients, band, expert):
+                        coeffs.append(current_effective[band_idx, expert_idx].detach().to(device=device, dtype=dtype))
+                    else:
+                        coeffs.append(torch.tensor(anchor[expert], device=device, dtype=dtype))
+                effective_rows.append(torch.stack(coeffs))
+            effective_tensor = torch.stack(effective_rows)
+            global_anchor = _anchor_expert_coefficients(anchor_gate_values, "global", experts)
+            global_coeffs = []
+            for expert_idx, expert in enumerate(experts):
+                if _coefficient_is_trainable(train_coefficients, "global", expert):
+                    global_coeffs.append(current_global[expert_idx].detach().to(device=device, dtype=dtype))
+                else:
+                    global_coeffs.append(torch.tensor(global_anchor[expert], device=device, dtype=dtype))
+            global_tensor = torch.stack(global_coeffs)
+            gate_manager.raw_global_coefficients.copy_(global_tensor)
+            gate_manager.raw_residual_coefficients.copy_(effective_tensor - global_tensor.unsqueeze(0))
+        gate_manager.project_()
+        return
+    if hasattr(gate_manager, "raw_coefficients") and not hasattr(gate_manager, "raw_common"):
+        with torch.no_grad():
+            for band_idx, band in enumerate(band_names):
+                current = gate_manager.expert_coefficients(band=band)
+                anchor = _anchor_expert_coefficients(anchor_gate_values, band, experts)
+                for expert_idx, expert in enumerate(experts):
+                    if _coefficient_is_trainable(train_coefficients, band, expert):
+                        gate_manager.raw_coefficients[band_idx, expert_idx].copy_(
+                            current[expert].detach().to(
+                                device=gate_manager.raw_coefficients.device,
+                                dtype=gate_manager.raw_coefficients.dtype,
+                            )
+                        )
+                    else:
+                        gate_manager.raw_coefficients[band_idx, expert_idx].copy_(
+                            torch.tensor(
+                                anchor[expert],
+                                device=gate_manager.raw_coefficients.device,
+                                dtype=gate_manager.raw_coefficients.dtype,
+                            )
+                        )
+        gate_manager.project_()
+        return
     with torch.no_grad():
         for band_idx, band in enumerate(band_names):
             current = gate_manager.expert_coefficients(band=band)
-            anchor = _anchor_expert_coefficients(anchor_gate_values, band)
+            anchor = _anchor_expert_coefficients(anchor_gate_values, band, experts)
             coeffs = []
             for expert in experts:
                 if _coefficient_is_trainable(train_coefficients, band, expert):
@@ -3598,7 +4140,13 @@ def _project_trainable_coefficients_(torch, gate_manager, train_coefficients: se
     gate_manager.project_()
 
 
-def _project_max_delta_from_initial_(torch, gate_manager, max_delta: float | None) -> None:
+def _project_max_delta_from_initial_(
+    torch,
+    gate_manager,
+    max_delta: float | None,
+    *,
+    max_delta_by_expert: dict[str, float] | None = None,
+) -> None:
     """Hard trust-region projection for all OP-VEC gate parameterizations.
 
     The soft prior keeps updates local on average; this projection is the safety
@@ -3607,11 +4155,24 @@ def _project_max_delta_from_initial_(torch, gate_manager, max_delta: float | Non
     default ``global`` manager as well as parameterized managers.
     """
 
-    if max_delta is None:
+    max_delta_by_expert = dict(max_delta_by_expert or {})
+    if max_delta is None and not max_delta_by_expert:
         return
-    delta = float(max_delta)
-    if delta < 0:
+    if max_delta is not None and float(max_delta) < 0:
         raise ValueError("--max-coefficient-delta-from-init must be non-negative")
+    for expert, value in max_delta_by_expert.items():
+        if float(value) < 0:
+            raise ValueError(f"--max-coefficient-delta-from-init-by-expert for {expert} must be non-negative")
+    experts = tuple(getattr(gate_manager, "expert_names", ("tool", "memory", "code")))
+    fallback_delta = float(max_delta) if max_delta is not None else float("inf")
+
+    def _delta_tensor_like(reference):
+        return torch.tensor(
+            [float(max_delta_by_expert.get(expert, fallback_delta)) for expert in experts],
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
     with torch.no_grad():
         if (
             hasattr(gate_manager, "raw_global_coefficients")
@@ -3619,28 +4180,21 @@ def _project_max_delta_from_initial_(torch, gate_manager, max_delta: float | Non
             and hasattr(gate_manager, "raw_residual_coefficients")
             and hasattr(gate_manager, "initial_residual_coefficients")
         ):
-            gate_manager.raw_global_coefficients.copy_(
-                torch.clamp(
-                    gate_manager.raw_global_coefficients,
-                    min=gate_manager.initial_global_coefficients - delta,
-                    max=gate_manager.initial_global_coefficients + delta,
-                )
-            )
-            gate_manager.raw_residual_coefficients.copy_(
-                torch.clamp(
-                    gate_manager.raw_residual_coefficients,
-                    min=gate_manager.initial_residual_coefficients - delta,
-                    max=gate_manager.initial_residual_coefficients + delta,
-                )
-            )
+            delta_tensor = _delta_tensor_like(gate_manager.raw_global_coefficients)
+            effective = gate_manager.raw_global_coefficients.unsqueeze(0) + gate_manager.raw_residual_coefficients
+            initial_effective = gate_manager.initial_global_coefficients.unsqueeze(0) + gate_manager.initial_residual_coefficients
+            clamped = torch.maximum(torch.minimum(effective, initial_effective + delta_tensor), initial_effective - delta_tensor)
+            new_global = clamped.mean(dim=0)
+            gate_manager.raw_global_coefficients.copy_(new_global)
+            gate_manager.raw_residual_coefficients.copy_(clamped - new_global.unsqueeze(0))
             gate_manager.project_()
             return
         if hasattr(gate_manager, "raw_coefficients") and hasattr(gate_manager, "initial_coefficients"):
+            delta_tensor = _delta_tensor_like(gate_manager.raw_coefficients)
             gate_manager.raw_coefficients.copy_(
-                torch.clamp(
-                    gate_manager.raw_coefficients,
-                    min=gate_manager.initial_coefficients - delta,
-                    max=gate_manager.initial_coefficients + delta,
+                torch.maximum(
+                    torch.minimum(gate_manager.raw_coefficients, gate_manager.initial_coefficients + delta_tensor),
+                    gate_manager.initial_coefficients - delta_tensor,
                 )
             )
             gate_manager.project_()
@@ -3667,7 +4221,8 @@ def _project_max_delta_from_initial_(torch, gate_manager, max_delta: float | Non
                 initial_centered = initial_residual - initial_residual.mean()
                 coeffs = current_common_value + centered
                 anchors = initial_common_value + initial_centered
-                clamped = torch.clamp(coeffs, min=anchors - delta, max=anchors + delta)
+                delta_tensor = _delta_tensor_like(coeffs)
+                clamped = torch.maximum(torch.minimum(coeffs, anchors + delta_tensor), anchors - delta_tensor)
                 new_common = clamped.mean()
                 gate_manager.raw_common.copy_(new_common.reshape_as(gate_manager.raw_common))
                 gate_manager.raw_residual.copy_(clamped - new_common)
@@ -3676,7 +4231,83 @@ def _project_max_delta_from_initial_(torch, gate_manager, max_delta: float | Non
                 initial_centered = initial_residual - initial_residual.mean(dim=1, keepdim=True)
                 coeffs = current_common.unsqueeze(1) + centered
                 anchors = initial_common.unsqueeze(1) + initial_centered
-                clamped = torch.clamp(coeffs, min=anchors - delta, max=anchors + delta)
+                delta_tensor = _delta_tensor_like(coeffs).unsqueeze(0)
+                clamped = torch.maximum(torch.minimum(coeffs, anchors + delta_tensor), anchors - delta_tensor)
+                new_common = clamped.mean(dim=1)
+                gate_manager.raw_common.copy_(new_common)
+                gate_manager.raw_residual.copy_(clamped - new_common.unsqueeze(1))
+            gate_manager.project_()
+            return
+
+
+def _project_effective_coefficient_bounds_(
+    torch,
+    gate_manager,
+    bounds_by_expert: dict[str, tuple[float | None, float | None]],
+) -> None:
+    """Clamp behaviorally meaningful expert coefficients to absolute bounds.
+
+    This is intentionally separate from the per-update trust region.  It is used
+    for heterogeneous deltas such as DeepSeek-R1 where the coefficient scale is
+    not comparable to the tool/memory/code task vectors.
+    """
+
+    if not bounds_by_expert:
+        return
+    experts = tuple(getattr(gate_manager, "expert_names", ("tool", "memory", "code")))
+    active = {expert: bound for expert, bound in bounds_by_expert.items() if expert in experts}
+    if not active:
+        return
+
+    def _bound_tensors_like(reference):
+        lower = []
+        upper = []
+        for expert in experts:
+            lo, hi = active.get(expert, (None, None))
+            lower.append(float("-inf") if lo is None else float(lo))
+            upper.append(float("inf") if hi is None else float(hi))
+        return (
+            torch.tensor(lower, device=reference.device, dtype=reference.dtype),
+            torch.tensor(upper, device=reference.device, dtype=reference.dtype),
+        )
+
+    def _clamp_coefficients(coeffs):
+        lower, upper = _bound_tensors_like(coeffs)
+        while lower.dim() < coeffs.dim():
+            lower = lower.unsqueeze(0)
+            upper = upper.unsqueeze(0)
+        return torch.maximum(torch.minimum(coeffs, upper), lower)
+
+    with torch.no_grad():
+        if (
+            hasattr(gate_manager, "raw_global_coefficients")
+            and hasattr(gate_manager, "raw_residual_coefficients")
+        ):
+            effective = gate_manager.raw_global_coefficients.unsqueeze(0) + gate_manager.raw_residual_coefficients
+            clamped = _clamp_coefficients(effective)
+            new_global = clamped.mean(dim=0)
+            gate_manager.raw_global_coefficients.copy_(new_global)
+            gate_manager.raw_residual_coefficients.copy_(clamped - new_global.unsqueeze(0))
+            gate_manager.project_()
+            return
+        if hasattr(gate_manager, "raw_coefficients"):
+            gate_manager.raw_coefficients.copy_(_clamp_coefficients(gate_manager.raw_coefficients))
+            gate_manager.project_()
+            return
+        if hasattr(gate_manager, "raw_common") and hasattr(gate_manager, "raw_residual"):
+            current_common = gate_manager.raw_common
+            current_residual = gate_manager.raw_residual
+            if current_residual.dim() == 1:
+                centered = current_residual - current_residual.mean()
+                coeffs = current_common.reshape(-1)[0] + centered
+                clamped = _clamp_coefficients(coeffs)
+                new_common = clamped.mean()
+                gate_manager.raw_common.copy_(new_common.reshape_as(gate_manager.raw_common))
+                gate_manager.raw_residual.copy_(clamped - new_common)
+            else:
+                centered = current_residual - current_residual.mean(dim=1, keepdim=True)
+                coeffs = current_common.unsqueeze(1) + centered
+                clamped = _clamp_coefficients(coeffs)
                 new_common = clamped.mean(dim=1)
                 gate_manager.raw_common.copy_(new_common)
                 gate_manager.raw_residual.copy_(clamped - new_common.unsqueeze(1))
@@ -3814,8 +4445,9 @@ def _expert_coefficient_trainable(train_coefficients: set[str], band: str, exper
 
 
 def _write_global_coefficients_(torch, gate_manager, coeffs: dict[str, float]) -> None:
+    experts = tuple(getattr(gate_manager, "expert_names", ("tool", "memory", "code")))
     tensor = torch.tensor(
-        [float(coeffs["tool"]), float(coeffs["memory"]), float(coeffs["code"])],
+        [float(coeffs[expert]) for expert in experts],
         device=gate_manager.raw_common.device,
         dtype=gate_manager.raw_common.dtype,
     )
@@ -3825,8 +4457,9 @@ def _write_global_coefficients_(torch, gate_manager, coeffs: dict[str, float]) -
 
 
 def _write_band_coefficients_(torch, gate_manager, band_idx: int, coeffs: dict[str, float]) -> None:
+    experts = tuple(getattr(gate_manager, "expert_names", ("tool", "memory", "code")))
     tensor = torch.tensor(
-        [float(coeffs["tool"]), float(coeffs["memory"]), float(coeffs["code"])],
+        [float(coeffs[expert]) for expert in experts],
         device=gate_manager.raw_common.device,
         dtype=gate_manager.raw_common.dtype,
     )
@@ -3848,15 +4481,30 @@ def _coefficient_is_trainable(train_coefficients: set[str], band: str, expert: s
     )
 
 
-def _anchor_expert_coefficients(anchor_gate_values: dict[str, float], band: str) -> dict[str, float]:
+def _anchor_expert_coefficients(
+    anchor_gate_values: dict[str, float],
+    band: str,
+    experts: tuple[str, ...] = ("tool", "memory", "code"),
+) -> dict[str, float]:
+    direct: dict[str, float] = {}
+    for expert in experts:
+        candidates = [f"{band}.{expert}", f"{band}::{expert}"]
+        if band == "global":
+            candidates = [f"__global__::{expert}", f"global.{expert}", expert, *candidates]
+        for key in candidates:
+            if key in anchor_gate_values:
+                direct[expert] = float(anchor_gate_values[key])
+                break
     common = float(anchor_gate_values.get(f"{band}.common", anchor_gate_values.get("common", 0.5)))
     residuals = {
-        "tool": float(anchor_gate_values.get(f"{band}.tool_residual", anchor_gate_values.get("tool_residual", 0.0))),
-        "memory": float(anchor_gate_values.get(f"{band}.memory_residual", anchor_gate_values.get("memory_residual", 0.0))),
-        "code": float(anchor_gate_values.get(f"{band}.code_residual", anchor_gate_values.get("code_residual", 0.0))),
+        expert: float(anchor_gate_values.get(f"{band}.{expert}_residual", anchor_gate_values.get(f"{expert}_residual", 0.0)))
+        for expert in experts
     }
-    mean_residual = sum(residuals.values()) / 3.0
-    return {expert: common + residual - mean_residual for expert, residual in residuals.items()}
+    mean_residual = sum(residuals.values()) / float(len(residuals))
+    fallback = {expert: common + residual - mean_residual for expert, residual in residuals.items()}
+    if direct:
+        return {expert: direct.get(expert, fallback[expert]) for expert in experts}
+    return fallback
 
 
 def _row_category(row: dict) -> str:

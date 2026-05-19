@@ -922,9 +922,9 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys = sorted({key for info in reward_extra_infos for key in info.keys()})
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos], dtype=object)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
@@ -963,10 +963,14 @@ class AgentLoopWorker:
 
         # Only include reward_extra_keys in meta_info if rm_scores is in batch
         # This avoids conflicts when reward_tensor is merged later in ray_trainer.py
+        meta_info = {
+            "metrics": metrics,
+            # Expanded multi-turn trajectories can replace the trainer-side batch.
+            # Keep the sampling temperature available for old-logprob recomputation.
+            "temperature": self.rollout_config.temperature,
+        }
         if "rm_scores" in batch.keys():
-            meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
-        else:
-            meta_info = {"metrics": metrics}
+            meta_info["reward_extra_keys"] = reward_extra_keys
 
         return DataProto(
             batch=batch,

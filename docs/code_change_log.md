@@ -499,3 +499,865 @@ Validation:
   - `--retention-task-balanced-loss-scale`
   - `--opd-dynamic-scale`
   - `--opd-task-balanced-loss-scale`
+
+## 2026-05-17 Norm-aware Init And CURE Code Calibration Blueprints
+
+Context:
+
+- Code reward and gate movement were weak even when code coefficients increased.
+- Diagnostics showed the code task vector covers the same 196 modules as tool/memory but has much smaller total L2 norm.
+- Formal CURE failures split into generation failures and generated-test selection failures, which the previous all-fail OPD pipeline did not distinguish.
+
+Changes:
+
+- Added `scripts/analysis/analyze_task_vector_norms.py`.
+  - Reads OP-VEC `diagnostics.json` and `mode_manifest.json`.
+  - Reports total/layer/block/module L2, code effective sparsity, and top code modules.
+  - Writes deterministic norm-aware gate checkpoints:
+    - `all_ones`
+    - `all1_sqrt_weak_compensation`
+    - `all1_linear_weak_compensation`
+    - `sum1_equal_effective_l2`
+    - `baseline_mean_effective_l2`
+    - `global-coefficient` and `global-parameter` formats.
+- Added `scripts/data/build_cure_code_calibration_pools.py`.
+  - Reads case-level CURE results from the eval case browser.
+  - Builds separate `generation`, `selection`, and `partial_edge` blueprint pools for Code calibration.
+  - Defaults to blueprint/audit outputs and explicitly marks official CURE data as non-training leakage-risk material.
+- Added config/report docs:
+  - `docs/report/task_vector_norm_diagnostics_20260517.md`
+  - `docs/config/20260517_norm_aware_code_calibration.md`
+- Added smoke records showing `all_ones` is stable on 9 prompts while sqrt weak compensation hurts Code reward in the same tiny sample.
+
+Validation:
+
+- `python -m py_compile scripts/analysis/analyze_task_vector_norms.py scripts/data/build_cure_code_calibration_pools.py`
+
+## 2026-05-17 Selected-Mode Gate Checkpoints
+
+Context:
+
+- We need to test whether the strongest model's mode-selection evidence can support structured pruning from `init=1`.
+- The reasoning model's TAME selected modes are expert-specific and must not be reused to prune tool/memory/code deltas.
+
+Changes:
+
+- Added `scripts/analysis/build_selected_mode_gate_checkpoints.py`.
+  - Converts expert-specific `selected_modes.json` files into OP-VEC `parameter` gate checkpoints.
+  - Supports hard expert pruning: selected expert-param coefficients stay at `1.0`, non-selected coefficients become `0.0`.
+  - Supports `--top-k-per-expert` for controlled top-k retention; if a source has fewer mapped modes than requested, the script supplements with per-expert delta-L2 ranked params from OP-VEC diagnostics.
+  - Supports selected/ranked source formats including `selected`, `top_rows`, `plans`, `coefficients`, and `rows_path` JSONL summaries.
+  - Supports 4-expert reasoning micro-addition: `tool=memory=code=1.0`, reasoning selected modes at `0.001`, other reasoning modes at `0.0`.
+  - Writes audit Markdown beside each generated gate checkpoint.
+- Added config doc:
+  - `docs/config/20260517_selected_mode_pruning.md`
+- Updated evaluation report:
+  - Filled F/G final iter20 Code/CURE results in `docs/evaluation/20260517_defg_eval6.md`.
+
+Validation:
+
+- `PYTHONPATH=. python -m py_compile scripts/analysis/build_selected_mode_gate_checkpoints.py`
+- Built selected-mode checkpoints under `/tmp/shared-storage/OnPolicy/data/init_gates/selected_mode_pruning_20260517`, including Tool/Memory top64 pruning with Code kept full.
+- Ran 9-prompt vLLM smoke for expert-specific pruning, reasoning selected64@0.001, and Tool/Memory top64 + Code full.
+
+## 2026-05-17 Eval-Targeted Calibration Builder
+
+Context:
+
+- The eval case browser showed that the old `paper96` calibration is too weakly aligned with BFCL-live Tool failures and CURE Code failures.
+- We need a reproducible calibration manifest that reflects formal-eval ability without copying official eval prompts, answers, tests, or model outputs.
+
+Changes:
+
+- Added `scripts/data/build_eval_targeted_calibration.py`.
+  - Reads case-study candidates from `/tmp/shared-storage/OnPolicy/analysis/eval_case_browser/bfcl_live_calibration_candidates.jsonl`.
+  - Builds a 96-row task-balanced manifest under `/tmp/shared-storage/OnPolicy/data/calibration/eval_targeted96_20260517`.
+  - Tool: mixes 16 paper96 ToolRL/RLLA source-anchor rows with 16 fresh BFCL-style synthetic rows using `reference.bfcl`, covering live/non-live parallel calls, default values, enum exactness, canonicalization, and distractor function selection.
+  - Memory: reuses 32 paper96 HotpotQA-train memory rows as a stable anchor.
+  - Code: selects 32 CodeContests-train rows by CURE-derived tags, storing executable source tests in `reference.metadata`.
+  - Writes `summary.json`, `tool_synthetic_blueprints.jsonl`, `code_train_blueprints.jsonl`, and README for audit.
+- Added report:
+  - `docs/report/eval_targeted_calibration_20260517.md`
+
+Validation:
+
+- `PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile scripts/data/build_eval_targeted_calibration.py`
+- Built `/tmp/shared-storage/OnPolicy/data/calibration/eval_targeted96_20260517/eval_targeted96.prompts.jsonl`.
+- Verified row counts are `tool=32`, `memory=32`, `code=32` with 96 unique prompt ids.
+- Verified all 16 synthetic Tool reference responses score `success=True, reward=1.0` through the current `RewardRouter` / BFCL adapter.
+
+Follow-up:
+
+- Extended `scripts/data/build_eval_targeted_calibration.py` with optional Code source-anchor mixing:
+  - `--code-source-count`
+  - `--code-targeted-count`
+- Defaults preserve the original builder behavior (`--code-source-count 0`), so existing reproduction commands and the first `eval_targeted96_20260517` data path are unchanged.
+- Built the recommended mixed calibration manifest:
+  - `/tmp/shared-storage/OnPolicy/data/calibration/eval_targeted96_cure_aligned_20260517/eval_targeted96.prompts.jsonl`
+  - Tool: 16 paper96 source anchors + 16 BFCL-style synthetic probes.
+  - Memory: 32 paper96 HotpotQA-train anchors.
+  - Code: 16 paper96 Code frontier anchors + 16 CURE-style targeted CodeContests probes.
+- Updated `docs/report/eval_targeted_calibration_20260517.md` with the recommended data path, reproduction command, audit counts, and Code reward alignment settings.
+
+Validation:
+
+- `python -m py_compile scripts/data/build_eval_targeted_calibration.py`
+- Built `/tmp/shared-storage/OnPolicy/data/calibration/eval_targeted96_cure_aligned_20260517/eval_targeted96.prompts.jsonl`.
+- Verified row counts are `tool=32`, `memory=32`, `code=32` with 96 unique prompt ids.
+- Verified all 32 Code rows resolve to CodeContests source tests.
+- Verified all 16 synthetic Tool reference responses score `success=True, reward_train=1.0` through the current `RewardRouter` / BFCL adapter.
+# 2026-05-17 c1 layer-band bake config support
+
+- 修改 `opvec/modeling/bake.py`：`create_bake_plan()` / `bake_checkpoint()` 新增可选 `layer_bands` 参数。默认不传时仍使用原来的 `DEFAULT_LAYER_BANDS`，不影响旧实验。
+- 修改 `scripts/eval/opvec_bake_checkpoint.py`：从 config 的顶层 `layer_bands` 或 `modes.layer_bands` 读取自定义 layer-band，并传给 bake。用于 c1 的 `configs/gated_grpo_layer28.yaml`，避免 bake 阶段仍按 `early/mid/late` 查 band。
+- 不修改 reward、rollout、update loss、OPD、retention、GRPO 或 gate optimizer 逻辑。
+
+# 2026-05-17 frontier/retention random row sampling
+
+- 修改 `scripts/train/opvec_update_gates_from_rollouts.py`：新增可选 `--sample-frontier-before-limit`、`--sample-retention-before-limit`、`--retention-shuffle-seed`。默认关闭，旧实验仍按原顺序截断。
+- 新增 `--ignore-config-frontier-task-quota`：显式忽略 config 里的 `calibration.frontier_task_quota`，从而实现“不设置 frontier quota 就全量”。
+- frontier 随机采样发生在 per-task quota 之前，例如每任务随机取 4 条后再进入 `task-interleaved` 顺序。
+- retention 随机采样发生在 `max_retention_rows_per_task` / `max_retention_rows` 截断之前；未显式指定 retention seed 时复用 frontier seed。
+- 修改 `skill/command/run_qbank_c033333_gate_strategy.sh`：暴露 `FRONTIER_SAMPLE_BEFORE_LIMIT`、`RETENTION_SAMPLE_BEFORE_LIMIT`、`RETENTION_SHUFFLE_SEED`、`FRONTIER_ROWS_PER_TASK`、`IGNORE_CONFIG_FRONTIER_TASK_QUOTA` 环境变量，并在启动日志中记录。wrapper 默认 `IGNORE_CONFIG_FRONTIER_TASK_QUOTA=1`，因此不设置 quota 时默认 full frontier。
+# 2026-05-17 P0 State Distribution Utility
+
+## 变更
+
+- 新增 `scripts/analysis/build_rollout_state_distribution.py`。
+- 新增 `configs/init_gates/ta_c033333_global.json` 与 `configs/init_gates/ta_init1_global.json`。
+
+## 目的
+
+服务论文 P0：从 rollout JSONL 与 expert rollout JSONL 统计 `frontier / recoverable / stable / unsolved`，把 calibration prompts 明确解释为 executable probes。
+
+## 行为
+
+- 只读 rollout，不改训练主流程。
+- `stable`: current rollout 全 success。
+- `frontier`: current rollout 有 reward 方差或成功/失败混合。
+- `recoverable`: current all-fail 且 same-prompt expert rollout 有 verified positive。
+- `unsolved`: current all-fail 且 expert 也没有 positive。
+- 输出 JSON 与 Markdown，供 `docs/report/expertgym_72h` 和论文表格使用。
+
+## 验证
+
+```bash
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/analysis/build_rollout_state_distribution.py \
+  scripts/eval/opvec_bake_checkpoint.py
+
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/analysis/build_rollout_state_distribution.py --help
+```
+
+# 2026-05-18 P0 SOTA calibration v2 data harness
+
+## 变更
+
+- 新增 `scripts/data/partition_calibration_bank.py`：
+  - 从多个 seed manifest 读取候选池；
+  - 按 `prompt_hash` 去重；
+  - 按 task 和 `eval_targeted_calibration.role` 分层；
+  - 生成 disjoint `train/monitor/guard` split；
+  - 只处理数据 manifest，不改 reward、rollout、update 或训练主逻辑。
+- 新增 `skill/command/build_20260518_sota_calib_v2.sh`：
+  - 构建 Tool/Code 候选池；
+  - 构建 HotpotQA memory trajectory 候选池；
+  - 产出 `sota_calib_v2_20260518/{train128,monitor64,guard64}`。
+- 新增 `skill/command/run_20260518_sota_v2_expert_rollouts.sh`：
+  - 对 `train128` 生成 same-prompt expert rollouts；
+  - 每个专家 rollout 写 coverage summary。
+- 新增 `skill/command/run_20260518_p0_sota_v2.sh`：
+  - 管理 P0 主实验 `train_gc` / `train_gp`；
+  - 默认使用 `train128`、dynamic OPD、GRPO、retention；
+  - 默认只作为新实验入口，不影响旧 paper96 / eval_targeted96 命令。
+
+## 产物
+
+```text
+/tmp/shared-storage/OnPolicy/data/calibration/sota_calib_v2_20260518/
+  train128.prompts.jsonl
+  monitor64.prompts.jsonl
+  guard64.prompts.jsonl
+  summary.json
+```
+
+计数：
+
+- `train128`: tool=32, memory=48, code=48
+- `monitor64`: tool=16, memory=24, code=24
+- `guard64`: tool=16, memory=24, code=24
+
+## 验证
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  -m py_compile scripts/data/partition_calibration_bank.py
+
+bash -n skill/command/build_20260518_sota_calib_v2.sh
+bash -n skill/command/run_20260518_sota_v2_expert_rollouts.sh
+bash -n skill/command/run_20260518_p0_sota_v2.sh
+```
+
+已实际构建 `sota_calib_v2_20260518`，schema 校验通过。
+
+# 2026-05-18 Recoverable-code calibration filter
+
+## 变更
+
+- 新增 `scripts/data/build_recoverable_code_calibration.py`。
+- 功能：从同 prompt expert rollouts 中统计 verified positive，只保留有 expert positive 的 Code 行进入训练 split；Tool/Memory 按给定数量保留。
+- 默认不参与任何旧训练命令，必须显式调用。
+
+## 目的
+
+`sota_calib_v2_20260518/train128` 的 Code 部分中，两个 code expert 合并后只有 `21/48` 有 positive。直接训练会让 dynamic OPD 的 Code 信号过稀，导致主实验仍然“Code gate/reward 不涨”。这个 filter 把 hard Code 行留在 monitor/guard，把训练集收束到 verified recoverable directions。
+
+## 产物
+
+```text
+/tmp/shared-storage/OnPolicy/data/calibration/sota_calib_v2_recoverable_code_20260518/
+  train_recoverable101.prompts.jsonl
+  train_recoverable101.prompts.summary.json
+```
+
+计数：
+
+- Tool: 32
+- Memory: 48
+- Code: 21
+- Total: 101
+
+## 验证
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  -m py_compile scripts/data/build_recoverable_code_calibration.py
+
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/data/build_recoverable_code_calibration.py \
+  --input /tmp/shared-storage/OnPolicy/data/calibration/sota_calib_v2_20260518/train128.prompts.jsonl \
+  --output /tmp/shared-storage/OnPolicy/data/calibration/sota_calib_v2_recoverable_code_20260518/train_recoverable101.prompts.jsonl \
+  --expert-rollout /tmp/shared-storage/OnPolicy/data/calibration/sota_calib_v2_20260518/expert_rollouts/code_expert_reasonflux_coder7b_sota_v2_train128_s4_seed20260518.jsonl \
+  --expert-rollout /tmp/shared-storage/OnPolicy/data/calibration/sota_calib_v2_20260518/expert_rollouts/code_expert_deepseek_r1_distill_qwen7b_sota_v2_train128_s4_seed20260518.jsonl \
+  --tool-count 32 --memory-count 48 --code-count -1 --seed 20260518
+```
+
+# 2026-05-18 SOTA monitor64 eval wrapper
+
+## 变更
+
+- 新增 `skill/command/run_20260518_sota_monitor64_eval.sh`。
+- 功能：对任意 baked HF policy 在 `sota_calib_v2_20260518/monitor64.prompts.jsonl` 上执行 vLLM rollout，并用 `scripts/eval/summarize_rollouts.py` 生成 summary。
+- 默认不影响训练；仅作为 checkpoint 筛选和三任务 proxy sanity check。
+
+## 用法
+
+```bash
+MODEL_PATH=/path/to/baked_policy \
+RUN_ID=my-model-monitor64 \
+GPU_LIST=0 \
+bash skill/command/run_20260518_sota_monitor64_eval.sh
+```
+
+## 主读数
+
+```text
+summary.json:
+  task_stats.tool.mean_reward / success_rate
+  task_stats.memory.mean_reward / success_rate
+  task_stats.code.mean_reward / success_rate
+```
+
+## 验证
+
+```bash
+bash -n skill/command/run_20260518_sota_monitor64_eval.sh
+```
+
+# 2026-05-18 Four-expert layer-band bake compatibility
+
+## 变更
+
+- 修复 `opvec/modeling/bake.py` 中 layer-band bake 的专家列表硬编码。
+- 之前 layer-band bake 侧会通过三专家 `project_gates()` 和三专家 `_band_gate_values()` 解析 `tool/memory/code`，当 manifest 包含第四个 `reasoning` expert 时，`reasoning_residual` 会被丢掉。
+- 现在 layer-band bake 按 mode manifest 的 `expert_names` 做 common+residual 零均值投影，因此可用于 `tool/memory/code/reasoning` 四专家配置。
+- `scripts/train/opvec_update_gates_from_rollouts.py` 的 `--train-coefficient` 投影也改为读取 `gate_manager.expert_names`，因此可冻结/解冻 `*.reasoning` 等非三专家系数。
+- 新增可选 expert-specific trust region：
+  - updater: `--max-coefficient-delta-from-init-by-expert reasoning=0.002`
+  - launcher env: `MAX_COEFF_DELTA_BY_EXPERT=reasoning=0.002`
+  - 默认空，不影响既有实验；设置后只覆盖指定 expert 的最大位移。
+- `scripts/modes/build_constant_gate_checkpoint.py` 新增 `--expert-value EXPERT=VALUE`，可直接生成 `tool/memory/code=1.0, reasoning=0.001` 这类异尺度 init checkpoint。
+- 三专家默认路径语义不变。
+
+## 背景
+
+DeepSeek-R1-Distill-Qwen-7B 的 task vector 范数远大于其他 experts，应作为小幅 reasoning/code prior 学习。要做 per-layer reasoning gate，bake 必须保留第四 expert 的 layer-band 系数。
+
+## 验证
+
+系统环境没有 `pytest`，已用 unittest 直接跑新增/既有 bake 测试：
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  tests/test_bake_global_coefficients.py
+
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  tests/test_gated_grpo_trust_region.py
+
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python - <<'PY'
+import json, tempfile
+from pathlib import Path
+from scripts.modes.build_constant_gate_checkpoint import build_constant_gate_checkpoint
+
+with tempfile.TemporaryDirectory() as td:
+    p = Path(td) / "mode_manifest.json"
+    p.write_text(json.dumps({
+        "expert_names": ["tool", "memory", "code", "reasoning"],
+        "basis_entries": [{"param_name": "model.layers.0.mlp.down_proj.weight", "expert": "tool"}],
+    }))
+    gates, _ = build_constant_gate_checkpoint(
+        mode_manifest=p,
+        parameterization="parameter",
+        value=1.0,
+        expert_names=("tool", "memory", "code", "reasoning"),
+        expert_values={"reasoning": 0.001},
+    )
+    assert gates["model.layers.0.mlp.down_proj.weight::reasoning"] == 0.001
+print("expert override smoke OK")
+PY
+
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python scripts/eval/opvec_bake_checkpoint.py \
+  --config configs/gated_grpo_reasoning_layer28.yaml \
+  --mode-manifest /tmp/shared-storage/OnPolicy/modes/opvec4_reasoning_20260516/mode_manifest.json \
+  --gate-checkpoint /tmp/shared-storage/OnPolicy/data/init_gates/r1_scaled_20260518/all1_r1_z001.layer-band.json \
+  --output /tmp/shared-storage/OnPolicy/data/init_gates/r1_scaled_20260518/plan_only_bake \
+  --plan-only
+```
+
+结果：
+
+```text
+tests/test_bake_global_coefficients.py: Ran 2 tests, OK
+tests/test_gated_grpo_trust_region.py: Ran 3 tests, OK
+OK
+```
+
+# 2026-05-18 Code P0 v3 calibration bank builder
+
+## 变更
+
+- 新增 `scripts/data/build_code_p0_calibration_bank.py`。
+- 新增复现入口 `skill/command/build_20260518_code_p0_v3.sh`。
+- 新增 expert rollout 入口 `skill/command/run_20260518_code_p0_v3_expert_rollouts.sh`，专门生成 Code P0 v3 同 prompt 的 ReasonFlux / DeepSeek positive 轨迹。
+- 新增 recoverable 子集入口 `skill/command/build_20260518_code_p0_v3_recoverable.sh`，复用现有 `build_recoverable_code_calibration.py` 筛出专家能做对的 Code OPD rows。
+- 新增 `scripts/data/merge_rollout_shards.py`，用于按 prompt manifest 顺序合并多卡 rollout shard，并输出去重 summary。
+- `scripts/data/build_recoverable_code_calibration.py` 的 role 统计增加 `code_p0_calibration.role` / `reference.metadata.code_bank_role` fallback；旧 eval-targeted 统计不变。
+- 新增配置说明 `docs/config/20260518_code_p0_v3.md`。
+- 功能：只从 CodeContests train 构建 Code-only `train/monitor/guard` bank，不修改旧 paper96、sota_calib_v2、recoverable101 数据。
+
+## 数据语义
+
+每条 Code row 显式写入：
+
+```text
+reference.metadata.test_input/test_output      # 当前训练 reward 实际读取
+reference.metadata.reward_test_input/output    # 同上，显式审计字段
+reference.metadata.guard_test_input/output     # 同题 held-out test slice
+reference.metadata.code_bank_role              # generation/frontier/partial_edge/stable
+```
+
+默认输出：
+
+```text
+/tmp/shared-storage/OnPolicy/data/calibration/code_p0_v3_20260518/
+  train_code64.prompts.jsonl
+  monitor_code32.prompts.jsonl
+  guard_code32.prompts.jsonl
+  code_p0_blueprints.jsonl
+  summary.json
+  README.md
+```
+
+## 验证
+
+```bash
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/data/build_code_p0_calibration_bank.py
+
+bash skill/command/build_20260518_code_p0_v3.sh
+```
+
+结构校验：
+
+```text
+train rows 64 unique_task_ids 64 bad 0
+monitor rows 32 unique_task_ids 32 bad 0
+guard rows 32 unique_task_ids 32 bad 0
+total unique 128
+```
+
+当前 expert rollout / recoverable 结果：
+
+```text
+ReasonFlux-Coder-7B: covered 29/64, mean reward 0.4089
+DeepSeek-R1-Distill-Qwen-7B merged: covered 31/64, mean reward 0.4306
+recoverable Code rows: 36/64
+recoverable role counts: generation 7, frontier 15, partial_edge 11, stable 3
+```
+
+# 2026-05-18 R1 expert coefficient absolute bounds
+
+## 变更
+
+- `scripts/train/opvec_update_gates_from_rollouts.py` 新增可选参数：
+
+```text
+--coefficient-bound-by-expert reasoning=0.0:0.003
+```
+
+- 该参数对 effective coefficient 生效，即 common/residual 参数化下实际 bake 的专家系数。
+- 默认不传时完全不进入新增边界逻辑，不改变旧实验路径。
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py` 增加参数透传。
+- `skill/command/run_qbank_c033333_gate_strategy.sh` 增加环境变量：
+
+```text
+COEFF_BOUND_BY_EXPERT=reasoning=0.0:0.003
+```
+
+- 新增 `skill/command/run_20260518_r1_codep0_bounded_sanity.sh`，默认在 R1 Code P0 sanity 上启用 `reasoning=0.0:0.003` 全程绝对边界。
+- `scripts/eval/summarize_gate_strategy_run.py` 和 `scripts/monitor/opvec_run_monitor.py` 改为从 gate keys 动态推断 expert 名称，支持 `tool/memory/code/reasoning` 四专家，不再把 R1 实验误解析成三专家。
+
+## 背景
+
+R1 sanity 暴露了一个语义问题：
+
+```text
+--max-coefficient-delta-from-init-by-expert reasoning=0.002
+```
+
+在 bake-vLLM loop 中每轮 update 的 init checkpoint 是上一轮 checkpoint，因此它是逐轮 trust region，不是全程绝对边界。R1 delta 范数远大于其他 task vector，需要额外的绝对系数边界来保证可复现、可审查。
+
+## 验证
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/train/opvec_update_gates_from_rollouts.py \
+  scripts/train/opvec_gated_grpo_bake_vllm_loop.py \
+  scripts/eval/summarize_gate_strategy_run.py \
+  scripts/monitor/opvec_run_monitor.py
+
+bash -n skill/command/run_qbank_c033333_gate_strategy.sh skill/command/run_20260518_r1_codep0_sanity.sh
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. \
+  /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_gated_grpo_trust_region.py
+```
+
+结果：
+
+```text
+tests/test_gated_grpo_trust_region.py: Ran 5 tests, OK
+```
+
+# 2026-05-18 Skip old-logprob fill for OPD-only NLL updates
+
+## 变更
+
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py` 不再无条件向 update 阶段传：
+
+```text
+--fill-missing-old-logprob
+```
+
+- 现在仅在以下场景传入：
+
+```text
+ppo_loss_weight != 0
+或
+use_retention=1 且 retention_objective=kl
+```
+
+## 原因
+
+`expD_r1scaled_*` 当前是 OPD + NLL retention-only：
+
+```text
+ppo_loss_weight=0
+retention_objective=nll
+```
+
+这一路不使用 PPO ratio，也不使用 KL retention，因此 old logprob 不参与 loss。旧逻辑仍会先用 HF 模型对 rollout 样本补 `old_logprob`，造成无效前向计算。
+
+## 影响范围
+
+- GRPO/PPO 路径不变：`ppo_loss_weight != 0` 时仍会填 old logprob。
+- KL retention 路径不变：`retention_objective=kl` 时仍会填 old logprob。
+- OPD-only + NLL retention 后续实验会更快，loss 语义不变。
+
+## 验证
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+  /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/train/opvec_gated_grpo_bake_vllm_loop.py
+
+bash -n scripts/train/run_4expert_r1scaled.sh
+```
+
+结果：
+
+```text
+ok
+```
+## 2026-05-18: 新增 direct layer-band coefficient gate
+
+目的：支持一个干净对照实验，保留 layer-band 的层段划分，但不使用 `common + residual` 参数化，而是直接学习每个 band 上每个 expert 的 coefficient。
+
+改动范围：
+
+- `opvec/modeling/gate_parameters.py`
+  - 新增 `TorchLayerBandCoefficientManager`。
+  - 新参数化名：`layer-band-coefficient`。
+  - gate 形式：`early.tool`、`early.memory`、`early.code`、`mid.*`、`late.*`。
+  - 不改变已有 `global` / `layer-band` / `parameter` / `global-parameter` / `global-coefficient` 行为。
+- `scripts/modes/build_constant_gate_checkpoint.py`
+  - 支持生成 direct layer-band 初始化 gate。
+- `scripts/modes/build_zero_gate_checkpoint.py`
+  - 支持 direct layer-band zero gate。
+- `scripts/train/opvec_update_gates_from_rollouts.py`
+  - CLI `--gate-parameterization` 接受 `layer-band-coefficient`。
+  - direct layer-band 使用已有 `raw_coefficients` trust-region / prior 逻辑。
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`、`scripts/train/opvec_collect_hf_rollouts.py`、`scripts/train/opvec_gated_grpo_loop.py`
+  - 只扩展 CLI choices，不改训练目标。
+- `skill/command/run_qbank_c033333_gate_strategy.sh`
+  - 支持 `STRATEGY=layer-band-coefficient`，默认 LR/ prior/ delta 沿用 `layer-band`。
+
+验证：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  opvec/modeling/gate_parameters.py \
+  scripts/train/opvec_update_gates_from_rollouts.py \
+  scripts/train/opvec_gated_grpo_bake_vllm_loop.py \
+  scripts/train/opvec_collect_hf_rollouts.py \
+  scripts/modes/build_constant_gate_checkpoint.py \
+  scripts/modes/build_zero_gate_checkpoint.py
+
+bash -n skill/command/run_qbank_c033333_gate_strategy.sh
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_gated_linear.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_bake_global_coefficients.py
+```
+
+## 2026-05-18: Monitor 支持续训 run 的显示迭代 offset
+
+目的：续训实验的物理目录仍从 `iter_001` 开始，但前端曲线需要接在原 run 后面显示，例如 3band continue10 应显示为 `iter_011..iter_020`。
+
+改动：
+
+- `scripts/monitor/opvec_run_monitor.py`
+  - 新增 CLI：`--run-iteration-offset RUN_ID=OFFSET`。
+  - offset 只改 API / 前端中的 `iteration` label。
+  - 原始目录名保留在 `physical_iteration`，不改训练产物、不影响复现路径。
+
+示例：
+
+```bash
+python scripts/monitor/opvec_run_monitor.py \
+  --run-dir r1_3band_continue10=/path/to/run \
+  --run-iteration-offset r1_3band_continue10=10
+```
+
+备注：`BFCL` 环境没有 `pytest`，因此这里用标准库 `unittest` 运行这两个测试文件。
+
+## 2026-05-18: Monitor 支持 reasoning gate 显示
+
+问题：`scripts/monitor/opvec_run_monitor.py` 的前端表格和 coefficient 下拉框写死了 `tool/memory/code`，导致 4-expert R1 run 虽然后端 gate JSON 里有 `reasoning_residual`，前端仍不显示 reasoning gate。
+
+改动：
+
+- 后端 `_infer_experts()` 支持 `__global__::<expert>` 和 direct layer-band key `band.expert`。
+- 后端 `_effective_coefficients()` 支持 direct layer-band coefficient，不再把 `band.tool` 误读成 common/residual fallback。
+- `gate_stats.expert_delta` 改为基于 loop manifest 首轮 `input_gate_checkpoint` 的真实初始 gate 计算；因此 R1 的 `reasoning` delta 以 `0.0` 为初始点，而不是错误地以默认 `1/3` 为初始点。
+- 前端 gate 总览、Gate/Update 表、source 聚合表、coefficient selector 改为动态 expert 列表；R1 run 会显示 `reasoning`。
+
+验证：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile scripts/monitor/opvec_run_monitor.py
+curl -sS 'http://127.0.0.1:8794/api/state?max_prompt_rows=1'
+```
+
+当前 API 已包含：
+
+```text
+coefficient/code
+coefficient/memory
+coefficient/reasoning
+coefficient/tool
+```
+
+## 2026-05-18: 新增 hierarchical layer-band gate
+
+目的：验证 `28layer` 细粒度 gate 训练不动是否来自缺少全局 expert 聚合项。新增 `layer-band-parameter`，形式为：
+
+```text
+coefficient[band, expert] = global[expert] + residual[band, expert]
+```
+
+行为边界：
+
+- 不覆盖已有 `layer-band`、`layer-band-coefficient`、`global-parameter`。
+- `gate_values` 同时写出 `__global__::<expert>` 和 `band.expert` 的有效系数。
+- bake 时忽略只有诊断用途的 `__global__::<expert>`，按 `band.expert` 烘焙实际模型；因此不会误判成 588 parameter gate。
+- trust-region / prior / coefficient bounds 复用已有 `raw_global_coefficients + raw_residual_coefficients` 路径。
+
+主要改动：
+
+- `opvec/modeling/gate_parameters.py`
+  - 新增 `TorchLayerBandParameterCoefficientManager`。
+  - 新增 aliases：`layer-band-parameter`、`layer-band-hierarchical`、`hierarchical-layer-band` 等。
+- `opvec/modeling/bake.py`
+  - `__global__::<expert>` 不再单独触发 parameter bake。
+  - 当 gate 同时含 `__global__::<expert>` 和 `band.expert` 时，bake summary 标记为 `layer-band-parameter`。
+- 训练入口：
+  - `scripts/train/opvec_update_gates_from_rollouts.py`
+  - `scripts/train/opvec_collect_hf_rollouts.py`
+  - `scripts/train/opvec_gated_grpo_loop.py`
+  - `scripts/train/opvec_gated_grpo_bake_vllm_loop.py`
+  - `skill/command/run_qbank_c033333_gate_strategy.sh`
+- 初始化脚本：
+  - `scripts/modes/build_constant_gate_checkpoint.py`
+  - `scripts/modes/build_zero_gate_checkpoint.py`
+- R1 实验脚本：
+  - `scripts/train/run_4expert_r1scaled.sh`
+  - 新增 `PHASE=layer28_hier`，默认 `LAYER28_STRATEGY=layer-band-parameter`、`LAYER28_LR=0.25`。
+
+验证命令：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_gated_linear.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_bake_global_coefficients.py
+```
+# 2026-05-18: SOTA recovery calibration v3
+
+新增文件：
+
+- `scripts/data/build_sota_recovery_calibration_v3.py`
+- `skill/command/build_20260518_sota_recovery_calib_v3.sh`
+- `skill/command/run_20260518_sota_recovery_v3.sh`
+- `docs/config/20260518_sota_recovery_calib_v3.md`
+- `docs/report/20260518_sota_recovery_calib_v3.md`
+
+功能：
+
+- 构建 `sota_recovery_calib_v3_20260518`，把 train 与 monitor/guard 分工拆开。
+- `train128` 使用 verified-recoverable rows，提升 OPD/frontier/retention 的训练信号密度。
+- `monitor64` / `guard64` 使用 harder audit rows，尤其是 Code P0 hard rows，防止 train proxy 过拟合。
+- 训练脚本显式接入 sota_v2 与 code_p0 两套 expert rollouts，避免 v3 train 中 Code P0 rows 没有 OPD positive。
+- v3 训练脚本把 init gates 写到 v3 bank 自己的 `init_gates/`，不覆盖公共 question-bank init。
+
+验证：
+
+- `build_sota_recovery_calibration_v3.py` 通过 `py_compile`。
+- `build_20260518_sota_recovery_calib_v3.sh` / `run_20260518_sota_recovery_v3.sh` 通过 `bash -n`。
+- 已生成：
+  - `/tmp/shared-storage/OnPolicy/data/calibration/sota_recovery_calib_v3_20260518/train128.prompts.jsonl`
+  - `/tmp/shared-storage/OnPolicy/data/calibration/sota_recovery_calib_v3_20260518/monitor64.prompts.jsonl`
+  - `/tmp/shared-storage/OnPolicy/data/calibration/sota_recovery_calib_v3_20260518/guard64.prompts.jsonl`
+
+注意：
+
+- 曾在 dry-run 中发现底层 launcher 会把 init gate 写入公共 question-bank 路径；已恢复公共 `init_layer_band_parameter_c033333.json` 为 `0.3333333333333333`，并在 v3 launcher 中设置 `QB=$BANK` 进行隔离。
+## 2026-05-19: Correct DeepSeek-R1 Delta Base Support
+
+Problem:
+
+- `DeepSeek-R1-Distill-Qwen-7B` is distilled from `Qwen2.5-Math-7B`, not `Qwen2.5-7B-Instruct`.
+- The old R1 mode artifacts subtracted the Instruct base, so the reasoning delta mixed true reasoning behavior with the Math/Instruct base gap.
+
+Changes:
+
+- `opvec/modes/build_modes.py` now supports optional per-expert delta bases:
+
+```yaml
+models:
+  base: /mnt/cache/wuruixiao/models/Qwen2.5-7b-instruct
+  delta_bases:
+    reasoning: /mnt/cache/wuruixiao/models/Qwen2.5-Math-7B
+```
+
+- Default behavior is unchanged: experts without `delta_bases` still subtract `models.base`.
+- Added `configs/gated_grpo_4expert_r1math_layer28.yaml` for correct-R1 layer28 experiments.
+- Added reproducible scripts:
+  - `skill/command/build_20260519_r1math_modes.sh`
+  - `skill/command/run_20260519_r1math_L_experiments.sh`
+  - `skill/command/orchestrate_20260519_r1math_L1_L2.sh`
+- Added experiment table: `docs/config/20260519_r1math_L_experiments.md`.
+
+Validation:
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  opvec/modes/build_modes.py \
+  scripts/modes/build_opvec4_modes.py \
+  scripts/modes/build_scaled_r1_modes.py
+
+bash -n \
+  skill/command/build_20260519_r1math_modes.sh \
+  skill/command/run_20260519_r1math_L_experiments.sh \
+  skill/command/orchestrate_20260519_r1math_L1_L2.sh
+
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python scripts/modes/build_opvec4_modes.py \
+  --config configs/gated_grpo_4expert_r1math_layer28.yaml \
+  --output-dir /tmp/shared-storage/OnPolicy/modes/opvec4_r1math_dryrun_20260519 \
+  --dry-run
+```
+
+## 2026-05-19: L-series Resume and Layer-Band-Parameter Freeze Fix
+
+Problem:
+
+- L1 needed clean resume after an external GPU process blocked the second rollout shard.
+- L2 freezes reasoning by `TRAIN_COEFFICIENTS=*.tool,*.memory,*.code`; the update-side train-coefficient projection only handled old global / common-residual managers and could fall through to `raw_common` on direct `layer-band-parameter`.
+
+Changes:
+
+- `skill/command/run_qbank_c033333_gate_strategy.sh` now exposes `START_ITERATION` and passes it to `opvec_gated_grpo_bake_vllm_loop.py`.
+- `skill/command/run_20260519_r1math_L_experiments.sh` forwards `START_ITERATION` and respects an external `INIT_GATE_CHECKPOINT`, enabling deterministic continuation from a completed gate checkpoint.
+- `scripts/train/opvec_update_gates_from_rollouts.py` now supports train-coefficient projection for managers with `raw_global_coefficients` + `raw_residual_coefficients`:
+  - trainable expert coefficients keep the current effective value;
+  - frozen coefficients are restored to the anchor gate value;
+  - global + residual tensors are rewritten consistently, then projected.
+- `_anchor_expert_coefficients` now also understands direct coefficient checkpoint keys such as `__global__::reasoning` and `layer0.reasoning`; this prevents frozen coefficients from falling back to the old `common=0.5` default when resuming `layer-band-parameter` runs from a gate checkpoint.
+
+Default impact:
+
+- Runs without `TRAIN_COEFFICIENTS` or without resume variables are unchanged.
+- Reward, OPD construction, retention, task weights, loss weights, and gate parameterization semantics are unchanged.
+
+Validation:
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/train/opvec_update_gates_from_rollouts.py
+
+bash -n \
+  skill/command/run_qbank_c033333_gate_strategy.sh \
+  skill/command/run_20260519_r1math_L_experiments.sh
+```
+
+## 2026-05-19: L4 BFCL Tool Augmentation and Dynamic OPD Require-All Guard
+
+Problem:
+
+- L1/L2/L3 showed a repeated failure mode: when Tool no longer contributed dynamic OPD rows, Memory/Code OPD could keep pushing gates and Tool proxy collapsed.
+- L4 needs Tool calibration closer to BFCL live/non-live evaluation while preserving the old launcher behavior for all previous experiments.
+
+Changes:
+
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py` adds `--dynamic-opd-require-all-tasks`.
+  - Default is off, so existing experiments keep the exact previous path.
+  - When on, the loop reads `opd_distill_from_allfail.summary.json` after dynamic OPD construction.
+  - If any task listed by `--dynamic-opd-tasks` has zero selected OPD rows, the update command receives no dynamic OPD rollout for that iteration.
+  - Retention, rollout reward, OPD builder, task weights, and static OPD rollouts are unchanged.
+- `skill/command/run_qbank_c033333_gate_strategy.sh` exposes `DYNAMIC_OPD_REQUIRE_ALL_TASKS=0|1`.
+- `scripts/data/build_bfcl_tool_calibration.py` builds a reproducible BFCL Tool augmentation:
+  - 8 non-live BFCL rows: `parallel=4`, `parallel_multiple=4`;
+  - 8 live BFCL rows: `live_parallel=4`, `live_parallel_multiple=4`;
+  - live rows are selected from existing model-failure cases, satisfying the requested hard-live requirement;
+  - an official-answer expert rollout JSONL is emitted so dynamic OPD can use these BFCL prompts as positive Tool anchors.
+- `skill/command/run_20260519_r1math_L_experiments.sh` adds `PHASE=L4`, using L1 settings plus:
+  - merged 112-row manifest with BFCL Tool rows;
+  - BFCL official-answer expert rollout;
+  - `DYNAMIC_OPD_REQUIRE_ALL_TASKS=1`.
+
+Artifacts:
+
+- Prompt-only BFCL Tool rows:
+  `/tmp/shared-storage/OnPolicy/data/calibration/20260519_l4_bfcl_tool_aug/bfcl_tool16_nonlive8_live8_seed20260519.prompts.jsonl`
+- BFCL official-answer expert rollout:
+  `/tmp/shared-storage/OnPolicy/data/calibration/20260519_l4_bfcl_tool_aug/bfcl_tool16_official_answer_expert_rollouts_seed20260519.jsonl`
+- L4 merged manifest:
+  `/tmp/shared-storage/OnPolicy/data/calibration/20260519_l4_bfcl_tool_aug/qbank_c033333_paper96_plus_bfcl_tool16_seed20260519.prompts.jsonl`
+
+Validation:
+
+```bash
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/train/opvec_gated_grpo_bake_vllm_loop.py \
+  scripts/data/build_bfcl_tool_calibration.py
+
+bash -n \
+  skill/command/run_qbank_c033333_gate_strategy.sh \
+  skill/command/run_20260519_r1math_L_experiments.sh
+
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/data/build_bfcl_tool_calibration.py
+
+PHASE=L4 GPU_LIST=0,1 DRY_RUN=1 \
+  bash skill/command/run_20260519_r1math_L_experiments.sh
+```
+
+## 2026-05-19: Optional Tool Behavior-Span Null-Space Projection
+
+Problem:
+
+- L1/L2/L3 showed strong Memory/Code gate growth but Tool proxy collapsed in later iterations.
+- NLL retention on Tool all-success rows produced much smaller gradients than OPD and did not strongly preserve the tool-call behavior span.
+- We need an optional gradient-control baseline that protects Tool behavior without changing the default training path.
+
+Changes:
+
+- `scripts/train/opvec_update_gates_from_rollouts.py` adds optional Tool null-space projection:
+  - enabled only by `--tool-nullspace-gate-gradients`;
+  - default off, so existing experiments do not enter this branch;
+  - collects Tool positive rows from current retention rows plus a fixed replay rollout file;
+  - recomputes behavior-span NLL gate gradients on selected Tool trajectories;
+  - builds an SVD basis from those gradients;
+  - projects the currently accumulated total gate gradient away from the protected span before gradient clipping and optimizer step.
+- `scripts/train/opvec_gated_grpo_bake_vllm_loop.py` forwards the null-space args to update.
+- `skill/command/run_qbank_c033333_gate_strategy.sh` exposes:
+  - `TOOL_NULLSPACE_GATE_GRADIENTS`
+  - `TOOL_NULLSPACE_REPLAY_ROLLOUT`
+  - `TOOL_NULLSPACE_ROWS`
+  - `TOOL_NULLSPACE_MIN_ROWS`
+  - `TOOL_NULLSPACE_RANK`
+  - `TOOL_NULLSPACE_EPS`
+  - `TOOL_NULLSPACE_POSITIVE_REWARD_THRESHOLD`
+- `scripts/data/build_tool_nullspace_calibration_v1.py` creates the v1 calibration bank:
+  - Tool: 16 original paper96 rows + 16 BFCL live historical-success rows;
+  - Memory: original paper96 32 rows;
+  - Code: original paper96 32 rows + 8 CURE eval-aligned hard-vs-TA anchors.
+- `skill/command/run_20260519_tool_nullspace_v1.sh` is the dedicated M1 launcher.
+- `tests/test_pcgrad_gate_gradients.py` adds unit tests for the null-space projection math and Tool behavior span extraction.
+
+Default impact:
+
+- Default training is unchanged unless `--tool-nullspace-gate-gradients` is passed.
+- Reward, dynamic OPD selection, retention selection, task weights, OPD/retention loss formulas, PCGrad, optimizer semantics, and gate parameterization are unchanged.
+
+Artifacts:
+
+- Config/report: `docs/config/20260519_tool_nullspace_v1.md`
+- Merged prompt manifest:
+  `/tmp/shared-storage/OnPolicy/data/calibration/20260519_tool_nullspace_v1/tool32_memory32_code40_toolnullspace_seed20260519.prompts.jsonl`
+- Tool replay rollout:
+  `/tmp/shared-storage/OnPolicy/data/calibration/20260519_tool_nullspace_v1/toolnullspace_tool_replay_rollouts_seed20260519.jsonl`
+
+Validation:
+
+```bash
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/train/opvec_update_gates_from_rollouts.py \
+  scripts/train/opvec_gated_grpo_bake_vllm_loop.py \
+  scripts/data/build_tool_nullspace_calibration_v1.py
+
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_pcgrad_gate_gradients.py
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_update_gates_objectives.py
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_gated_grpo_trust_region.py
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_gated_grpo_utils.py
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_bake_global_coefficients.py
+```
+
+`pytest` is not installed in the available BFCL/easyrl/system Python environments, so validation used the direct `unittest` script entrypoints.

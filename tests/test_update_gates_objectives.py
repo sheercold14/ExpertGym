@@ -47,6 +47,8 @@ class UpdateGatesObjectivesTest(unittest.TestCase):
             coefficient_anchor_gates={},
             args=Namespace(
                 max_coefficient_delta_from_init=None,
+                max_coefficient_delta_from_init_by_expert=[],
+                coefficient_bound_by_expert=[],
                 tool_min_margin_over_memory=0.0,
                 tool_min_margin_over_code=0.0,
             ),
@@ -93,6 +95,8 @@ class UpdateGatesObjectivesTest(unittest.TestCase):
             coefficient_anchor_gates={},
             args=Namespace(
                 max_coefficient_delta_from_init=None,
+                max_coefficient_delta_from_init_by_expert=[],
+                coefficient_bound_by_expert=[],
                 tool_min_margin_over_memory=0.0,
                 tool_min_margin_over_code=0.0,
             ),

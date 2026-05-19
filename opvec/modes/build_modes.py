@@ -51,6 +51,7 @@ def build_opvec4_modes(
 
     base_dir = Path(models["base"]).expanduser()
     base_index = load_safetensors_index(base_dir)
+    delta_bases = {str(key): str(value) for key, value in dict(models.get("delta_bases") or {}).items()}
     params = select_mergeable_params(
         list(base_index["weight_map"].keys()),
         include_regex=modes_cfg.get("include_regex"),
@@ -66,6 +67,7 @@ def build_opvec4_modes(
         "mode_set": "opvec4",
         "base_model": str(base_dir),
         "experts": dict(experts),
+        "delta_bases": delta_bases,
         "expert_names": expert_names,
         "selection": {
             "include_regex": list(modes_cfg.get("include_regex") or []),
@@ -90,18 +92,33 @@ def build_opvec4_modes(
         raise RuntimeError("Mode building requires torch and safetensors") from error
 
     dtype = _torch_dtype(torch, str(modes_cfg.get("delta_dtype", "float32")))
-    base_weight_map = base_index["weight_map"]
     diagnostics: dict[str, Any] = {"experts": {}, "params": {}, "total_l2_sq_by_expert": defaultdict(float)}
+    delta_base_indices: dict[str, tuple[Path, dict[str, str]]] = {}
+
+    def delta_base_for_expert(expert_name: str) -> tuple[Path, dict[str, str]]:
+        delta_base_dir = Path(delta_bases.get(expert_name, str(base_dir))).expanduser()
+        cache_key = str(delta_base_dir)
+        if cache_key not in delta_base_indices:
+            delta_base_indices[cache_key] = (delta_base_dir, load_safetensors_index(delta_base_dir)["weight_map"])
+        return delta_base_indices[cache_key]
 
     for expert_name in expert_names:
         expert_dir = Path(experts[expert_name]).expanduser()
         expert_weight_map = load_safetensors_index(expert_dir)["weight_map"]
+        delta_base_dir, delta_base_weight_map = delta_base_for_expert(expert_name)
         missing = [param for param in params if param not in expert_weight_map]
         if missing:
             raise KeyError(f"Expert {expert_name} missing selected params: {missing[:5]}")
-        diagnostics["experts"][expert_name] = {"path": str(expert_dir), "num_params": len(params)}
+        missing_base = [param for param in params if param not in delta_base_weight_map]
+        if missing_base:
+            raise KeyError(f"Delta base {delta_base_dir} for expert {expert_name} missing selected params: {missing_base[:5]}")
+        diagnostics["experts"][expert_name] = {
+            "path": str(expert_dir),
+            "delta_base": str(delta_base_dir),
+            "num_params": len(params),
+        }
         for param_name in params:
-            base_tensor = _read_safetensor(base_dir, base_weight_map[param_name], param_name)
+            base_tensor = _read_safetensor(delta_base_dir, delta_base_weight_map[param_name], param_name)
             expert_tensor = _read_safetensor(expert_dir, expert_weight_map[param_name], param_name)
             if list(base_tensor.shape) != list(expert_tensor.shape):
                 raise ValueError(f"Shape mismatch for {expert_name}:{param_name}")

@@ -159,6 +159,179 @@ class TorchLayerBandGateManager:
         return getattr(self.module, name)
 
 
+class TorchLayerBandCoefficientManager:
+    """nn.Module that learns one direct coefficient per layer band and expert."""
+
+    def __init__(
+        self,
+        torch_module: Any,
+        init_values: Mapping[str, float],
+        *,
+        layer_bands: Mapping[str, tuple[int, int]] | None = None,
+        coefficient_bounds: tuple[float, float] = (-0.50, 1.50),
+        expert_names: tuple[str, ...] = EXPERT_NAMES,
+    ):
+        nn = torch_module.nn
+        bands = dict(layer_bands or DEFAULT_LAYER_BANDS)
+        band_names = tuple(bands.keys())
+        experts = _expert_names_tuple(expert_names)
+        initial = _initial_layer_band_coefficients(init_values, band_names, expert_names=experts)
+
+        class _Manager(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.band_names = band_names
+                self.layer_bands = bands
+                self.expert_names = experts
+                self.raw_coefficients = nn.Parameter(torch_module.tensor(initial, dtype=torch_module.float32))
+                self.register_buffer(
+                    "initial_coefficients",
+                    torch_module.tensor(initial, dtype=torch_module.float32),
+                )
+
+            def band_for_param(self, param_name: str | None) -> str:
+                return layer_band_for_param(param_name, self.layer_bands, default=self.band_names[0])
+
+            def effective_gates(self, *, band: str | None = None, param_name: str | None = None):
+                if band is None and param_name is not None:
+                    band = self.band_for_param(param_name)
+                if band is not None:
+                    idx = self.band_names.index(band)
+                    row = self.raw_coefficients[idx]
+                    return {expert: row[index] for index, expert in enumerate(self.expert_names)}
+                values = {}
+                for band_idx, band_name in enumerate(self.band_names):
+                    for expert_idx, expert in enumerate(self.expert_names):
+                        values[f"{band_name}.{expert}"] = self.raw_coefficients[band_idx, expert_idx]
+                return values
+
+            def expert_coefficients(self, *, band: str | None = None, param_name: str | None = None):
+                return self.effective_gates(band=band, param_name=param_name)
+
+            def gate_values(self):
+                detached = self.raw_coefficients.detach().cpu()
+                values = {}
+                for band_idx, band_name in enumerate(self.band_names):
+                    for expert_idx, expert in enumerate(self.expert_names):
+                        values[f"{band_name}.{expert}"] = float(detached[band_idx, expert_idx].item())
+                return values
+
+            def project_(self):
+                with torch_module.no_grad():
+                    self.raw_coefficients.clamp_(float(coefficient_bounds[0]), float(coefficient_bounds[1]))
+
+        self.module = _Manager()
+
+    def __getattr__(self, name: str):
+        return getattr(self.module, name)
+
+
+class TorchLayerBandParameterCoefficientManager:
+    """Learn global expert strengths plus small layer-band residuals."""
+
+    def __init__(
+        self,
+        torch_module: Any,
+        init_values: Mapping[str, float],
+        *,
+        layer_bands: Mapping[str, tuple[int, int]] | None = None,
+        global_bounds: tuple[float, float] = (0.00, 1.20),
+        residual_bounds: tuple[float, float] = (-0.15, 0.15),
+        coefficient_bounds: tuple[float, float] = (-0.50, 1.50),
+        global_prior_scale: float = 0.10,
+        residual_prior_scale: float = 1.00,
+        expert_names: tuple[str, ...] = EXPERT_NAMES,
+    ):
+        nn = torch_module.nn
+        bands = dict(layer_bands or DEFAULT_LAYER_BANDS)
+        band_names = tuple(bands.keys())
+        experts = _expert_names_tuple(expert_names)
+        initial_global, initial_residual = _initial_layer_band_parameter_coefficients(
+            init_values,
+            band_names,
+            residual_bounds=residual_bounds,
+            expert_names=experts,
+        )
+
+        class _Manager(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.band_names = band_names
+                self.layer_bands = bands
+                self.expert_names = experts
+                self.global_prior_scale = float(global_prior_scale)
+                self.residual_prior_scale = float(residual_prior_scale)
+                self.raw_global_coefficients = nn.Parameter(torch_module.tensor(initial_global, dtype=torch_module.float32))
+                self.raw_residual_coefficients = nn.Parameter(torch_module.tensor(initial_residual, dtype=torch_module.float32))
+                self.register_buffer(
+                    "initial_global_coefficients",
+                    torch_module.tensor(initial_global, dtype=torch_module.float32),
+                )
+                self.register_buffer(
+                    "initial_residual_coefficients",
+                    torch_module.tensor(initial_residual, dtype=torch_module.float32),
+                )
+
+            def band_for_param(self, param_name: str | None) -> str:
+                return layer_band_for_param(param_name, self.layer_bands, default=self.band_names[0])
+
+            def effective_coefficients(self):
+                return self.raw_global_coefficients.unsqueeze(0) + self.raw_residual_coefficients
+
+            def effective_gates(self, *, band: str | None = None, param_name: str | None = None):
+                coefficients = self.effective_coefficients()
+                if band is None and param_name is not None:
+                    band = self.band_for_param(param_name)
+                if band is not None:
+                    idx = self.band_names.index(band)
+                    row = coefficients[idx]
+                    return {expert: row[index] for index, expert in enumerate(self.expert_names)}
+                values = {}
+                for expert_idx, expert in enumerate(self.expert_names):
+                    values[f"__global__::{expert}"] = self.raw_global_coefficients[expert_idx]
+                for band_idx, band_name in enumerate(self.band_names):
+                    for expert_idx, expert in enumerate(self.expert_names):
+                        values[f"{band_name}.{expert}"] = coefficients[band_idx, expert_idx]
+                return values
+
+            def expert_coefficients(self, *, band: str | None = None, param_name: str | None = None):
+                if band is None and param_name is None:
+                    values = self.raw_global_coefficients
+                    return {expert: values[index] for index, expert in enumerate(self.expert_names)}
+                return self.effective_gates(band=band, param_name=param_name)
+
+            def gate_values(self):
+                values = {}
+                detached_global = self.raw_global_coefficients.detach().cpu()
+                detached_effective = self.effective_coefficients().detach().cpu()
+                for expert_idx, expert in enumerate(self.expert_names):
+                    values[f"__global__::{expert}"] = float(detached_global[expert_idx].item())
+                for band_idx, band_name in enumerate(self.band_names):
+                    for expert_idx, expert in enumerate(self.expert_names):
+                        values[f"{band_name}.{expert}"] = float(detached_effective[band_idx, expert_idx].item())
+                return values
+
+            def project_(self):
+                with torch_module.no_grad():
+                    self.raw_global_coefficients.clamp_(float(global_bounds[0]), float(global_bounds[1]))
+                    self.raw_residual_coefficients.clamp_(float(residual_bounds[0]), float(residual_bounds[1]))
+                    effective = (self.raw_global_coefficients.unsqueeze(0) + self.raw_residual_coefficients).clamp(
+                        float(coefficient_bounds[0]),
+                        float(coefficient_bounds[1]),
+                    )
+                    self.raw_residual_coefficients.copy_(
+                        (effective - self.raw_global_coefficients.unsqueeze(0)).clamp(
+                            float(residual_bounds[0]),
+                            float(residual_bounds[1]),
+                        )
+                    )
+
+        self.module = _Manager()
+
+    def __getattr__(self, name: str):
+        return getattr(self.module, name)
+
+
 class TorchParameterCoefficientManager:
     """nn.Module that learns one coefficient per mergeable parameter and expert."""
 
@@ -437,6 +610,59 @@ def make_torch_gate_manager(
         )
     )
     if parameterization in {
+        "layer-band-coefficient",
+        "layer_band_coefficient",
+        "layer-band-coefficients",
+        "layer_band_coefficients",
+        "layer-band-direct",
+        "layer_band_direct",
+    }:
+        return TorchLayerBandCoefficientManager(
+            torch_module,
+            config.get("initial_gates", {}),
+            layer_bands=_config_layer_bands(config),
+            coefficient_bounds=coefficient_bounds,  # type: ignore[arg-type]
+            expert_names=expert_names,
+        ).module
+    if parameterization in {
+        "layer-band-parameter",
+        "layer_band_parameter",
+        "layer-band-param",
+        "layer_band_param",
+        "layer-band-residual",
+        "layer_band_residual",
+        "layer-band-hierarchical",
+        "layer_band_hierarchical",
+        "hierarchical-layer-band",
+        "hierarchical_layer_band",
+    }:
+        global_bounds = tuple(
+            float(item)
+            for item in config.get("gate_bounds", {}).get(
+                "global_coefficient",
+                (0.00, 1.20),
+            )
+        )
+        layer_residual_bounds = tuple(
+            float(item)
+            for item in config.get("gate_bounds", {}).get(
+                "layer_band_residual",
+                config.get("gate_bounds", {}).get("parameter_residual", (-0.15, 0.15)),
+            )
+        )
+        loss_config = config.get("loss", {})
+        return TorchLayerBandParameterCoefficientManager(
+            torch_module,
+            config.get("initial_gates", {}),
+            layer_bands=_config_layer_bands(config),
+            global_bounds=global_bounds,  # type: ignore[arg-type]
+            residual_bounds=layer_residual_bounds,  # type: ignore[arg-type]
+            coefficient_bounds=coefficient_bounds,  # type: ignore[arg-type]
+            global_prior_scale=float(loss_config.get("global_coefficient_prior_scale", 0.10)),
+            residual_prior_scale=float(loss_config.get("layer_band_residual_prior_scale", loss_config.get("parameter_residual_prior_scale", 1.00))),
+            expert_names=expert_names,
+        ).module
+    if parameterization in {
         "global-coefficient",
         "global_coefficient",
         "global-coefficients",
@@ -542,6 +768,60 @@ def _initial_global_coefficients(
     return values
 
 
+def _initial_layer_band_coefficients(
+    init_values: Mapping[str, float],
+    band_names: tuple[str, ...],
+    *,
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
+) -> list[list[float]]:
+    rows = []
+    for band in band_names:
+        fallback = _fallback_layer_band_coefficients(init_values, band, expert_names=expert_names)
+        row = []
+        for expert in expert_names:
+            row.append(
+                float(
+                    init_values.get(
+                        f"{band}.{expert}",
+                        init_values.get(f"{band}_{expert}", init_values.get(expert, fallback[expert])),
+                    )
+                )
+            )
+        rows.append(row)
+    return rows
+
+
+def _initial_layer_band_parameter_coefficients(
+    init_values: Mapping[str, float],
+    band_names: tuple[str, ...],
+    *,
+    residual_bounds: tuple[float, float],
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
+) -> tuple[list[float], list[list[float]]]:
+    rows = _initial_layer_band_coefficients(init_values, band_names, expert_names=expert_names)
+    explicit_global = [init_values.get(f"__global__::{expert}") for expert in expert_names]
+    if any(value is not None for value in explicit_global):
+        global_values = [
+            float(value) if value is not None else sum(row[expert_idx] for row in rows) / len(rows)
+            for expert_idx, value in enumerate(explicit_global)
+        ]
+    else:
+        global_values = [sum(row[expert_idx] for row in rows) / len(rows) for expert_idx in range(len(expert_names))]
+    residuals = []
+    for band_name, row in zip(band_names, rows):
+        residual_row = []
+        for expert_idx, expert in enumerate(expert_names):
+            residual_key = f"__residual__::{band_name}::{expert}"
+            raw_residual = init_values.get(residual_key)
+            if raw_residual is None:
+                raw_residual = row[expert_idx] - global_values[expert_idx]
+            residual_row.append(
+                max(float(residual_bounds[0]), min(float(raw_residual), float(residual_bounds[1])))
+            )
+        residuals.append(residual_row)
+    return global_values, residuals
+
+
 def _initial_global_parameter_coefficients(
     init_values: Mapping[str, float],
     param_names: tuple[str, ...],
@@ -578,8 +858,27 @@ def _fallback_expert_coefficients(
     *,
     expert_names: tuple[str, ...] = EXPERT_NAMES,
 ) -> dict[str, float]:
+    if all(expert in init_values for expert in expert_names):
+        return {expert: float(init_values[expert]) for expert in expert_names}
+    if all(f"global.{expert}" in init_values for expert in expert_names):
+        return {expert: float(init_values[f"global.{expert}"]) for expert in expert_names}
     common = float(init_values.get("common", 0.5))
     residuals = {expert: float(init_values.get(f"{expert}_residual", 0.0)) for expert in expert_names}
+    mean_residual = sum(residuals.values()) / len(residuals)
+    return {expert: common + residual - mean_residual for expert, residual in residuals.items()}
+
+
+def _fallback_layer_band_coefficients(
+    init_values: Mapping[str, float],
+    band: str,
+    *,
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
+) -> dict[str, float]:
+    common = _init_value(init_values, band, "common", sum(_fallback_expert_coefficients(init_values, expert_names=expert_names).values()) / len(expert_names))
+    residuals = {
+        expert: _init_value(init_values, band, f"{expert}_residual", float(init_values.get(f"{expert}_residual", 0.0)))
+        for expert in expert_names
+    }
     mean_residual = sum(residuals.values()) / len(residuals)
     return {expert: common + residual - mean_residual for expert, residual in residuals.items()}
 

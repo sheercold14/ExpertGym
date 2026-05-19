@@ -29,6 +29,7 @@ def main() -> None:
         gate_values=gate_values,
         output_dir=output,
         plan_only=args.plan_only,
+        layer_bands=_config_layer_bands(config),
     )
     print(json.dumps({"output": str(output), "num_delta_entries": summary["num_delta_entries"], "plan_only": args.plan_only}, indent=2))
 
@@ -41,6 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None)
     parser.add_argument("--plan-only", action="store_true")
     return parser.parse_args()
+
+
+def _config_layer_bands(config: dict) -> dict[str, tuple[int, int]] | None:
+    raw = config.get("layer_bands") or config.get("modes", {}).get("layer_bands")
+    if not raw:
+        return None
+    bands: dict[str, tuple[int, int]] = {}
+    for name, bounds in raw.items():
+        if len(bounds) != 2:
+            raise ValueError(f"Layer band {name} must have [start, end] bounds")
+        bands[str(name)] = (int(bounds[0]), int(bounds[1]))
+    return bands
 
 
 if __name__ == "__main__":

@@ -43,6 +43,8 @@ class PCGradGateGradientsTest(unittest.TestCase):
             args=Namespace(
                 pcgrad_gate_gradients=False,
                 max_coefficient_delta_from_init=None,
+                max_coefficient_delta_from_init_by_expert=[],
+                coefficient_bound_by_expert=[],
                 tool_min_margin_over_memory=0.0,
                 tool_min_margin_over_code=0.0,
             ),
@@ -104,6 +106,56 @@ class PCGradGateGradientsTest(unittest.TestCase):
         self.assertTrue(torch.allclose(param.grad, torch.tensor([0.25, -0.5])))
         param.grad.zero_()
         self.assertTrue(torch.allclose(param.grad, torch.zeros_like(param)))
+
+
+class ToolNullspaceGateGradientsTest(unittest.TestCase):
+    def test_projection_removes_protected_direction(self):
+        total_grad = torch.tensor([3.0, 4.0])
+        basis_grads = [torch.tensor([1.0, 0.0]), torch.tensor([2.0, 0.0])]
+
+        projected, stats = update_gates_module._project_flat_grad_away_from_basis_grads(
+            torch,
+            total_grad,
+            basis_grads,
+            eps=1e-12,
+            max_rank=0,
+        )
+
+        self.assertTrue(torch.allclose(projected, torch.tensor([0.0, 4.0]), atol=1e-6))
+        self.assertEqual(stats["rank"], 1)
+        self.assertAlmostEqual(stats["grad_norm_before"], 5.0, places=6)
+        self.assertAlmostEqual(stats["grad_norm_after"], 4.0, places=6)
+        self.assertAlmostEqual(stats["removed_norm"], 3.0, places=6)
+
+    def test_projection_respects_rank_limit(self):
+        total_grad = torch.tensor([3.0, 4.0])
+        basis_grads = [torch.tensor([2.0, 0.0]), torch.tensor([0.0, 1.0])]
+
+        projected, stats = update_gates_module._project_flat_grad_away_from_basis_grads(
+            torch,
+            total_grad,
+            basis_grads,
+            eps=1e-12,
+            max_rank=1,
+        )
+
+        self.assertTrue(torch.allclose(projected, torch.tensor([0.0, 4.0]), atol=1e-6))
+        self.assertEqual(stats["rank"], 1)
+
+    def test_tool_behavior_char_spans_prefer_tool_call_markup(self):
+        text = 'prefix <tool_call>{"name":"x"}</tool_call> suffix'
+        spans = update_gates_module._tool_behavior_char_spans(text)
+
+        self.assertEqual(len(spans), 1)
+        protected = text[spans[0][0] : spans[0][1]]
+        self.assertTrue(protected.startswith("<tool_call>"))
+        self.assertTrue(protected.endswith("</tool_call>"))
+
+    def test_tool_behavior_char_spans_cover_bfcl_bracket_call(self):
+        text = "[get_weather(location='Boston')]"
+        spans = update_gates_module._tool_behavior_char_spans(text)
+
+        self.assertEqual(spans, [(0, len(text))])
 
 
 if __name__ == "__main__":

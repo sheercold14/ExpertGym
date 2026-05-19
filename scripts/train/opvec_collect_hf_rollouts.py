@@ -607,7 +607,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument(
         "--gate-parameterization",
-        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        choices=["global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"],
         default="global",
     )
     parser.add_argument("--gate-checkpoint", default=None)
@@ -620,6 +620,20 @@ def parse_args() -> argparse.Namespace:
 def _normalize_gate_parameterization(value: str) -> str:
     aliases = {
         "layer_band": "layer-band",
+        "layer_band_coefficient": "layer-band-coefficient",
+        "layer-band-coefficients": "layer-band-coefficient",
+        "layer_band_coefficients": "layer-band-coefficient",
+        "layer-band-direct": "layer-band-coefficient",
+        "layer_band_direct": "layer-band-coefficient",
+        "layer_band_parameter": "layer-band-parameter",
+        "layer-band-param": "layer-band-parameter",
+        "layer_band_param": "layer-band-parameter",
+        "layer-band-residual": "layer-band-parameter",
+        "layer_band_residual": "layer-band-parameter",
+        "layer-band-hierarchical": "layer-band-parameter",
+        "layer_band_hierarchical": "layer-band-parameter",
+        "hierarchical-layer-band": "layer-band-parameter",
+        "hierarchical_layer_band": "layer-band-parameter",
         "param": "parameter",
         "param-coefficients": "parameter",
         "parameter-coefficients": "parameter",

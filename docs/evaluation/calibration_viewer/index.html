@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Calibration Prompt Viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="title-block">
+          <h1>Calibration Prompt Viewer</h1>
+          <div id="datasetPath" class="path-line"></div>
+        </div>
+        <div class="toolbar">
+          <label class="file-button">
+            Load JSONL
+            <input id="fileInput" type="file" accept=".jsonl,.json,.txt" />
+          </label>
+          <button id="copyPathButton" type="button">Copy Path</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar">
+          <section class="filter-panel">
+            <div class="search-row">
+              <input id="searchInput" type="search" placeholder="Search prompt, id, tag, source" />
+            </div>
+            <div id="taskFilters" class="segmented"></div>
+            <div id="roleFilters" class="role-list"></div>
+          </section>
+          <section class="summary-panel">
+            <h2>Summary</h2>
+            <div id="summaryStats" class="stat-grid"></div>
+          </section>
+          <section class="row-list-panel">
+            <h2>Prompts</h2>
+            <div id="rowList" class="row-list"></div>
+          </section>
+        </aside>
+
+        <section class="detail-pane">
+          <nav class="tabs" aria-label="Detail sections">
+            <button class="tab active" type="button" data-tab="overview">Overview</button>
+            <button class="tab" type="button" data-tab="rollouts">Rollouts</button>
+            <button class="tab" type="button" data-tab="reward">Reward</button>
+            <button class="tab" type="button" data-tab="livecodebench">LiveCodeBench</button>
+            <button class="tab" type="button" data-tab="reference">Reference</button>
+            <button class="tab" type="button" data-tab="raw">Raw</button>
+          </nav>
+
+          <article id="overviewTab" class="tab-panel active"></article>
+          <article id="rolloutsTab" class="tab-panel"></article>
+          <article id="rewardTab" class="tab-panel"></article>
+          <article id="livecodebenchTab" class="tab-panel"></article>
+          <article id="referenceTab" class="tab-panel"></article>
+          <article id="rawTab" class="tab-panel"></article>
+        </section>
+      </main>
+    </div>
+
+    <script src="./data/eval_targeted96_cure_aligned_20260517.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

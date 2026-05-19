@@ -70,6 +70,18 @@ def build_zero_gate_checkpoint(
             for expert in expert_names:
                 gates[f"{band_name}.{expert}_residual"] = 0.0
 
+    if parameterization == "layer-band-coefficient":
+        for band_name in _layer_band_names(config):
+            for expert in expert_names:
+                gates[f"{band_name}.{expert}"] = 0.0
+
+    if parameterization == "layer-band-parameter":
+        for expert in expert_names:
+            gates[f"__global__::{expert}"] = 0.0
+        for band_name in _layer_band_names(config):
+            for expert in expert_names:
+                gates[f"{band_name}.{expert}"] = 0.0
+
     if parameterization in {"parameter", "global-parameter"}:
         param_names = manifest_param_names(mode_manifest, weight_only=not include_bias)
         if not param_names:
@@ -95,6 +107,20 @@ def build_zero_gate_checkpoint(
 def normalize_parameterization(value: str) -> str:
     aliases = {
         "layer_band": "layer-band",
+        "layer_band_coefficient": "layer-band-coefficient",
+        "layer-band-coefficients": "layer-band-coefficient",
+        "layer_band_coefficients": "layer-band-coefficient",
+        "layer-band-direct": "layer-band-coefficient",
+        "layer_band_direct": "layer-band-coefficient",
+        "layer_band_parameter": "layer-band-parameter",
+        "layer-band-param": "layer-band-parameter",
+        "layer_band_param": "layer-band-parameter",
+        "layer-band-residual": "layer-band-parameter",
+        "layer_band_residual": "layer-band-parameter",
+        "layer-band-hierarchical": "layer-band-parameter",
+        "layer_band_hierarchical": "layer-band-parameter",
+        "hierarchical-layer-band": "layer-band-parameter",
+        "hierarchical_layer_band": "layer-band-parameter",
         "param": "parameter",
         "param-coefficients": "parameter",
         "parameter-coefficients": "parameter",
@@ -112,7 +138,7 @@ def normalize_parameterization(value: str) -> str:
         "expert_coefficient": "global-coefficient",
     }
     normalized = aliases.get(str(value), str(value))
-    if normalized not in {"global", "layer-band", "parameter", "global-parameter", "global-coefficient"}:
+    if normalized not in {"global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"}:
         raise ValueError(f"Unknown gate parameterization: {value}")
     return normalized
 
@@ -145,7 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gate-parameterization",
         default="global-parameter",
-        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        choices=["global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"],
     )
     parser.add_argument("--include-bias", action="store_true", help="Include non-weight manifest entries if present.")
     return parser.parse_args()

@@ -14,7 +14,7 @@ from statistics import mean, pstdev
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-EXPERTS = ("tool", "memory", "code")
+DEFAULT_EXPERTS = ("tool", "memory", "code")
 PAPER96_EVAL_MODELS = {
     "A_gc_opd": "paper96-a-gc-fixedopd-final-iter8",
     "B_gc_noopd": "paper96-b-gc-noopd-final-iter8",
@@ -28,6 +28,7 @@ EVAL6_RUN_ID = "eval6-20260502-125748"
 def main() -> None:
     args = parse_args()
     run_specs = [_parse_run_dir_spec(item) for item in args.run_dir]
+    iteration_offsets = _parse_iteration_offsets(args.run_iteration_offset)
     missing = [str(run_dir) for _, run_dir in run_specs if not run_dir.exists()]
     if missing:
         raise SystemExit(f"run dir not found: {missing[0]}")
@@ -41,7 +42,12 @@ def main() -> None:
             if parsed.path == "/api/state":
                 query = parse_qs(parsed.query)
                 max_prompt_rows = int(query.get("max_prompt_rows", [args.max_prompt_rows])[0])
-                state = _build_api_state(run_specs, init_value=args.init_value, max_prompt_rows=max_prompt_rows)
+                state = _build_api_state(
+                    run_specs,
+                    init_value=args.init_value,
+                    max_prompt_rows=max_prompt_rows,
+                    iteration_offsets=iteration_offsets,
+                )
                 self._send_json(state)
                 return
             self.send_error(404)
@@ -90,20 +96,45 @@ def _parse_run_dir_spec(value: str) -> tuple[str, Path]:
     return run_id or run_dir.name, run_dir
 
 
+def _parse_iteration_offsets(items: list[str]) -> dict[str, int]:
+    offsets: dict[str, int] = {}
+    for item in items or []:
+        if "=" not in str(item):
+            raise ValueError(f"--run-iteration-offset expects RUN_ID=OFFSET, got: {item}")
+        run_id, raw_offset = str(item).split("=", 1)
+        run_id = run_id.strip()
+        if not run_id:
+            raise ValueError(f"--run-iteration-offset has empty RUN_ID: {item}")
+        offsets[run_id] = int(raw_offset)
+    return offsets
+
+
 def _build_api_state(
     run_specs: list[tuple[str, Path]],
     *,
     init_value: float,
     max_prompt_rows: int,
+    iteration_offsets: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    iteration_offsets = dict(iteration_offsets or {})
     if len(run_specs) == 1:
         run_id, run_dir = run_specs[0]
-        state = build_state(run_dir, init_value=init_value, max_prompt_rows=max_prompt_rows)
+        state = build_state(
+            run_dir,
+            init_value=init_value,
+            max_prompt_rows=max_prompt_rows,
+            iteration_offset=iteration_offsets.get(run_id, 0),
+        )
         state["run_id"] = run_id
         return state
     runs = []
     for run_id, run_dir in run_specs:
-        state = build_state(run_dir, init_value=init_value, max_prompt_rows=max_prompt_rows)
+        state = build_state(
+            run_dir,
+            init_value=init_value,
+            max_prompt_rows=max_prompt_rows,
+            iteration_offset=iteration_offsets.get(run_id, 0),
+        )
         state["run_id"] = run_id
         runs.append(state)
     return {
@@ -114,7 +145,7 @@ def _build_api_state(
     }
 
 
-def build_state(run_dir: Path, *, init_value: float, max_prompt_rows: int) -> dict[str, Any]:
+def build_state(run_dir: Path, *, init_value: float, max_prompt_rows: int, iteration_offset: int = 0) -> dict[str, Any]:
     iterations = []
     loop_manifest = _read_json(run_dir / "gated_grpo_bake_vllm_loop_manifest.json") or {}
     manifest_iterations = {
@@ -122,6 +153,7 @@ def build_state(run_dir: Path, *, init_value: float, max_prompt_rows: int) -> di
         for item in loop_manifest.get("iterations", [])
         if isinstance(item, dict) and item.get("iteration") is not None
     }
+    initial_gate_values = _manifest_initial_gate_values(loop_manifest)
     for iter_dir in sorted(run_dir.glob("iter_*")):
         if not iter_dir.is_dir():
             continue
@@ -129,10 +161,12 @@ def build_state(run_dir: Path, *, init_value: float, max_prompt_rows: int) -> di
             _iteration_state(
                 iter_dir,
                 init_value=init_value,
+                initial_gate_values=initial_gate_values,
                 max_prompt_rows=max_prompt_rows,
                 manifest_iteration=manifest_iterations.get(iter_dir.name),
             )
         )
+    _apply_iteration_offset(iterations, int(iteration_offset))
     return {
         "format": "opvec_monitor_state_v1",
         "run_dir": str(run_dir),
@@ -147,10 +181,30 @@ def build_state(run_dir: Path, *, init_value: float, max_prompt_rows: int) -> di
     }
 
 
+def _apply_iteration_offset(iterations: list[dict[str, Any]], offset: int) -> None:
+    if int(offset) == 0:
+        return
+    for item in iterations:
+        physical = str(item.get("iteration") or "")
+        item["physical_iteration"] = physical
+        item["iteration"] = _offset_iteration_name(physical, offset)
+
+
+def _offset_iteration_name(name: str, offset: int) -> str:
+    if not name.startswith("iter_"):
+        return name
+    try:
+        value = int(name.split("_", 1)[1])
+    except ValueError:
+        return name
+    return f"iter_{value + int(offset):03d}"
+
+
 def _iteration_state(
     iter_dir: Path,
     *,
     init_value: float,
+    initial_gate_values: dict[str, float] | None,
     max_prompt_rows: int,
     manifest_iteration: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -168,7 +222,7 @@ def _iteration_state(
     gates = _load_gates(gates_path) if gates_path.exists() else {}
     status = _status(rollout_path=rollout_path, update_summary_path=update_summary_path, gates_path=gates_path)
     update = _compact_update(update_summary)
-    gate_stats = _gate_stats(gates, init_value=init_value) if gates else None
+    gate_stats = _gate_stats(gates, init_value=init_value, initial_gates=initial_gate_values) if gates else None
     token_stats = _token_stats(rows)
     metrics = _iteration_metrics(
         task_stats=task_stats,
@@ -385,7 +439,7 @@ def _iteration_metrics(
         ),
         "task_rewards": {task: _float(stats.get("mean_reward")) for task, stats in sorted(task_stats.items())},
         "task_frontier_rows": {task: int(stats.get("kept_frontier_rows") or 0) for task, stats in sorted(task_stats.items())},
-        "opd_task_rows": {task: int(opd_task_counts.get(task) or 0) for task in EXPERTS},
+        "opd_task_rows": {task: int(opd_task_counts.get(task) or 0) for task in DEFAULT_EXPERTS},
         "expert_coefficients": dict((gate_stats or {}).get("expert_means") or {}),
         "expert_delta_from_init": dict((gate_stats or {}).get("expert_delta") or {}),
     }
@@ -484,21 +538,49 @@ def _percentile(values: list[int], q: float) -> float:
     return float(ordered[index])
 
 
-def _gate_stats(gates: dict[str, float], *, init_value: float) -> dict[str, Any]:
+def _manifest_initial_gate_values(loop_manifest: dict[str, Any]) -> dict[str, float] | None:
+    for item in loop_manifest.get("iterations", []):
+        if not isinstance(item, dict):
+            continue
+        path = item.get("input_gate_checkpoint")
+        if not path:
+            continue
+        gate_path = Path(str(path))
+        if gate_path.exists():
+            return _load_gates(gate_path)
+    return None
+
+
+def _gate_stats(gates: dict[str, float], *, init_value: float, initial_gates: dict[str, float] | None = None) -> dict[str, Any]:
     coeffs = _effective_coefficients(gates)
+    initial_coeffs = {
+        (name, expert): value
+        for name, expert, value in _effective_coefficients(initial_gates or {})
+    }
     values = [value for _, _, value in coeffs]
     by_expert: dict[str, list[float]] = defaultdict(list)
+    by_expert_delta: dict[str, list[float]] = defaultdict(list)
     by_source: dict[str, list[float]] = defaultdict(list)
     by_source_expert: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    deltas: list[float] = []
     for name, expert, value in coeffs:
+        anchor = initial_coeffs.get((name, expert), init_value)
+        delta = value - anchor
         by_expert[expert].append(value)
+        by_expert_delta[expert].append(delta)
         source = _coefficient_source(name)
         by_source[source].append(value)
         by_source_expert[source][expert].append(value)
-    abs_deltas = [abs(value - init_value) for value in values]
+        deltas.append(delta)
+    abs_deltas = [abs(delta) for delta in deltas]
     top_changed = sorted(
         [
-            {"name": name, "expert": expert, "value": value, "delta": value - init_value}
+            {
+                "name": name,
+                "expert": expert,
+                "value": value,
+                "delta": value - initial_coeffs.get((name, expert), init_value),
+            }
             for name, expert, value in coeffs
         ],
         key=lambda item: abs(float(item["delta"])),
@@ -513,7 +595,7 @@ def _gate_stats(gates: dict[str, float], *, init_value: float) -> dict[str, Any]
         "mean_abs_delta_from_init": mean(abs_deltas) if abs_deltas else 0.0,
         "max_abs_delta_from_init": max(abs_deltas) if abs_deltas else 0.0,
         "expert_means": {expert: mean(items) for expert, items in sorted(by_expert.items()) if items},
-        "expert_delta": {expert: mean(items) - init_value for expert, items in sorted(by_expert.items()) if items},
+        "expert_delta": {expert: mean(items) for expert, items in sorted(by_expert_delta.items()) if items},
         "source_stats": {
             source: {
                 "n": len(items),
@@ -545,30 +627,56 @@ def _coefficient_source(name: str) -> str:
 
 
 def _effective_coefficients(gates: dict[str, float]) -> list[tuple[str, str, float]]:
+    experts = _infer_experts(gates)
     param_keys = [key for key in gates if "::" in key and not key.startswith("__global__::")]
     if param_keys:
         output = []
         for key in sorted(param_keys):
             name, expert = key.rsplit("::", 1)
-            if expert in EXPERTS:
+            if expert in experts:
                 output.append((name, expert, float(gates[key])))
         return output
-    if all(expert in gates for expert in EXPERTS):
-        return [("global", expert, float(gates[expert])) for expert in EXPERTS]
+    if all(expert in gates for expert in experts):
+        return [("global", expert, float(gates[expert])) for expert in experts]
     band_names = sorted({key.split(".", 1)[0] for key in gates if "." in key and "::" not in key})
     if band_names:
         output = []
         for band in band_names:
+            if all(f"{band}.{expert}" in gates for expert in experts):
+                for expert in experts:
+                    output.append((band, expert, float(gates[f"{band}.{expert}"])))
+                continue
             common = float(gates.get(f"{band}.common", gates.get("common", 0.5)))
-            residuals = [float(gates.get(f"{band}.{expert}_residual", gates.get(f"{expert}_residual", 0.0))) for expert in EXPERTS]
+            residuals = [float(gates.get(f"{band}.{expert}_residual", gates.get(f"{expert}_residual", 0.0))) for expert in experts]
             residual_mean = sum(residuals) / len(residuals)
-            for expert, residual in zip(EXPERTS, residuals):
+            for expert, residual in zip(experts, residuals):
                 output.append((band, expert, common + residual - residual_mean))
         return output
     common = float(gates.get("common", 0.5))
-    residuals = [float(gates.get(f"{expert}_residual", 0.0)) for expert in EXPERTS]
+    residuals = [float(gates.get(f"{expert}_residual", 0.0)) for expert in experts]
     residual_mean = sum(residuals) / len(residuals)
-    return [("global", expert, common + residual - residual_mean) for expert, residual in zip(EXPERTS, residuals)]
+    return [("global", expert, common + residual - residual_mean) for expert, residual in zip(experts, residuals)]
+
+
+def _infer_experts(gates: dict[str, float]) -> tuple[str, ...]:
+    experts = []
+    for key in sorted(gates):
+        if "::" in key:
+            expert = key.rsplit("::", 1)[1]
+        elif key.endswith("_residual"):
+            tail = key.split(".", 1)[1] if "." in key else key
+            expert = tail[: -len("_residual")]
+        elif "." in key:
+            expert = key.split(".", 1)[1]
+            if expert == "common":
+                continue
+        elif "." not in key and key not in {"common"}:
+            expert = key
+        else:
+            continue
+        if expert and expert not in experts:
+            experts.append(expert)
+    return tuple(experts) if experts else DEFAULT_EXPERTS
 
 
 def _reward_series(iterations: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -587,12 +695,21 @@ def _reward_series(iterations: list[dict[str, Any]]) -> dict[str, list[dict[str,
 
 
 def _coefficient_series(iterations: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    series: dict[str, list[dict[str, Any]]] = {expert: [] for expert in EXPERTS}
+    experts = sorted(
+        {
+            str(expert)
+            for item in iterations
+            for expert in ((item.get("gate_stats") or {}).get("expert_means") or {})
+        }
+    )
+    if not experts:
+        experts = list(DEFAULT_EXPERTS)
+    series: dict[str, list[dict[str, Any]]] = {expert: [] for expert in experts}
     for item in iterations:
         gate_stats = item.get("gate_stats") or {}
         means = gate_stats.get("expert_means") or {}
         deltas = gate_stats.get("expert_delta") or {}
-        for expert in EXPERTS:
+        for expert in experts:
             if expert in means:
                 series[expert].append(
                     {
@@ -750,7 +867,7 @@ def _alerts(iterations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if update and update.get("gate_grad_nonzero") is False:
             alerts.append({"level": "error", "iteration": item["iteration"], "reason": "gate_grad_zero"})
         counts = update.get("frontier_task_counts") or {}
-        for task in EXPERTS:
+        for task in DEFAULT_EXPERTS:
             if counts and int(counts.get(task, 0)) == 0:
                 alerts.append({"level": "warn", "iteration": item["iteration"], "task": task, "reason": "no_frontier_rows"})
     return alerts
@@ -821,7 +938,7 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OP-VEC Monitor</title>
   <style>
-    :root { color-scheme: light; --bg:#f7f8fb; --panel:#ffffff; --panel2:#f2f5f9; --line:#d8dee9; --text:#19202d; --muted:#687386; --tool:#0a8f5a; --memory:#2f64c5; --code:#c46a16; --bad:#c93333; --ok:#18864b; --warn:#9b6a00; }
+    :root { color-scheme: light; --bg:#f7f8fb; --panel:#ffffff; --panel2:#f2f5f9; --line:#d8dee9; --text:#19202d; --muted:#687386; --tool:#0a8f5a; --memory:#2f64c5; --code:#c46a16; --reasoning:#7a3fc0; --bad:#c93333; --ok:#18864b; --warn:#9b6a00; }
     * { box-sizing: border-box; }
     body { margin:0; font:14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
     header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:flex-start; justify-content:space-between; gap:18px; position:sticky; top:0; background:rgba(255,255,255,.96); z-index:5; }
@@ -836,7 +953,7 @@ INDEX_HTML = r"""<!doctype html>
     th { color:var(--muted); font-weight:600; font-size:12px; }
     .pill { display:inline-block; padding:2px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:12px; }
     .num { font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .task-tool { color:var(--tool); } .task-memory { color:var(--memory); } .task-code { color:var(--code); }
+    .task-tool { color:var(--tool); } .task-memory { color:var(--memory); } .task-code { color:var(--code); } .task-reasoning { color:var(--reasoning); }
     canvas { width:100%; height:270px; display:block; background:#fff; border:1px solid var(--line); border-radius:4px; }
     .controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
     select, input { background:#fff; color:var(--text); border:1px solid var(--line); border-radius:4px; padding:5px 7px; }
@@ -850,7 +967,7 @@ INDEX_HTML = r"""<!doctype html>
     .value { font:650 22px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .sub { color:var(--muted); font-size:12px; margin-top:4px; overflow-wrap:anywhere; }
     .spark { height:8px; border-radius:99px; background:#222936; overflow:hidden; margin-top:8px; display:flex; }
-    .seg-tool { background:var(--tool); } .seg-memory { background:var(--memory); } .seg-code { background:var(--code); }
+    .seg-tool { background:var(--tool); } .seg-memory { background:var(--memory); } .seg-code { background:var(--code); } .seg-reasoning { background:var(--reasoning); }
     .small { font-size:12px; color:var(--muted); }
     .header-right { display:flex; flex-direction:column; gap:6px; align-items:flex-end; min-width:260px; }
     .run-select { display:none; align-items:center; gap:8px; }
@@ -906,7 +1023,9 @@ INDEX_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
-    const colors = {tool:'#0a8f5a', memory:'#2f64c5', code:'#c46a16'};
+    const taskNames = ['tool','memory','code'];
+    const preferredExperts = ['tool','memory','code','reasoning'];
+    const colors = {tool:'#0a8f5a', memory:'#2f64c5', code:'#c46a16', reasoning:'#7a3fc0'};
     const strategyColors = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#8c564b', '#17becf'];
     const metricLabels = {
       mean_reward:'mean reward',
@@ -998,19 +1117,44 @@ INDEX_HTML = r"""<!doctype html>
       if (!state.alerts.length) { box.textContent = 'no alerts'; return; }
       box.innerHTML = state.alerts.map(a => '<span class="alert">' + esc(JSON.stringify(a)) + '</span>').join('<br>');
     }
+    function orderedExperts(experts) {
+      const set = new Set((experts || []).filter(Boolean).map(String));
+      const ordered = preferredExperts.filter(name => set.has(name));
+      const rest = [...set].filter(name => !preferredExperts.includes(name)).sort();
+      return [...ordered, ...rest];
+    }
+    function gateExpertsForRun(run) {
+      const names = new Set();
+      for (const it of (run.iterations || [])) {
+        const coeffs = ((it.metrics || {}).expert_coefficients) || {};
+        Object.keys(coeffs).forEach(name => names.add(name));
+      }
+      return orderedExperts(names.size ? [...names] : taskNames);
+    }
+    function expertsFromMetricKeys(keys) {
+      const names = new Set();
+      for (const key of keys || []) {
+        if (key.startsWith('coefficient/')) names.add(key.slice('coefficient/'.length));
+        if (key.startsWith('delta_from_init/')) names.add(key.slice('delta_from_init/'.length));
+      }
+      return orderedExperts(names.size ? [...names] : taskNames);
+    }
+    function taskClass(name) {
+      return 'task-' + String(name || '').replace(/[^A-Za-z0-9_-]/g, '_');
+    }
     function renderAllRuns() {
       const box = document.getElementById('allRuns');
       const runs = isMulti() ? rootState.runs : [state];
-      let html = '<table><thead><tr><th>run</th><th>状态 / 轮次</th><th>当前阶段</th><th>耗时</th><th>reward tool/memory/code</th><th>gate tool/memory/code</th><th>frontier</th><th>OPD / all-fail</th><th>Eval6</th></tr></thead><tbody>';
+      let html = '<table><thead><tr><th>run</th><th>状态 / 轮次</th><th>当前阶段</th><th>耗时</th><th>reward tool/memory/code</th><th>gate coefficients</th><th>frontier</th><th>OPD / all-fail</th><th>Eval6</th></tr></thead><tbody>';
       for (const run of runs) {
         const summary = run.run_summary || {};
         const latest = run.iterations[run.iterations.length - 1] || {};
         const metrics = latest.metrics || {};
         const gateIteration = latestWithGate(run) || latest;
         const gateMetrics = gateIteration.metrics || {};
-        const rewards = ['tool','memory','code'].map(t => `<span class="task-${t}">${t}</span> <span class="num">${fmt((metrics.task_rewards || {})[t])}</span>`).join('<br>');
+        const rewards = taskNames.map(t => `<span class="${taskClass(t)}">${t}</span> <span class="num">${fmt((metrics.task_rewards || {})[t])}</span>`).join('<br>');
         const gateNote = gateIteration.iteration && gateIteration.iteration !== latest.iteration ? `<div class="path">from ${esc(gateIteration.iteration)}</div>` : '';
-        const gates = ['tool','memory','code'].map(t => `<span class="task-${t}">${t}</span> <span class="num">${fmt((gateMetrics.expert_coefficients || {})[t])}</span>`).join('<br>') + gateNote;
+        const gates = gateExpertsForRun(run).map(t => `<span class="${taskClass(t)}">${t}</span> <span class="num">${fmt((gateMetrics.expert_coefficients || {})[t])}</span>`).join('<br>') + gateNote;
         const frontier = JSON.stringify((latest.update || {}).frontier_task_counts || metrics.task_frontier_rows || {});
         const opdCounts = (latest.dynamic_opd || {}).selected_task_counts || (latest.update || {}).opd_distill_task_counts || {};
         const opd = `OPD ${metrics.opd_distill_rows || 0} ${esc(JSON.stringify(opdCounts))}<br>all-fail <span class="num">${metrics.all_fail_rows || 0}</span> retention <span class="num">${metrics.retention_rows || 0}</span>`;
@@ -1044,7 +1188,7 @@ INDEX_HTML = r"""<!doctype html>
       const latest = state.iterations[state.iterations.length - 1] || {};
       const tasks = latest.task_stats || {};
       const totalTaskRows = Object.values(tasks).reduce((a, x) => a + Number(x.rows || 0), 0) || 1;
-      const spark = ['tool','memory','code'].map(t => `<span class="seg-${t}" style="width:${100 * Number((tasks[t] || {}).rows || 0) / totalTaskRows}%"></span>`).join('');
+      const spark = taskNames.map(t => `<span class="seg-${t}" style="width:${100 * Number((tasks[t] || {}).rows || 0) / totalTaskRows}%"></span>`).join('');
       const timing = s.timing_totals || {};
       document.getElementById('overview').innerHTML = [
         card('status', esc(s.status || 'pending'), `iters ${s.iterations || 0}`),
@@ -1070,6 +1214,7 @@ INDEX_HTML = r"""<!doctype html>
       const lastEpoch = epochs[epochs.length - 1] || {};
       const means = gate.expert_means || {};
       const deltas = gate.expert_delta || {};
+      const experts = gateExpertsForRun(state);
       let cards = [
         card('source iteration', latest.iteration || '', latest.status || ''),
         card('optimizer steps', update.optimizer_steps ?? '', `updates ${update.updates ?? ''}`),
@@ -1077,7 +1222,7 @@ INDEX_HTML = r"""<!doctype html>
         card('gate max delta', fmt(gate.max_abs_delta_from_init), `mean abs ${fmt(gate.mean_abs_delta_from_init)}`),
       ].join('');
       let table = '<table><thead><tr><th>expert</th><th>coefficient</th><th>delta</th></tr></thead><tbody>';
-      for (const task of ['tool','memory','code']) table += `<tr><td class="task-${task}">${task}</td><td class="num">${fmt(means[task])}</td><td class="num">${fmt(deltas[task])}</td></tr>`;
+      for (const task of experts) table += `<tr><td class="${taskClass(task)}">${task}</td><td class="num">${fmt(means[task])}</td><td class="num">${fmt(deltas[task])}</td></tr>`;
       table += '</tbody></table>';
       const sources = Object.entries(gate.source_stats || {}).slice(0, 12);
       let sourceTable = '';
@@ -1085,7 +1230,7 @@ INDEX_HTML = r"""<!doctype html>
         sourceTable = '<h2>Global-parameter source 聚合</h2><table><thead><tr><th>source</th><th>n</th><th>mean/min/max</th><th>task-wise mean</th></tr></thead><tbody>';
         for (const [source, s] of sources) {
           const tm = s.task_mean || {};
-          sourceTable += `<tr><td class="path">${esc(source)}</td><td class="num">${s.n}</td><td class="num">${fmt(s.mean)} / ${fmt(s.min)} / ${fmt(s.max)}</td><td>${['tool','memory','code'].map(t => `<span class="task-${t}">${t}</span> <span class="num">${fmt(tm[t])}</span>`).join('<br>')}</td></tr>`;
+          sourceTable += `<tr><td class="path">${esc(source)}</td><td class="num">${s.n}</td><td class="num">${fmt(s.mean)} / ${fmt(s.min)} / ${fmt(s.max)}</td><td>${experts.map(t => `<span class="${taskClass(t)}">${t}</span> <span class="num">${fmt(tm[t])}</span>`).join('<br>')}</td></tr>`;
         }
         sourceTable += '</tbody></table>';
       }
@@ -1094,7 +1239,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderIterations() {
       let html = '<table><thead><tr><th>iter</th><th>status</th><th>rows</th><th>task rewards</th><th>tokens</th><th>frontier</th><th>OPD / all-fail</th><th>gate mean / max delta</th></tr></thead><tbody>';
       for (const it of state.iterations) {
-        const rewards = Object.entries(it.task_stats || {}).map(([task,s]) => `<span class="task-${task}">${task}</span> <span class="num">${fmt(s.mean_reward)}</span> sr <span class="num">${fmt(s.success_rate)}</span> fr <span class="num">${fmt(s.frontier_ratio)}</span>`).join('<br>');
+        const rewards = Object.entries(it.task_stats || {}).map(([task,s]) => `<span class="${taskClass(task)}">${task}</span> <span class="num">${fmt(s.mean_reward)}</span> sr <span class="num">${fmt(s.success_rate)}</span> fr <span class="num">${fmt(s.frontier_ratio)}</span>`).join('<br>');
         const frontier = it.update ? JSON.stringify(it.update.frontier_task_counts || {}) : '';
         const dyn = it.dynamic_opd || {};
         const opdCounts = dyn.selected_task_counts || (it.update || {}).opd_distill_task_counts || {};
@@ -1125,8 +1270,15 @@ INDEX_HTML = r"""<!doctype html>
       const oldCoef = coefSelect.value || 'coefficient/tool';
       const coefKeys = (isMulti() ? Object.keys(rootState.comparison_series || {}) : Object.keys(state.metric_series || {}))
         .filter(key => key.startsWith('coefficient/') || key.startsWith('delta_from_init/'));
-      const orderedCoef = ['coefficient/tool','coefficient/memory','coefficient/code','delta_from_init/tool','delta_from_init/memory','delta_from_init/code']
-        .filter(key => coefKeys.includes(key));
+      const coefExperts = expertsFromMetricKeys(coefKeys);
+      const preferredCoef = [
+        ...coefExperts.map(expert => `coefficient/${expert}`),
+        ...coefExperts.map(expert => `delta_from_init/${expert}`),
+      ];
+      const orderedCoef = [
+        ...preferredCoef.filter(key => coefKeys.includes(key)),
+        ...coefKeys.filter(key => !preferredCoef.includes(key)).sort(),
+      ];
       coefSelect.innerHTML = orderedCoef.map(key => `<option value="${esc(key)}">${esc(key.replace('coefficient/', 'coef ').replace('delta_from_init/', 'delta '))}</option>`).join('');
       coefSelect.value = orderedCoef.includes(oldCoef) ? oldCoef : (orderedCoef[0] || '');
     }
@@ -1140,7 +1292,7 @@ INDEX_HTML = r"""<!doctype html>
       let html = '<table><thead><tr><th>prompt</th><th>task</th><th>mean/std</th><th>success</th><th>tokens</th><th>samples</th><th>status</th></tr></thead><tbody>';
       for (const row of rows) {
         const bars = row.samples.map(s => `<span title="${esc(s.sample_id)} reward=${fmt(s.reward)}" class="bar ${s.reward > 0 ? 'pos' : (s.reward < 0 ? 'neg' : '')}" style="width:${Math.max(8, Math.min(70, 12 + Math.abs(s.reward) * 12))}px"></span>`).join('');
-        html += `<tr><td class="path">${esc(row.prompt_id)}</td><td class="task-${row.task}">${row.task}</td><td class="num">${fmt(row.mean_reward)} / ${fmt(row.std_reward)}</td><td class="num">${row.success_count}/${row.samples.length}</td><td class="num">${fmt(row.token_mean)} max ${fmt(row.token_max)}</td><td><div class="samples">${bars}</div></td><td>${row.keep_for_policy_loss ? '<span class="pill">frontier</span>' : esc(row.skip_reason || '')}</td></tr>`;
+        html += `<tr><td class="path">${esc(row.prompt_id)}</td><td class="${taskClass(row.task)}">${row.task}</td><td class="num">${fmt(row.mean_reward)} / ${fmt(row.std_reward)}</td><td class="num">${row.success_count}/${row.samples.length}</td><td class="num">${fmt(row.token_mean)} max ${fmt(row.token_max)}</td><td><div class="samples">${bars}</div></td><td>${row.keep_for_policy_loss ? '<span class="pill">frontier</span>' : esc(row.skip_reason || '')}</td></tr>`;
       }
       html += '</tbody></table>';
       document.getElementById('promptRows').innerHTML = html;
@@ -1300,6 +1452,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--init-value", type=float, default=1.0 / 3.0)
     parser.add_argument("--max-prompt-rows", type=int, default=300)
+    parser.add_argument(
+        "--run-iteration-offset",
+        action="append",
+        default=[],
+        help="Display-only iteration offset for a run_id, e.g. --run-iteration-offset r1_continue=10.",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 

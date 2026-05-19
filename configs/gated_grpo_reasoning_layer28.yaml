@@ -1,0 +1,137 @@
+# Gated-GRPO configuration for four-expert OP-VEC with one layer band per
+# transformer layer.  Intended for scaled DeepSeek-R1 reasoning delta
+# experiments where tool/memory/code start near 1.0 and reasoning starts around
+# 0.0005-0.001 with an expert-specific trust region.
+
+run:
+  name: opvec-gated-grpo-reasoning-layer28
+  seed: 20260518
+
+storage:
+  root: ${ONPOLICY_STORAGE_ROOT}
+
+models:
+  base: /mnt/cache/wuruixiao/models/Qwen2.5-7b-instruct
+  experts:
+    tool: /mnt/cache/wuruixiao/models/Qwen2.5-7B-Instruct-ToolRL-grpo-cold
+    memory: /mnt/cache/wuruixiao/models/RL-MemoryAgent-7B
+    code: /mnt/cache/wuruixiao/models/ReasonFlux-Coder-7B
+    reasoning: /mnt/cache/wuruixiao/models/DeepSeek-R1-Distill-Qwen-7B
+  reference_policy: /tmp/shared-storage/AgentMerging_plan/experiments/conflict_gated_residual/ITER_019_cg_tool_extra020/model
+
+modes:
+  mode_set: opvec4_reasoning
+  artifact_dir: ${ONPOLICY_STORAGE_ROOT}/modes/opvec4_reasoning_20260516
+  expert_names: [tool, memory, code, reasoning]
+  residual_zero_mean: true
+  include_regex:
+    - "^model\\.layers\\.[0-9]+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\\.weight$"
+  exclude_regex:
+    - ".*lm_head.*"
+    - ".*norm.*"
+    - ".*embed_tokens.*"
+    - ".*bias.*"
+  delta_dtype: float32
+
+layer_bands:
+  layer0: [0, 0]
+  layer1: [1, 1]
+  layer2: [2, 2]
+  layer3: [3, 3]
+  layer4: [4, 4]
+  layer5: [5, 5]
+  layer6: [6, 6]
+  layer7: [7, 7]
+  layer8: [8, 8]
+  layer9: [9, 9]
+  layer10: [10, 10]
+  layer11: [11, 11]
+  layer12: [12, 12]
+  layer13: [13, 13]
+  layer14: [14, 14]
+  layer15: [15, 15]
+  layer16: [16, 16]
+  layer17: [17, 17]
+  layer18: [18, 18]
+  layer19: [19, 19]
+  layer20: [20, 20]
+  layer21: [21, 21]
+  layer22: [22, 22]
+  layer23: [23, 23]
+  layer24: [24, 24]
+  layer25: [25, 25]
+  layer26: [26, 26]
+  layer27: [27, 27]
+
+initial_gates:
+  common: 0.75025
+  tool_residual: 0.24975
+  memory_residual: 0.24975
+  code_residual: 0.24975
+  reasoning_residual: -0.74925
+
+gate_bounds:
+  common: [0.00, 1.30]
+  residual: [-1.00, 1.00]
+  coefficient: [0.00, 1.30]
+  global_coefficient: [0.00, 1.30]
+  parameter_residual: [-0.10, 0.10]
+
+data:
+  seed_manifest: ${ONPOLICY_STORAGE_ROOT}/data/seed_prompt_manifest.jsonl
+  behavior_matrix: ${ONPOLICY_STORAGE_ROOT}/data/behavior_matrix.jsonl
+  rollout_store: ${ONPOLICY_STORAGE_ROOT}/runs/gated_grpo/onpolicy_rollouts.jsonl
+
+rollout:
+  samples_per_prompt: 8
+  temperature: 0.7
+  top_p: 0.95
+  max_new_tokens:
+    tool: 512
+    memory: 2048
+    code: 10000
+
+frontier:
+  min_frontier_weight: 0.20
+  min_reward_std: 0.05
+  drop_all_success_from_policy_loss: true
+  drop_all_failure_without_contract_signal: true
+
+loss:
+  eps_clip: 0.2
+  beta_kl: 0.02
+  lambda_prior: 0.02
+  lambda_retention: 0.10
+  lambda_invalid: 0.10
+  advantage_eps: 1.0e-6
+  global_coefficient_prior_scale: 0.10
+  parameter_residual_prior_scale: 1.00
+
+reward:
+  behavior_span_weight: 0.00
+
+calibration:
+  frontier_task_quota:
+    code: 64
+    tool: 64
+    memory: 32
+  task_loss_weight:
+    code: 1.0
+    tool: 1.0
+    memory: 1.0
+
+optimizer:
+  name: adamw
+  lr: 0.01
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+
+train:
+  max_steps: 1
+  prompt_batch_size: 150
+  retention_batch_size: 32
+  eval_interval: 1
+  bake_interval: 1
+
+evaluation:
+  model_name: opvec-gated-grpo-reasoning-layer28

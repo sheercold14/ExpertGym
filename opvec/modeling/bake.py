@@ -64,6 +64,7 @@ def create_bake_plan(
     mode_manifest_path: str | Path,
     gate_values: Mapping[str, float],
     output_dir: str | Path,
+    layer_bands: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     manifest_path = Path(mode_manifest_path).expanduser().resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -71,13 +72,17 @@ def create_bake_plan(
     parameter_mode = _is_parameter_coefficient_values(gate_values)
     global_parameter_mode = parameter_mode and any(str(key).startswith("__global__::") for key in gate_values)
     layer_band_mode = (not parameter_mode) and _is_layer_band_gate_values(gate_values)
+    layer_band_parameter_mode = layer_band_mode and any(str(key).startswith("__global__::") for key in gate_values)
     global_coefficient_mode = (not parameter_mode) and (not layer_band_mode) and _is_global_coefficient_values(gate_values, expert_names)
     if parameter_mode:
         projected = {str(key): float(value) for key, value in gate_values.items() if "::" in str(key)}
         coeffs = {"parameter_coefficients": projected}
     elif layer_band_mode:
-        projected = project_layer_band_gates(gate_values)
-        coeffs = {band: expert_coefficients(_band_gate_values(projected, band)) for band in _gate_band_names(projected)}
+        projected = project_layer_band_gates(gate_values, expert_names=expert_names)
+        coeffs = {
+            band: _expert_coefficients_for_experts(_band_gate_values(projected, band, expert_names=expert_names), expert_names)
+            for band in _gate_band_names(projected)
+        }
     elif global_coefficient_mode:
         projected = _global_coefficient_values(gate_values, expert_names)
         coeffs = dict(projected)
@@ -85,12 +90,14 @@ def create_bake_plan(
         projected = project_gates(gate_values).as_dict()
         coeffs = expert_coefficients(projected)
     entries_by_param: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    bake_layer_bands = dict(layer_bands or DEFAULT_LAYER_BANDS)
+    default_layer_band = next(iter(bake_layer_bands), "early")
     for entry in manifest.get("basis_entries", []):
         expert = str(entry["expert"])
         if parameter_mode:
             coeff = float(projected.get(f"{entry['param_name']}::{expert}", 0.0))
         elif layer_band_mode:
-            band = layer_band_for_param(str(entry["param_name"]), DEFAULT_LAYER_BANDS)
+            band = layer_band_for_param(str(entry["param_name"]), bake_layer_bands, default=default_layer_band)
             coeff = float(coeffs[band][expert])
         else:
             coeff = float(coeffs[expert])
@@ -108,7 +115,15 @@ def create_bake_plan(
         "gate_parameterization": (
             "global-parameter"
             if global_parameter_mode
-            else ("parameter" if parameter_mode else ("layer-band" if layer_band_mode else ("global-coefficient" if global_coefficient_mode else "global")))
+            else (
+                "parameter"
+                if parameter_mode
+                else (
+                    "layer-band-parameter"
+                    if layer_band_parameter_mode
+                    else ("layer-band" if layer_band_mode else ("global-coefficient" if global_coefficient_mode else "global"))
+                )
+            )
         ),
         "num_params": len(entries_by_param),
         "num_delta_entries": sum(len(value) for value in entries_by_param.values()),
@@ -122,11 +137,13 @@ def bake_checkpoint(
     gate_values: Mapping[str, float],
     output_dir: str | Path,
     plan_only: bool = False,
+    layer_bands: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     plan = create_bake_plan(
         mode_manifest_path=mode_manifest_path,
         gate_values=gate_values,
         output_dir=output_dir,
+        layer_bands=layer_bands,
     )
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -199,13 +216,37 @@ def ensure_tokenizer_chat_template(tokenizer_config_path: Path) -> bool:
     return True
 
 
-def project_layer_band_gates(gate_values: Mapping[str, float]) -> dict[str, float]:
+def project_layer_band_gates(gate_values: Mapping[str, float], expert_names: tuple[str, ...] = EXPERT_NAMES) -> dict[str, float]:
     projected = {}
     for band in _gate_band_names(gate_values):
-        band_projected = project_gates(_band_gate_values(gate_values, band)).as_dict()
+        band_projected = _project_common_residual_gates(_band_gate_values(gate_values, band, expert_names=expert_names), expert_names)
         for key, value in band_projected.items():
             projected[f"{band}.{key}"] = value
     return projected
+
+
+def _project_common_residual_gates(values: Mapping[str, float], expert_names: tuple[str, ...]) -> dict[str, float]:
+    """Project a common-plus-residual gate set for an arbitrary expert list."""
+
+    if _is_global_coefficient_values_for_experts(values, expert_names):
+        return _global_coefficient_values(values, expert_names)
+    common = float(values.get("common", values.get("a_common", 0.0)))
+    residuals = [
+        float(values.get(f"{expert}_residual", values.get(f"a_{expert}", 0.0)))
+        for expert in expert_names
+    ]
+    mean_residual = sum(residuals) / float(len(residuals))
+    projected = {"common": common}
+    for expert, residual in zip(expert_names, residuals):
+        projected[f"{expert}_residual"] = residual - mean_residual
+    return projected
+
+
+def _expert_coefficients_for_experts(values: Mapping[str, float], expert_names: tuple[str, ...]) -> dict[str, float]:
+    if _is_global_coefficient_values_for_experts(values, expert_names):
+        return _global_coefficient_values(values, expert_names)
+    common = float(values.get("common", 0.0))
+    return {expert: common + float(values.get(f"{expert}_residual", 0.0)) for expert in expert_names}
 
 
 def _is_layer_band_gate_values(gate_values: Mapping[str, float]) -> bool:
@@ -213,7 +254,7 @@ def _is_layer_band_gate_values(gate_values: Mapping[str, float]) -> bool:
 
 
 def _is_parameter_coefficient_values(gate_values: Mapping[str, float]) -> bool:
-    return any("::" in str(key) for key in gate_values)
+    return any("::" in str(key) and not str(key).startswith("__global__::") for key in gate_values)
 
 
 def _is_global_coefficient_values_for_experts(gate_values: Mapping[str, float], expert_names: tuple[str, ...]) -> bool:
@@ -255,10 +296,16 @@ def _gate_band_names(gate_values: Mapping[str, float]) -> list[str]:
     return names or list(DEFAULT_LAYER_BANDS)
 
 
-def _band_gate_values(gate_values: Mapping[str, float], band: str) -> dict[str, float]:
-    return {
-        "common": float(gate_values.get(f"{band}.common", gate_values.get("common", 0.5))),
-        "tool_residual": float(gate_values.get(f"{band}.tool_residual", gate_values.get("tool_residual", 0.0))),
-        "memory_residual": float(gate_values.get(f"{band}.memory_residual", gate_values.get("memory_residual", 0.0))),
-        "code_residual": float(gate_values.get(f"{band}.code_residual", gate_values.get("code_residual", 0.0))),
-    }
+def _band_gate_values(
+    gate_values: Mapping[str, float],
+    band: str,
+    expert_names: tuple[str, ...] = EXPERT_NAMES,
+) -> dict[str, float]:
+    values = {"common": float(gate_values.get(f"{band}.common", gate_values.get("common", 0.5)))}
+    for expert in expert_names:
+        values[f"{expert}_residual"] = float(
+            gate_values.get(f"{band}.{expert}_residual", gate_values.get(f"{expert}_residual", 0.0))
+        )
+        if f"{band}.{expert}" in gate_values or expert in gate_values:
+            values[expert] = float(gate_values.get(f"{band}.{expert}", gate_values.get(expert, 0.0)))
+    return values

@@ -29,6 +29,7 @@ def main() -> None:
         config=config,
         include_bias=bool(args.include_bias),
         expert_names=expert_names,
+        expert_values=_parse_expert_values(args.expert_value),
     )
     payload = {
         "format": "opvec_constant_gate_checkpoint_v1",
@@ -51,23 +52,42 @@ def build_constant_gate_checkpoint(
     config: dict[str, Any] | None = None,
     include_bias: bool = False,
     expert_names: tuple[str, ...] = EXPERT_NAMES,
+    expert_values: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     parameterization = normalize_parameterization(parameterization)
+    coefficients = {expert: float(value) for expert in expert_names}
+    coefficients.update({expert: float(value) for expert, value in dict(expert_values or {}).items()})
     if parameterization == "global-coefficient":
-        gates: dict[str, float] = {expert: value for expert in expert_names}
+        gates: dict[str, float] = {expert: coefficients[expert] for expert in expert_names}
     else:
-        gates = {"common": value}
+        common = sum(coefficients[expert] for expert in expert_names) / float(len(expert_names))
+        gates = {"common": common}
         for expert in expert_names:
-            gates[f"{expert}_residual"] = 0.0
+            gates[f"{expert}_residual"] = coefficients[expert] - common
     param_names: list[str] = []
     band_names: list[str] = []
 
     if parameterization == "layer-band":
         band_names = _layer_band_names(config)
         for band_name in band_names:
-            gates[f"{band_name}.common"] = value
+            common = sum(coefficients[expert] for expert in expert_names) / float(len(expert_names))
+            gates[f"{band_name}.common"] = common
             for expert in expert_names:
-                gates[f"{band_name}.{expert}_residual"] = 0.0
+                gates[f"{band_name}.{expert}_residual"] = coefficients[expert] - common
+
+    if parameterization == "layer-band-coefficient":
+        band_names = _layer_band_names(config)
+        for band_name in band_names:
+            for expert in expert_names:
+                gates[f"{band_name}.{expert}"] = coefficients[expert]
+
+    if parameterization == "layer-band-parameter":
+        band_names = _layer_band_names(config)
+        for expert in expert_names:
+            gates[f"__global__::{expert}"] = coefficients[expert]
+        for band_name in band_names:
+            for expert in expert_names:
+                gates[f"{band_name}.{expert}"] = coefficients[expert]
 
     if parameterization in {"parameter", "global-parameter"}:
         param_names = manifest_param_names(mode_manifest, weight_only=not include_bias)
@@ -75,16 +95,17 @@ def build_constant_gate_checkpoint(
             raise ValueError("No mergeable parameters found in mode manifest.")
         if parameterization == "global-parameter":
             for expert in expert_names:
-                gates[f"__global__::{expert}"] = value
+                gates[f"__global__::{expert}"] = coefficients[expert]
         for param_name in param_names:
             for expert in expert_names:
-                gates[f"{param_name}::{expert}"] = value
+                gates[f"{param_name}::{expert}"] = coefficients[expert]
 
     return gates, {
         "num_mergeable_params": len(param_names),
         "num_layer_bands": len(band_names),
         "num_gate_values": len(gates),
         "experts": list(expert_names),
+        "expert_values": coefficients,
         "constant_init_meaning": "all effective task-vector coefficients start at the requested value",
     }
 
@@ -92,6 +113,20 @@ def build_constant_gate_checkpoint(
 def normalize_parameterization(value: str) -> str:
     aliases = {
         "layer_band": "layer-band",
+        "layer_band_coefficient": "layer-band-coefficient",
+        "layer-band-coefficients": "layer-band-coefficient",
+        "layer_band_coefficients": "layer-band-coefficient",
+        "layer-band-direct": "layer-band-coefficient",
+        "layer_band_direct": "layer-band-coefficient",
+        "layer_band_parameter": "layer-band-parameter",
+        "layer-band-param": "layer-band-parameter",
+        "layer_band_param": "layer-band-parameter",
+        "layer-band-residual": "layer-band-parameter",
+        "layer_band_residual": "layer-band-parameter",
+        "layer-band-hierarchical": "layer-band-parameter",
+        "layer_band_hierarchical": "layer-band-parameter",
+        "hierarchical-layer-band": "layer-band-parameter",
+        "hierarchical_layer_band": "layer-band-parameter",
         "param": "parameter",
         "param-coefficients": "parameter",
         "parameter-coefficients": "parameter",
@@ -109,7 +144,7 @@ def normalize_parameterization(value: str) -> str:
         "expert_coefficient": "global-coefficient",
     }
     normalized = aliases.get(str(value), str(value))
-    if normalized not in {"global", "layer-band", "parameter", "global-parameter", "global-coefficient"}:
+    if normalized not in {"global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"}:
         raise ValueError(f"Unknown gate parameterization: {value}")
     return normalized
 
@@ -134,16 +169,36 @@ def _manifest_expert_names(mode_manifest: str | Path) -> tuple[str, ...]:
     return EXPERT_NAMES
 
 
+def _parse_expert_values(items: list[str] | None) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for item in items or []:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(f"--expert-value expects EXPERT=VALUE, got: {part}")
+            expert, value = part.split("=", 1)
+            values[expert.strip()] = float(value)
+    return values
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode-manifest", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--value", type=float, required=True)
+    parser.add_argument(
+        "--expert-value",
+        action="append",
+        default=[],
+        help="Override one expert coefficient, e.g. --expert-value reasoning=0.001. Repeatable or comma-separated.",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument(
         "--gate-parameterization",
         default="global",
-        choices=["global", "layer-band", "parameter", "global-parameter", "global-coefficient"],
+        choices=["global", "layer-band", "layer-band-coefficient", "layer-band-parameter", "parameter", "global-parameter", "global-coefficient"],
     )
     parser.add_argument("--include-bias", action="store_true")
     return parser.parse_args()

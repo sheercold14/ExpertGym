@@ -1,0 +1,121 @@
+\begin{thebibliography}{16}
+\providecommand{\natexlab}[1]{#1}
+
+\bibitem[{Agarwal et~al.(2024)Agarwal, Vieillard, Zhou, Stanczyk, Geist, and
+  Bachem}]{agarwal2024gkd}
+Rishabh Agarwal, Nino Vieillard, Yongchao Zhou, Piotr Stanczyk, Matthieu Geist,
+  and Olivier Bachem. 2024.
+\newblock On-policy distillation of language models: Learning from
+  self-generated mistakes.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[{Cheng et~al.(2025)Cheng, Xiong, Wei, Zhu, and Yuan}]{cheng2025wudi}
+Runxi Cheng, Feng Xiong, Yongxian Wei, Wanyun Zhu, and Chun Yuan. 2025.
+\newblock Whoever started the interference should end it: Guiding data-free
+  model merging via task vectors.
+\newblock In \emph{International Conference on Machine Learning}.
+
+\bibitem[{Deep et~al.(2024)Deep, Bhardwaj, and Poria}]{deep2024della}
+Pala~Tej Deep, Rishabh Bhardwaj, and Soujanya Poria. 2024.
+\newblock {DELLA}-merging: Reducing interference in model merging through
+  magnitude-based sampling.
+\newblock \emph{arXiv preprint arXiv:2406.11617}.
+
+\bibitem[{Feng et~al.(2026)Feng, Chen, Zhao, Xiong, Wang, Yu, Nian, Xiao, Cao,
+  and Jiang}]{feng2026arm}
+Zhuoka Feng, Kang Chen, Sihan Zhao, Kai Xiong, Yaoning Wang, Minshen Yu, Junjie
+  Nian, Changyi Xiao, Yixin Cao, and Yugang Jiang. 2026.
+\newblock {ARM}: Role-conditioned neuron transplantation for training-free
+  generalist {LLM} agent merging.
+\newblock \emph{arXiv preprint arXiv:2601.07309}.
+
+\bibitem[{Gargiulo et~al.(2025)Gargiulo, Crisostomi, Bucarelli, Scardapane,
+  Silvestri, and Rodola}]{gargiulo2025tsv}
+Antonio~Andrea Gargiulo, Donato Crisostomi, Maria~Sofia Bucarelli, Simone
+  Scardapane, Fabrizio Silvestri, and Emanuele Rodola. 2025.
+\newblock Task singular vectors: Reducing task interference in model merging.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision
+  and Pattern Recognition}.
+
+\bibitem[{Ilharco et~al.(2023)Ilharco, Ribeiro, Wortsman, Gururangan, Schmidt,
+  Hajishirzi, and Farhadi}]{ilharco2023editing}
+Gabriel Ilharco, Marco~Tulio Ribeiro, Mitchell Wortsman, Suchin Gururangan,
+  Ludwig Schmidt, Hannaneh Hajishirzi, and Ali Farhadi. 2023.
+\newblock Editing models with task arithmetic.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[{Jain et~al.(2025)Jain, Han, Gu, Li, Yan, Zhang, Wang, Solar-Lezama,
+  Sen, and Stoica}]{jain2025livecodebench}
+Naman Jain, King Han, Alex Gu, Wen-Ding Li, Fanjia Yan, Tianjun Zhang, Sida
+  Wang, Armando Solar-Lezama, Koushik Sen, and Ion Stoica. 2025.
+\newblock Livecodebench: Holistic and contamination free evaluation of large
+  language models for code.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[{Patil et~al.(2025)Patil, Zhang, Wang, and Gonzalez}]{patil2025bfcl}
+Shishir~G. Patil, Tianjun Zhang, Xin Wang, and Joseph~E. Gonzalez. 2025.
+\newblock Berkeley function calling leaderboard: A challenging and executable
+  function calling benchmark.
+\newblock In \emph{Proceedings of Machine Learning Research}.
+
+\bibitem[{Shao et~al.(2024)Shao, Wang, Zhu, Xu, Song, Bi, Zhang, Zhang, Li, Wu,
+  and Guo}]{shao2024deepseekmath}
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei
+  Zhang, Mingchuan Zhang, Y.~K. Li, Y.~Wu, and Daya Guo. 2024.
+\newblock {DeepSeekMath}: Pushing the limits of mathematical reasoning in open
+  language models.
+\newblock \emph{arXiv preprint arXiv:2402.03300}.
+
+\bibitem[{Wang et~al.(2025)}]{wang2025cure}
+Yibo Wang and 1 others. 2025.
+\newblock Co-evolving {LLM} coder and unit tester via reinforcement learning.
+\newblock \emph{arXiv preprint arXiv:2506.03136}.
+
+\bibitem[{Wortsman et~al.(2022)Wortsman, Ilharco, Gadre, Roelofs, Lopes,
+  Morcos, Namkoong, Farhadi, Carmon, Kornblith, and
+  Schmidt}]{wortsman2022model}
+Mitchell Wortsman, Gabriel Ilharco, Samir~Yitzhak Gadre, Rebecca Roelofs,
+  Raphael~Gontijo Lopes, Ari~S. Morcos, Hongseok Namkoong, Ali Farhadi, Yair
+  Carmon, Simon Kornblith, and Ludwig Schmidt. 2022.
+\newblock Model soups: averaging weights of multiple fine-tuned models improves
+  accuracy without increasing inference time.
+\newblock In \emph{Proceedings of the 39th International Conference on Machine
+  Learning}, pages 23965--23998.
+
+\bibitem[{Yadav et~al.(2023)Yadav, Tam, Choshen, Raffel, and
+  Bansal}]{yadav2023ties}
+Prateek Yadav, Derek Tam, Leshem Choshen, Colin Raffel, and Mohit Bansal. 2023.
+\newblock {TIES}-merging: Resolving interference when merging models.
+\newblock In \emph{Advances in Neural Information Processing Systems}.
+
+\bibitem[{Yang et~al.(2018)Yang, Qi, Zhang, Bengio, Cohen, Salakhutdinov, and
+  Manning}]{yang2018hotpotqa}
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William~W. Cohen, Ruslan
+  Salakhutdinov, and Christopher~D. Manning. 2018.
+\newblock Hotpotqa: A dataset for diverse, explainable multi-hop question
+  answering.
+\newblock In \emph{Proceedings of the 2018 Conference on Empirical Methods in
+  Natural Language Processing}, pages 2369--2380.
+
+\bibitem[{Yu et~al.(2023)Yu, Yu, Yu, Huang, and Li}]{yu2023dare}
+Le~Yu, Bowen Yu, Haiyang Yu, Fei Huang, and Yongbin Li. 2023.
+\newblock Language models are super mario: Absorbing abilities from homologous
+  models as a free lunch.
+\newblock \emph{arXiv preprint arXiv:2311.03099}.
+
+\bibitem[{Yuan et~al.(2026)Yuan, Shi, Zhang, Liu, Yao, Vosoughi, and
+  Lee}]{yuan2026ram}
+Xiangchi Yuan, Dachuan Shi, Chunhui Zhang, Zheyuan Liu, Shenglong Yao, Soroush
+  Vosoughi, and Wenke Lee. 2026.
+\newblock Behavior knowledge merge in reinforced agentic models.
+\newblock \emph{arXiv preprint arXiv:2601.13572}.
+
+\bibitem[{Zhang et~al.(2025)Zhang, Ma, Ni, Wu, Shu, Jiang, and
+  Chen}]{zhang2025expertmerging}
+Dengming Zhang, Xiaowen Ma, Zhenliang Ni, Zhenkai Wu, Han Shu, Xin Jiang, and
+  Xinghao Chen. 2025.
+\newblock Expert merging: Model merging with unsupervised expert alignment and
+  importance-guided layer chunking.
+\newblock \emph{arXiv preprint arXiv:2509.25712}.
+
+\end{thebibliography}

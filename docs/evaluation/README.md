@@ -13,7 +13,8 @@
 | 文件 | 内容 | 原始来源 |
 |---|---|---|
 | `20260516_tonight_abc_eval6.md` | 2026-05-16 A/B/C 受控实验正式 eval6 结果 | Tool/Memory/Code 三类 `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_abc_20260516_addons.py` |
-| `20260517_defg_eval6.md` | 2026-05-17 D/E/F/G 正式 eval6 结果，当前 Tool+Memory 完成，Code pending | Tool/Memory `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_defg_20260517_addons.py` |
+| `20260517_defg_eval6.md` | 2026-05-17 D/E/F/G 正式 eval6 结果，含 F/G final iter20 补充评测 | Tool/Memory/Code `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_defg_20260517_addons.py` |
+| `20260519_r1math_L_eval6.md` | 2026-05-19 Correct-R1 L 系列 `L1 iter009` / `L2 iter009` 正式 Eval6，当前 running | Tool/Memory/Code `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_r1math_L_20260519_addons.py` |
 
 ## 记录格式
 
@@ -42,3 +43,11 @@
 评测报告：
 
 `/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/evaluation/20260516_tonight_abc_eval6.md`
+
+## 2026-05-17 P0
+
+- [20260517_p0_ta13_eval6.md](20260517_p0_ta13_eval6.md): strict `TA-1/3` formal eval6, used as symmetric-prior baseline for ExpertGym paper.
+- [20260517_p0_static_baselines_eval6.md](20260517_p0_static_baselines_eval6.md): P0 static baseline table for `TA-1/3`, `TA-0.75`, and `init1`; Code rows are updated as CURE finishes.
+- [20260518_baselines_eval6.md](20260518_baselines_eval6.md): paper baseline batch for TIES, DARE-TA, DARE-TIES, and AdaMerging; WUDI/ExpertMerging are indexed but not rerun.
+- [20260518_p1_evaltarget_candidates.md](20260518_p1_evaltarget_candidates.md): P1 eval-targeted training candidate queue; entries are not final eval6 until explicitly marked done.
+- [20260518_p1_evaltarget_eval6.md](20260518_p1_evaltarget_eval6.md): P1 eval-targeted candidate formal Eval6 table; Tool results are filled first, Memory/Code rows are completed as harnesses finish.
