@@ -136,8 +136,13 @@ def main() -> None:
                 beta_base=float(args.beta_base),
                 gamma_gate=float(args.gamma_gate),
                 residual_weight_power=float(args.residual_weight_power),
+                residual_objective=str(args.residual_objective),
                 normalize_residual_by_target=bool(args.normalize_residual_by_target),
                 target_normalize_eps=float(args.target_normalize_eps),
+                directional_projection_floor=float(args.directional_projection_floor),
+                directional_projection_weight=float(args.directional_projection_weight),
+                coefficient_floor=float(args.coefficient_floor),
+                coefficient_floor_weight=float(args.coefficient_floor_weight),
                 response_span_mode=str(args.response_span_mode),
             )
             if losses is None:
@@ -158,6 +163,7 @@ def main() -> None:
                 "residual_loss": tensor_item(losses["residual_loss"]),
                 "base_drift_loss": tensor_item(losses["base_drift_loss"]),
                 "gate_anchor_loss": tensor_item(losses["gate_anchor_loss"]),
+                "coefficient_floor_loss": tensor_item(losses["coefficient_floor_loss"]),
                 "loss_scale": loss_scale,
                 "response_tokens": int(losses["response_tokens"]),
                 "prompt_tokens": int(losses["prompt_tokens"]),
@@ -229,8 +235,13 @@ def compute_trc_row_loss(
     beta_base: float,
     gamma_gate: float,
     residual_weight_power: float,
+    residual_objective: str,
     normalize_residual_by_target: bool,
     target_normalize_eps: float,
+    directional_projection_floor: float,
+    directional_projection_weight: float,
+    coefficient_floor: float,
+    coefficient_floor_weight: float,
     response_span_mode: str,
 ) -> dict[str, Any] | None:
     encoded = encode_prompt_response(
@@ -288,8 +299,11 @@ def compute_trc_row_loss(
         positions=response_positions,
         topk_tokens=topk_tokens,
         residual_weight_power=residual_weight_power,
+        residual_objective=residual_objective,
         normalize_by_target=normalize_residual_by_target,
         target_normalize_eps=target_normalize_eps,
+        directional_projection_floor=directional_projection_floor,
+        directional_projection_weight=directional_projection_weight,
     )
     if beta_base > 0.0 and prompt_positions.numel() > 0:
         base_drift_loss = hidden_match_loss(
@@ -300,12 +314,19 @@ def compute_trc_row_loss(
     else:
         base_drift_loss = torch.zeros((), device=device, dtype=torch.float32)
     gate_anchor_loss = direct_gate_anchor_loss(torch, gate_manager)
-    total_loss = residual_loss + beta_base * base_drift_loss + gamma_gate * gate_anchor_loss
+    coefficient_floor_loss = direct_gate_floor_loss(torch, gate_manager, coefficient_floor=coefficient_floor)
+    total_loss = (
+        residual_loss
+        + beta_base * base_drift_loss
+        + gamma_gate * gate_anchor_loss
+        + coefficient_floor_weight * coefficient_floor_loss
+    )
     return {
         "total_loss": total_loss,
         "residual_loss": residual_loss.detach(),
         "base_drift_loss": base_drift_loss.detach(),
         "gate_anchor_loss": gate_anchor_loss.detach(),
+        "coefficient_floor_loss": coefficient_floor_loss.detach(),
         "response_tokens": response_len,
         "prompt_tokens": prompt_len,
         "span_mode": resolved_span_mode,
@@ -349,10 +370,14 @@ def hidden_residual_loss(
     positions: Any,
     topk_tokens: int,
     residual_weight_power: float,
+    residual_objective: str,
     normalize_by_target: bool,
     target_normalize_eps: float,
+    directional_projection_floor: float,
+    directional_projection_weight: float,
 ) -> Any:
     losses = []
+    objective = str(residual_objective).lower()
     for layer_index in sorted(base_hidden):
         layer_positions = positions.to(device=base_hidden[layer_index].device)
         base = base_hidden[layer_index][:, layer_positions, :].detach()
@@ -367,9 +392,24 @@ def hidden_residual_loss(
             _, top_indices = torch.topk(weights, k=int(topk_tokens), largest=True, sorted=False)
             token_error = token_error[top_indices]
             target_energy = target_energy[top_indices]
+            pred = pred[:, top_indices, :]
+            target = target[:, top_indices, :]
             weights = weights[top_indices]
         weights = weights / weights.mean().clamp_min(1.0e-8)
-        if normalize_by_target:
+        if objective == "directional":
+            pred_vec = pred.squeeze(0)
+            target_vec = target.squeeze(0)
+            dot = (pred_vec * target_vec).sum(dim=-1)
+            pred_norm = pred_vec.norm(dim=-1).clamp_min(float(target_normalize_eps))
+            target_norm = target_vec.norm(dim=-1).clamp_min(float(target_normalize_eps))
+            cosine_loss = 1.0 - (dot / (pred_norm * target_norm)).clamp(min=-1.0, max=1.0)
+            loss = (cosine_loss * weights).mean()
+            if directional_projection_floor > 0.0 and directional_projection_weight > 0.0:
+                projection_ratio = dot / target_vec.pow(2).sum(dim=-1).clamp_min(float(target_normalize_eps))
+                projection_loss = (torch.relu(float(directional_projection_floor) - projection_ratio).pow(2) * weights).mean()
+                loss = loss + float(directional_projection_weight) * projection_loss
+            losses.append(loss)
+        elif normalize_by_target or objective == "relative-mse":
             numerator = (token_error * weights).sum()
             denominator = (target_energy * weights).sum().clamp_min(float(target_normalize_eps))
             losses.append(numerator / denominator)
@@ -392,6 +432,12 @@ def direct_gate_anchor_loss(torch: Any, gate_manager: Any) -> Any:
     if not hasattr(gate_manager, "raw_coefficients") or not hasattr(gate_manager, "initial_coefficients"):
         return torch.zeros((), device=next(gate_manager.parameters()).device, dtype=torch.float32)
     return (gate_manager.raw_coefficients - gate_manager.initial_coefficients).pow(2).mean()
+
+
+def direct_gate_floor_loss(torch: Any, gate_manager: Any, *, coefficient_floor: float) -> Any:
+    if coefficient_floor <= 0.0 or not hasattr(gate_manager, "raw_coefficients"):
+        return torch.zeros((), device=next(gate_manager.parameters()).device, dtype=torch.float32)
+    return torch.relu(float(coefficient_floor) - gate_manager.raw_coefficients).pow(2).mean()
 
 
 def response_token_span(
@@ -517,6 +563,7 @@ def summarize_epoch(epoch: int, metrics: list[dict[str, Any]], gate_manager: Any
             "residual_loss": mean(item["residual_loss"] for item in rows),
             "base_drift_loss": mean(item["base_drift_loss"] for item in rows),
             "gate_anchor_loss": mean(item["gate_anchor_loss"] for item in rows),
+            "coefficient_floor_loss": mean(item.get("coefficient_floor_loss", 0.0) for item in rows),
             "span_tokens": mean(item.get("span_tokens", item.get("selected_response_tokens", 0)) for item in rows),
             "loss_scale": mean(item.get("loss_scale", 1.0) for item in rows),
         }
@@ -531,6 +578,7 @@ def summarize_epoch(epoch: int, metrics: list[dict[str, Any]], gate_manager: Any
         "mean_residual_loss": mean(item["residual_loss"] for item in metrics),
         "mean_base_drift_loss": mean(item["base_drift_loss"] for item in metrics),
         "mean_gate_anchor_loss": mean(item["gate_anchor_loss"] for item in metrics),
+        "mean_coefficient_floor_loss": mean(item.get("coefficient_floor_loss", 0.0) for item in metrics),
         "task_loss": task_loss,
         "gate_means": gate_means(gate_manager),
         "gate_values": gate_manager.gate_values(),
@@ -636,11 +684,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-drift-tokens", type=int, default=256)
     parser.add_argument("--residual-weight-power", type=float, default=1.0)
     parser.add_argument(
+        "--residual-objective",
+        choices=["mse", "relative-mse", "directional"],
+        default="mse",
+        help="TRC residual objective. directional matches expert residual direction without penalizing extra orthogonal expert components.",
+    )
+    parser.add_argument(
         "--normalize-residual-by-target",
         action="store_true",
         help="Use relative residual MSE: weighted ||r_merge-r_expert||^2 / weighted ||r_expert||^2.",
     )
     parser.add_argument("--target-normalize-eps", type=float, default=1.0e-6)
+    parser.add_argument("--directional-projection-floor", type=float, default=0.0)
+    parser.add_argument("--directional-projection-weight", type=float, default=0.1)
+    parser.add_argument("--coefficient-floor", type=float, default=0.0)
+    parser.add_argument("--coefficient-floor-weight", type=float, default=0.0)
     parser.add_argument(
         "--response-span-mode",
         choices=["response", "auto", "tool-call", "code-block"],

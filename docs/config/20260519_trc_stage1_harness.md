@@ -72,5 +72,23 @@ gamma_gate=0.001
 |---|---|---|
 | `trc_layer_init1_v2_20260519` | normalized + span-aware + beta 0.02 | 主候选，修复 v1 的尺度偏置 |
 | `trc_layer_init1_v2_anchor_20260519` | v2 + beta 0.05 + gamma 0.005 | 检查更强保持项是否保护 Memory/Tool |
+| `trc_layer_init1_v3_directional_20260519` | directional + span-aware + coefficient floor | 不拟合 pure expert 数值，只要求 merged residual 包含目标 expert 能力方向 |
 
 两者完成后，优先选择：不崩 Tool/Memory、Code 有提升迹象、gate 不贴边的 checkpoint 进入 bake/eval。
+
+## v2 早停结论
+
+v2 前两轮仍然把 Code 推高、压低 Tool/Memory：
+
+```text
+v2 main epoch2:   code=1.2249 memory=0.7671 tool=0.8378
+v2 anchor epoch2: code=1.2248 memory=0.7669 tool=0.8315
+```
+
+这说明问题不是单纯 loss 尺度，而是 `r_merge ≈ r_expert` 的目标本身会惩罚其他 expert residual。静态 gate 要保留多能力，不能让 tool prompt 训练把 code/memory 视作误差。v3 因此切换到 directional objective：
+
+```text
+L_dir = 1 - cos(r_merge, r_expert)
+```
+
+可选 projection floor 只要求目标 expert 方向在 merged residual 中有足够投影，不要求其他方向为 0。
