@@ -112,3 +112,43 @@ bash skill/command/run_20260519_trc_layer_init1.sh
 
 1. 和 GRPO/OPD 组合：TRC 作为第一阶段结构化初始化，GRPO 作为第二阶段 reward refinement。
 2. 加 R1/code 异质 expert，但先做 delta norm 缩放，再加入 TRC target。
+
+## 首次 Init1 运行结果
+
+运行目录：
+
+```text
+/tmp/shared-storage/OnPolicy/runs/trc/trc_layer_init1_20260519
+```
+
+命令设置：
+
+```text
+init_value=1.0
+epochs=3
+calibration=trc96_expert_trajectories.jsonl
+gate_parameterization=layer-band-coefficient
+hidden_layers=8,16,24,28
+max_seq_length=1536
+max_response_tokens=512
+topk_tokens=128
+beta_base=0.02
+gamma_gate=0.001
+lr=0.01
+accumulation_steps=8
+```
+
+训练动态：
+
+| epoch | mean residual loss | mean total loss | tool mean | memory mean | code mean |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.6378 | 0.6540 | 1.0743 | 0.8946 | 1.0980 |
+| 2 | 0.4713 | 0.4857 | 1.1233 | 0.7940 | 1.1990 |
+| 3 | 0.3300 | 0.3427 | 1.1426 | 0.7116 | 1.2871 |
+
+结论：
+
+- TRC hidden-residual signal 是可优化的，3 epoch 内 residual loss 单调下降。
+- gate 出现明显分化，不是所有系数同步平移。
+- 当前 v1 会强推 Code、轻推 Tool、压低 Memory；这不一定符合最终能力最优，需要 bake + official eval 判断。
+- 如果 Memory eval 下降，下一版应加入 task-balanced residual scale 或 Memory-specific floor/anchor，而不是直接沿用该 checkpoint。
