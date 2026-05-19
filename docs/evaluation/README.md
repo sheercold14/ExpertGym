@@ -15,6 +15,7 @@
 | `20260516_tonight_abc_eval6.md` | 2026-05-16 A/B/C 受控实验正式 eval6 结果 | Tool/Memory/Code 三类 `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_abc_20260516_addons.py` |
 | `20260517_defg_eval6.md` | 2026-05-17 D/E/F/G 正式 eval6 结果，含 F/G final iter20 补充评测 | Tool/Memory/Code `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_defg_20260517_addons.py` |
 | `20260519_r1math_L_eval6.md` | 2026-05-19 Correct-R1 L 系列 `L1 iter009` / `L2 iter009` 正式 Eval6，当前 running | Tool/Memory/Code `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_r1math_L_20260519_addons.py` |
+| `20260519_stage1_candidates_eval.md` | 2026-05-19 TRC directional stage-1 candidate full-suite evaluation | Tool/Memory done，Code CURE running |
 
 ## 记录格式
 
