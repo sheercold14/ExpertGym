@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import random
+import re
 import sys
 import time
 from contextlib import contextmanager
@@ -109,6 +110,7 @@ def main() -> None:
     metrics_path = output_dir / "trc_metrics.jsonl"
     metrics_rows: list[dict[str, Any]] = []
     train_rows = list(calibration_rows)
+    row_scales = task_balanced_row_scales(train_rows) if args.task_balanced_loss else {}
     start_time = time.time()
     for epoch in range(1, int(args.epochs) + 1):
         if args.shuffle:
@@ -134,10 +136,14 @@ def main() -> None:
                 beta_base=float(args.beta_base),
                 gamma_gate=float(args.gamma_gate),
                 residual_weight_power=float(args.residual_weight_power),
+                normalize_residual_by_target=bool(args.normalize_residual_by_target),
+                target_normalize_eps=float(args.target_normalize_eps),
+                response_span_mode=str(args.response_span_mode),
             )
             if losses is None:
                 continue
-            scaled_loss = losses["total_loss"] / float(max(1, int(args.accumulation_steps)))
+            loss_scale = float(row_scales.get(str(row.get("task")), 1.0))
+            scaled_loss = losses["total_loss"] * loss_scale / float(max(1, int(args.accumulation_steps)))
             scaled_loss.backward()
             pending_backward += 1
             metric = {
@@ -152,8 +158,13 @@ def main() -> None:
                 "residual_loss": tensor_item(losses["residual_loss"]),
                 "base_drift_loss": tensor_item(losses["base_drift_loss"]),
                 "gate_anchor_loss": tensor_item(losses["gate_anchor_loss"]),
+                "loss_scale": loss_scale,
                 "response_tokens": int(losses["response_tokens"]),
                 "prompt_tokens": int(losses["prompt_tokens"]),
+                "span_mode": str(losses["span_mode"]),
+                "span_start_token": int(losses["span_start_token"]),
+                "span_end_token": int(losses["span_end_token"]),
+                "span_tokens": int(losses["span_tokens"]),
                 "selected_response_tokens": int(losses["selected_response_tokens"]),
                 "elapsed_seconds": time.time() - row_start,
             }
@@ -218,6 +229,9 @@ def compute_trc_row_loss(
     beta_base: float,
     gamma_gate: float,
     residual_weight_power: float,
+    normalize_residual_by_target: bool,
+    target_normalize_eps: float,
+    response_span_mode: str,
 ) -> dict[str, Any] | None:
     encoded = encode_prompt_response(
         tokenizer,
@@ -229,6 +243,14 @@ def compute_trc_row_loss(
     if encoded is None:
         return None
     input_ids, attention_mask, prompt_len, response_len = encoded
+    span_start, span_end, resolved_span_mode = response_token_span(
+        tokenizer,
+        task=str(row.get("task") or ""),
+        response_text=str(row.get("response") or ""),
+        response_len=response_len,
+        max_response_tokens=max_response_tokens,
+        mode=response_span_mode,
+    )
     input_ids = input_ids.to(device)
     attention_mask = attention_mask.to(device)
     base_values = torch.zeros_like(gate_manager.raw_coefficients)
@@ -256,7 +278,7 @@ def compute_trc_row_loss(
         attention_mask=attention_mask,
         hidden_layers=hidden_layers,
     )
-    response_positions = torch.arange(prompt_len, prompt_len + response_len, device=device)
+    response_positions = torch.arange(prompt_len + span_start, prompt_len + span_end, device=device)
     prompt_positions = prompt_position_tensor(torch, prompt_len=prompt_len, limit=prompt_drift_tokens, device=device)
     residual_loss = hidden_residual_loss(
         torch,
@@ -266,6 +288,8 @@ def compute_trc_row_loss(
         positions=response_positions,
         topk_tokens=topk_tokens,
         residual_weight_power=residual_weight_power,
+        normalize_by_target=normalize_residual_by_target,
+        target_normalize_eps=target_normalize_eps,
     )
     if beta_base > 0.0 and prompt_positions.numel() > 0:
         base_drift_loss = hidden_match_loss(
@@ -284,7 +308,11 @@ def compute_trc_row_loss(
         "gate_anchor_loss": gate_anchor_loss.detach(),
         "response_tokens": response_len,
         "prompt_tokens": prompt_len,
-        "selected_response_tokens": min(response_len, topk_tokens) if topk_tokens > 0 else response_len,
+        "span_mode": resolved_span_mode,
+        "span_start_token": span_start,
+        "span_end_token": span_end,
+        "span_tokens": max(0, span_end - span_start),
+        "selected_response_tokens": min(max(0, span_end - span_start), topk_tokens) if topk_tokens > 0 else max(0, span_end - span_start),
     }
 
 
@@ -321,6 +349,8 @@ def hidden_residual_loss(
     positions: Any,
     topk_tokens: int,
     residual_weight_power: float,
+    normalize_by_target: bool,
+    target_normalize_eps: float,
 ) -> Any:
     losses = []
     for layer_index in sorted(base_hidden):
@@ -329,15 +359,22 @@ def hidden_residual_loss(
         target = expert_hidden[layer_index][:, layer_positions, :].detach() - base
         pred = merged_hidden[layer_index][:, layer_positions, :] - base
         token_error = (pred - target).pow(2).mean(dim=-1).squeeze(0)
+        target_energy = target.pow(2).mean(dim=-1).squeeze(0)
         weights = target.norm(dim=-1).squeeze(0).clamp_min(1.0e-8)
         if residual_weight_power != 1.0:
             weights = weights.pow(float(residual_weight_power))
         if topk_tokens > 0 and token_error.numel() > topk_tokens:
             _, top_indices = torch.topk(weights, k=int(topk_tokens), largest=True, sorted=False)
             token_error = token_error[top_indices]
+            target_energy = target_energy[top_indices]
             weights = weights[top_indices]
         weights = weights / weights.mean().clamp_min(1.0e-8)
-        losses.append((token_error * weights).mean())
+        if normalize_by_target:
+            numerator = (token_error * weights).sum()
+            denominator = (target_energy * weights).sum().clamp_min(float(target_normalize_eps))
+            losses.append(numerator / denominator)
+        else:
+            losses.append((token_error * weights).mean())
     return torch.stack(losses).mean()
 
 
@@ -355,6 +392,60 @@ def direct_gate_anchor_loss(torch: Any, gate_manager: Any) -> Any:
     if not hasattr(gate_manager, "raw_coefficients") or not hasattr(gate_manager, "initial_coefficients"):
         return torch.zeros((), device=next(gate_manager.parameters()).device, dtype=torch.float32)
     return (gate_manager.raw_coefficients - gate_manager.initial_coefficients).pow(2).mean()
+
+
+def response_token_span(
+    tokenizer: Any,
+    *,
+    task: str,
+    response_text: str,
+    response_len: int,
+    max_response_tokens: int,
+    mode: str,
+) -> tuple[int, int, str]:
+    if response_len <= 0:
+        return 0, 0, "empty"
+    normalized = str(mode).strip().lower()
+    if normalized == "response":
+        return 0, response_len, "response"
+    char_span, resolved = response_char_span(task=task, response_text=response_text, mode=normalized)
+    if char_span is None:
+        return 0, response_len, "response_fallback"
+    start_char, end_char = char_span
+    start_token = len(tokenizer(response_text[:start_char], add_special_tokens=False).input_ids)
+    span_token_len = len(tokenizer(response_text[start_char:end_char], add_special_tokens=False).input_ids)
+    end_token = start_token + max(1, span_token_len)
+    if max_response_tokens > 0:
+        start_token = min(start_token, max_response_tokens)
+        end_token = min(end_token, max_response_tokens)
+    start_token = max(0, min(start_token, response_len - 1))
+    end_token = max(start_token + 1, min(end_token, response_len))
+    return start_token, end_token, resolved
+
+
+def response_char_span(*, task: str, response_text: str, mode: str) -> tuple[tuple[int, int] | None, str]:
+    if not response_text:
+        return None, "response_fallback"
+    if mode == "auto":
+        if task == "tool":
+            mode = "tool-call"
+        elif task == "code":
+            mode = "code-block"
+        else:
+            mode = "response"
+    if mode in {"tool-call", "tool_call"}:
+        start = response_text.find("<tool_call>")
+        end = response_text.find("</tool_call>", start + 1)
+        if start >= 0 and end >= 0:
+            return (start, end + len("</tool_call>")), "tool-call"
+        return None, "response_fallback"
+    if mode in {"code-block", "code_block"}:
+        matches = list(re.finditer(r"```(?:python|py)?\s*\n?(.*?)```", response_text, flags=re.IGNORECASE | re.DOTALL))
+        if matches:
+            best = max(matches, key=lambda item: len(item.group(1)))
+            return (best.start(1), best.end(1)), "code-block"
+        return None, "response_fallback"
+    return (0, len(response_text)), "response"
 
 
 def encode_prompt_response(
@@ -426,6 +517,8 @@ def summarize_epoch(epoch: int, metrics: list[dict[str, Any]], gate_manager: Any
             "residual_loss": mean(item["residual_loss"] for item in rows),
             "base_drift_loss": mean(item["base_drift_loss"] for item in rows),
             "gate_anchor_loss": mean(item["gate_anchor_loss"] for item in rows),
+            "span_tokens": mean(item.get("span_tokens", item.get("selected_response_tokens", 0)) for item in rows),
+            "loss_scale": mean(item.get("loss_scale", 1.0) for item in rows),
         }
         for task, rows in sorted(by_task.items())
     }
@@ -503,6 +596,15 @@ def task_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def task_balanced_row_scales(rows: list[dict[str, Any]]) -> dict[str, float]:
+    counts = task_counts(rows)
+    if not counts:
+        return {}
+    total = float(sum(counts.values()))
+    num_tasks = float(len(counts))
+    return {task: total / (num_tasks * float(count)) for task, count in counts.items() if count > 0}
+
+
 def parse_int_list(value: str) -> list[int]:
     return [int(item.strip()) for item in str(value).split(",") if item.strip()]
 
@@ -533,6 +635,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk-tokens", type=int, default=128)
     parser.add_argument("--prompt-drift-tokens", type=int, default=256)
     parser.add_argument("--residual-weight-power", type=float, default=1.0)
+    parser.add_argument(
+        "--normalize-residual-by-target",
+        action="store_true",
+        help="Use relative residual MSE: weighted ||r_merge-r_expert||^2 / weighted ||r_expert||^2.",
+    )
+    parser.add_argument("--target-normalize-eps", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--response-span-mode",
+        choices=["response", "auto", "tool-call", "code-block"],
+        default="response",
+        help="Which response span to align. auto uses tool_call span for tool and code block for code.",
+    )
+    parser.add_argument(
+        "--task-balanced-loss",
+        action="store_true",
+        help="Scale row losses so each task contributes equally when task counts are imbalanced.",
+    )
     parser.add_argument("--beta-base", type=float, default=0.02)
     parser.add_argument("--gamma-gate", type=float, default=0.001)
     parser.add_argument("--device", default="cuda")
