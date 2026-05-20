@@ -74,6 +74,7 @@ class Candidate:
     row_index: int
     sample: dict[str, Any]
     row_metadata: dict[str, Any]
+    trajectory_turns: list[dict[str, Any]]
 
 
 def main() -> None:
@@ -81,10 +82,13 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    tool_rollouts = [Path(path).expanduser() for path in (args.tool_rollout or [str(DEFAULT_TOOL_ROLLOUT)])]
+    memory_rollouts = [Path(path).expanduser() for path in (args.memory_rollout or [str(DEFAULT_MEMORY_ROLLOUT)])]
+    code_rollouts = [Path(path).expanduser() for path in (args.code_rollout or [str(path) for path in DEFAULT_CODE_ROLLOUTS])]
     sources = {
-        "tool": [("tool_paper96_s2", Path(args.tool_rollout).expanduser())],
-        "memory": [("memory_paper96_s2", Path(args.memory_rollout).expanduser())],
-        "code": [(f"code_source_{idx:02d}", Path(path).expanduser()) for idx, path in enumerate(args.code_rollout)],
+        "tool": [(f"tool_source_{idx:02d}", path) for idx, path in enumerate(tool_rollouts)],
+        "memory": [(f"memory_source_{idx:02d}", path) for idx, path in enumerate(memory_rollouts)],
+        "code": [(f"code_source_{idx:02d}", path) for idx, path in enumerate(code_rollouts)],
     }
     candidates_by_task: dict[str, list[Candidate]] = {}
     source_stats: dict[str, Any] = {}
@@ -94,6 +98,12 @@ def main() -> None:
             expert=task,
             sources=task_sources,
             positive_threshold=float(args.positive_threshold),
+            include_sample_expert=args.include_sample_expert,
+            exclude_sample_expert=args.exclude_sample_expert,
+            memory_response_source=str(args.memory_response_source),
+            memory_trajectory_max_update_turns=int(args.memory_trajectory_max_update_turns),
+            memory_trajectory_turn_policy=str(args.memory_trajectory_turn_policy),
+            memory_trajectory_include_final_turn=not bool(args.memory_trajectory_no_final_turn),
         )
         candidates_by_task[task] = candidates
         source_stats[task] = stats
@@ -134,8 +144,17 @@ def main() -> None:
         "selection_stats": selection_stats,
         "source_policy": {
             "tool": "ToolRL expert paper96 successful samples; unique prompts first, then additional successful samples.",
-            "memory": "MemAgent expert paper96 successful samples; unique prompts first, then additional successful samples.",
+            "memory": (
+                "MemAgent expert paper96 successful samples; unique prompts first, then additional successful samples. "
+                f"memory_response_source={args.memory_response_source}."
+            ),
             "code": "ReasonFlux successful samples first, then DeepSeek-R1 and old code expert fallbacks.",
+        },
+        "memory_trajectory_policy": {
+            "response_source": str(args.memory_response_source),
+            "max_update_turns": int(args.memory_trajectory_max_update_turns),
+            "turn_policy": str(args.memory_trajectory_turn_policy),
+            "include_final_turn": not bool(args.memory_trajectory_no_final_turn),
         },
     }
     write_json(output_dir / "trc96_summary.json", summary)
@@ -149,6 +168,12 @@ def load_positive_candidates(
     expert: str,
     sources: Iterable[tuple[str, Path]],
     positive_threshold: float,
+    include_sample_expert: list[str],
+    exclude_sample_expert: list[str],
+    memory_response_source: str,
+    memory_trajectory_max_update_turns: int,
+    memory_trajectory_turn_policy: str,
+    memory_trajectory_include_final_turn: bool,
 ) -> tuple[list[Candidate], dict[str, Any]]:
     candidates: list[Candidate] = []
     stats: dict[str, Any] = {
@@ -172,7 +197,27 @@ def load_positive_candidates(
             for sample_index, sample in enumerate(samples):
                 reward_train = sample_reward_train(sample)
                 response = str(sample.get("text") or sample.get("response") or "")
+                trajectory_turns: list[dict[str, Any]] = []
+                if task == "memory" and memory_response_source == "trajectory-turns":
+                    trajectory_turns = extract_memory_trajectory_turns(
+                        sample,
+                        max_update_turns=memory_trajectory_max_update_turns,
+                        turn_policy=memory_trajectory_turn_policy,
+                        include_final_turn=memory_trajectory_include_final_turn,
+                    )
+                    trajectory_response = format_trajectory_response(trajectory_turns)
+                    if trajectory_response.strip():
+                        response = trajectory_response
                 if not response.strip():
+                    continue
+                if not sample_expert_filter_ok(
+                    sample,
+                    row=row,
+                    task=task,
+                    source_name=source_name,
+                    include=include_sample_expert,
+                    exclude=exclude_sample_expert,
+                ):
                     continue
                 if not (bool(sample.get("success")) or reward_train >= positive_threshold):
                     continue
@@ -208,7 +253,9 @@ def load_positive_candidates(
                             "seed": row.get("seed"),
                             "frontier": row.get("frontier"),
                             "skip_reason": row.get("skip_reason"),
+                            "memagent_trajectory": row.get("memagent_trajectory"),
                         },
+                        trajectory_turns=trajectory_turns,
                     )
                 )
         stats["sources"][source_name] = {
@@ -265,7 +312,7 @@ def candidate_sort_key(candidate: Candidate) -> tuple[Any, ...]:
 
 
 def materialize_row(candidate: Candidate, *, rank: int) -> dict[str, Any]:
-    return {
+    row = {
         "format": "trc_expert_trajectory_v1",
         "trajectory_id": f"trc96__{rank:03d}__{candidate.task}__{candidate.source_name}__{candidate.sample_id}",
         "task": candidate.task,
@@ -291,6 +338,81 @@ def materialize_row(candidate: Candidate, *, rank: int) -> dict[str, Any]:
             "behavior_span_reward": candidate.sample.get("behavior_span_reward"),
         },
     }
+    if candidate.trajectory_turns:
+        row["trajectory_turns"] = candidate.trajectory_turns
+        row["trajectory_turn_count"] = len(candidate.trajectory_turns)
+    return row
+
+
+def extract_memory_trajectory_turns(
+    sample: dict[str, Any],
+    *,
+    max_update_turns: int,
+    turn_policy: str,
+    include_final_turn: bool,
+) -> list[dict[str, Any]]:
+    raw_turns = sample.get("trajectory") or []
+    update_turns = [turn for turn in raw_turns if str(turn.get("kind")) == "memory_update"]
+    final_turns = [turn for turn in raw_turns if str(turn.get("kind")) == "final_answer"]
+    selected = select_memory_update_turns(update_turns, max_turns=max_update_turns, policy=turn_policy)
+    if include_final_turn and final_turns:
+        selected = selected + [final_turns[-1]]
+    turns: list[dict[str, Any]] = []
+    for turn in selected:
+        prompt_text = str(turn.get("prompt_text") or "")
+        text = str(turn.get("text") or turn.get("response") or "")
+        if not prompt_text.strip() or not text.strip():
+            continue
+        turns.append(
+            {
+                "turn": turn.get("turn"),
+                "kind": turn.get("kind"),
+                "prompt_text": prompt_text,
+                "text": text,
+                "length": turn.get("length"),
+            }
+        )
+    return turns
+
+
+def select_memory_update_turns(raw_turns: list[dict[str, Any]], *, max_turns: int, policy: str) -> list[dict[str, Any]]:
+    if max_turns <= 0 or len(raw_turns) <= max_turns:
+        return list(raw_turns)
+    if max_turns == 1:
+        return [raw_turns[-1]]
+    lowered = str(policy).strip().lower()
+    if lowered == "late":
+        return list(raw_turns[-max_turns:])
+    if lowered == "first-last":
+        if max_turns == 2:
+            return [raw_turns[0], raw_turns[-1]]
+        middle = select_memory_update_turns(raw_turns[1:-1], max_turns=max_turns - 2, policy="uniform")
+        return [raw_turns[0], *middle, raw_turns[-1]]
+    if lowered != "uniform":
+        raise ValueError(f"Unsupported --memory-trajectory-turn-policy: {policy!r}")
+    indices: list[int] = []
+    denom = max_turns - 1
+    last_index = len(raw_turns) - 1
+    for index in range(max_turns):
+        selected = round(index * last_index / denom)
+        if selected not in indices:
+            indices.append(selected)
+    cursor = 0
+    while len(indices) < max_turns and cursor < len(raw_turns):
+        if cursor not in indices:
+            indices.append(cursor)
+        cursor += 1
+    return [raw_turns[index] for index in sorted(indices[:max_turns])]
+
+
+def format_trajectory_response(turns: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for turn in turns:
+        kind = str(turn.get("kind") or "turn")
+        turn_id = turn.get("turn")
+        header = f"[{kind}:{turn_id}]" if turn_id is not None else f"[{kind}]"
+        parts.append(f"{header}\n{turn.get('text') or ''}".strip())
+    return "\n\n".join(part for part in parts if part)
 
 
 def sample_reward_train(sample: dict[str, Any]) -> float:
@@ -299,6 +421,43 @@ def sample_reward_train(sample: dict[str, Any]) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def sample_expert_filter_ok(
+    sample: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    task: str,
+    source_name: str,
+    include: list[str],
+    exclude: list[str],
+) -> bool:
+    if task != "code":
+        return True
+    identity = sample_expert_identity(sample, row=row, source_name=source_name)
+    if exclude and any(pattern.lower() in identity for pattern in exclude):
+        return False
+    if include and not any(pattern.lower() in identity for pattern in include):
+        return False
+    return True
+
+
+def sample_expert_identity(sample: dict[str, Any], *, row: dict[str, Any], source_name: str) -> str:
+    details = sample.get("details") if isinstance(sample.get("details"), dict) else {}
+    parts = [
+        source_name,
+        row.get("policy_id"),
+        row.get("run_id"),
+        sample.get("policy_id"),
+        sample.get("model"),
+        sample.get("model_name"),
+        sample.get("expert"),
+        sample.get("expert_name"),
+        details.get("expert_name"),
+        details.get("expert_model"),
+        details.get("expert_temp_file"),
+    ]
+    return " ".join(str(part).lower() for part in parts if part)
 
 
 def as_optional_float(value: Any) -> float | None:
@@ -354,9 +513,59 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--per-task", type=int, default=32, help="Number of successful trajectories per task.")
     parser.add_argument("--positive-threshold", type=float, default=1.0)
-    parser.add_argument("--tool-rollout", default=str(DEFAULT_TOOL_ROLLOUT))
-    parser.add_argument("--memory-rollout", default=str(DEFAULT_MEMORY_ROLLOUT))
-    parser.add_argument("--code-rollout", action="append", default=[str(path) for path in DEFAULT_CODE_ROLLOUTS])
+    parser.add_argument(
+        "--tool-rollout",
+        action="append",
+        default=None,
+        help="Tool rollout JSONL. Repeat to set ordered sources. Defaults to paper96 ToolRL rollout.",
+    )
+    parser.add_argument(
+        "--memory-rollout",
+        action="append",
+        default=None,
+        help="Memory rollout JSONL. Repeat to set ordered sources. Defaults to paper96 MemAgent rollout.",
+    )
+    parser.add_argument(
+        "--code-rollout",
+        action="append",
+        default=None,
+        help="Code rollout JSONL. Repeat to set ordered sources. Defaults to historical ReasonFlux/DeepSeek/paper96 order.",
+    )
+    parser.add_argument(
+        "--include-sample-expert",
+        action="append",
+        default=[],
+        help="Keep only samples whose source/policy/details identity contains this lowercase substring. Repeatable.",
+    )
+    parser.add_argument(
+        "--exclude-sample-expert",
+        action="append",
+        default=[],
+        help="Drop samples whose source/policy/details identity contains this lowercase substring. Repeatable.",
+    )
+    parser.add_argument(
+        "--memory-response-source",
+        choices=["final", "trajectory-turns"],
+        default="final",
+        help="For memory rows, keep the old final answer response or materialize MemAgent trajectory turns.",
+    )
+    parser.add_argument(
+        "--memory-trajectory-max-update-turns",
+        type=int,
+        default=0,
+        help="When --memory-response-source trajectory-turns, keep up to this many memory_update turns; 0 keeps all.",
+    )
+    parser.add_argument(
+        "--memory-trajectory-turn-policy",
+        choices=["uniform", "late", "first-last"],
+        default="uniform",
+        help="How to subsample memory_update turns when a max is set.",
+    )
+    parser.add_argument(
+        "--memory-trajectory-no-final-turn",
+        action="store_true",
+        help="When using memory trajectory turns, omit the final_answer turn.",
+    )
     return parser.parse_args()
 
 

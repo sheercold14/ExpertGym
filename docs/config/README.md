@@ -36,6 +36,9 @@ YYYYMMDD_short_name.md
 - [20260518_r1_codep0_bound_grid.md](20260518_r1_codep0_bound_grid.md): R1 Code P0 bound grid，`safe/stress` x `all/code+reasoning only` 四个短程诊断，用于判断 R1 幅值上限与 common 同动是否是 Code reward 不涨的瓶颈。
 - [20260519_r1math_L_experiments.md](20260519_r1math_L_experiments.md): 修正 DeepSeek-R1-Distill-Qwen-7B 的 delta base 为 Qwen2.5-Math-7B 后，L1/L2/L3 20-iter 主实验计划与命令。
 - [20260519_tool_nullspace_v1.md](20260519_tool_nullspace_v1.md): Tool behavior-span null-space v1，Tool32/Memory32/Code40 calibration，R1 init=0.05，OPD+NLL retention，update 阶段投影 gate 梯度保护 Tool 行为格式。
+- [hiddenstate/20260520_round13_evalleak_code16.md](hiddenstate/20260520_round13_evalleak_code16.md): Round13 formal-code eval-leak hidden-state diagnostic，构造 RF/Mem-only 与 all+R1 两个 Code16 ability-span TRC bank。
+- [20260520_trc_round3_memorytraj.md](20260520_trc_round3_memorytraj.md): TRC Round3 memory trajectory 与 coefficient-retention 主线，记录 uniform4/late3/full trajectory、global/task-aware floor、Tool/Memory 快评。
+- [20260520_trc_round4_codepush.md](20260520_trc_round4_codepush.md): TRC Round4 code-push variants，在 Round3 Tool/Memory 过线基础上测试 longer epochs、code loss boost 与 code full-response/global-floor。
 - [20260518_p0_sota_calib_v2.md](20260518_p0_sota_calib_v2.md): P0 SOTA-oriented calibration v2，新增 `train128/monitor64/guard64`、ToolRL all80 test 口径、expert rollout 与主实验入口。
 - P0 快速评测脚本：
   - `skill/command/run_20260518_toolrl_rlla4k_eval.sh`: ToolRL `rlla_4k/test` all80 overall correct。

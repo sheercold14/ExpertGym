@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only dashboard for the 2026-05-19 stage1 formal-eval candidates."""
+"""Read-only dashboard for ExpertGym/TRC experiment decisions."""
 
 from __future__ import annotations
 
@@ -15,6 +15,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 EXPERTS = ("tool", "memory", "code")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TRC_RUNS_ROOT = Path("/tmp/shared-storage/OnPolicy/runs/trc")
+LEDGER_PATH = REPO_ROOT / "docs/harness/20260520_experiment_ledger.md"
+ROUND_EVAL_PATHS = [
+    REPO_ROOT / "docs/evaluation/20260520_trc_round10_eval.md",
+    REPO_ROOT / "docs/evaluation/20260520_trc_round11_eval.md",
+    REPO_ROOT / "docs/evaluation/20260520_trc_round12_eval.md",
+]
+ROUND13_CONFIG_PATH = REPO_ROOT / "docs/config/hiddenstate/20260520_round13_evalleak_code16.md"
 
 EVALS: dict[str, dict[str, Any]] = {
     "anchor_i4": {
@@ -155,18 +164,453 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_state() -> dict[str, Any]:
-    evals = [build_eval_state(eval_id, spec) for eval_id, spec in EVALS.items()]
+    evals = build_trc_experiments()
+    if not evals:
+        evals = [build_eval_state(eval_id, spec) for eval_id, spec in EVALS.items()]
     ranking = candidate_ranking(evals)
     guidance = build_guidance(evals, ranking)
     return {
-        "format": "stage1_formal_eval_dashboard_v2",
+        "format": "trc_experiment_dashboard_v3",
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "evals": evals,
         "runs": [],
         "ranking": ranking,
         "ideas": guidance,
         "guidance": guidance,
+        "sources": [
+            str(LEDGER_PATH),
+            *(str(path) for path in ROUND_EVAL_PATHS),
+            str(ROUND13_CONFIG_PATH),
+            str(TRC_RUNS_ROOT),
+        ],
     }
+
+
+def build_trc_experiments() -> list[dict[str, Any]]:
+    attempts = parse_ledger_attempts(LEDGER_PATH)
+    by_artifact = {row["artifact"]: row for row in attempts if row.get("artifact")}
+    experiments: dict[str, dict[str, Any]] = {}
+    for path in ROUND_EVAL_PATHS:
+        for row in parse_round_eval_doc(path):
+            exp_id = row["id"]
+            checkpoint = row.get("checkpoint") or ""
+            run_id = run_id_from_checkpoint(checkpoint) or infer_run_id_from_eval_id(exp_id, by_artifact)
+            attempt = find_attempt(run_id, exp_id, attempts)
+            item = experiments.setdefault(exp_id, base_doc_experiment(exp_id, run_id, checkpoint, path, attempt))
+            if run_id and not item.get("run_id"):
+                item["run_id"] = run_id
+                item["checkpoint"] = checkpoint or item.get("checkpoint")
+                item["checkpoint_path"] = checkpoint or item.get("checkpoint_path")
+            item["round_doc"] = str(path)
+            if row["kind"] == "tool_memory":
+                item["setting"]["key_config"] = row.get("key_config")
+                item["tool"] = doc_tool_state(row, path)
+                item["memory"] = doc_memory_state(row, path)
+                item["quick_gate"] = row.get("decision")
+                item["failure_reason"] = failure_reason(row.get("decision"))
+            elif row["kind"] == "code":
+                item["code"] = doc_code_state(row, path)
+                if row.get("status"):
+                    item["code_status_text"] = row["status"]
+            elif row["kind"] == "training":
+                item["training_doc"] = row
+                if row.get("run id"):
+                    item["train_run_id"] = strip_code(row.get("run id"))
+                    if not item.get("run_id"):
+                        item["run_id"] = item["train_run_id"]
+    for item in experiments.values():
+        enrich_doc_experiment(item, attempts)
+
+    for item in build_round13_experiments(attempts):
+        experiments[item["id"]] = item
+    return sorted(experiments.values(), key=experiment_sort_key)
+
+
+def base_doc_experiment(
+    exp_id: str, run_id: str | None, checkpoint: str, source_path: Path, attempt: dict[str, Any] | None
+) -> dict[str, Any]:
+    run_id = run_id or ""
+    return {
+        "id": exp_id,
+        "label": exp_id,
+        "run_id": run_id,
+        "checkpoint": checkpoint,
+        "checkpoint_path": checkpoint,
+        "train_run": str(TRC_RUNS_ROOT / run_id) if run_id else "",
+        "train_command": "",
+        "setting": {"family": "TRC", "source": source_path.name},
+        "exists": bool(run_id and (TRC_RUNS_ROOT / run_id).exists()),
+        "mtime": file_mtime(source_path),
+        "tool": pending_status(source_path),
+        "memory": pending_status(source_path),
+        "code": pending_status(source_path),
+        "training": {"status": "pending", "run_root": str(TRC_RUNS_ROOT / run_id) if run_id else ""},
+        "quick_gate": None,
+        "failure_reason": None,
+        "attempt": attempt or {},
+        "data_sources": [str(source_path), str(LEDGER_PATH)],
+    }
+
+
+def enrich_doc_experiment(item: dict[str, Any], attempts: list[dict[str, Any]]) -> None:
+    run_id = item.get("run_id") or item.get("train_run_id") or ""
+    if not run_id:
+        run_id = infer_run_id_from_eval_id(str(item.get("id") or ""), {row["artifact"]: row for row in attempts if row.get("artifact")}) or ""
+        item["run_id"] = run_id
+    run_root = TRC_RUNS_ROOT / run_id if run_id else Path("")
+    env = parse_run_env(run_root / "run.env") if run_id else {}
+    item["run_env"] = env
+    item["train_run"] = str(run_root) if run_id else item.get("train_run", "")
+    item["exists"] = run_root.exists() if run_id else False
+    item["setting"].update(setting_from_env_and_text(env, str((item.get("setting") or {}).get("key_config") or "")))
+    item["setting"]["quick_gate"] = item.get("quick_gate")
+    item["setting"]["failure_reason"] = item.get("failure_reason")
+    item["setting"]["attempt"] = (item.get("attempt") or {}).get("id")
+    item["setting"]["hypothesis"] = (item.get("attempt") or {}).get("hypothesis")
+    item["training"] = parse_trc_training(
+        {
+            "train_run": str(run_root),
+            "setting": {"epoch": env.get("EPOCHS") or selected_epoch_from_run(run_root) or infer_epoch_from_run_id(run_id)},
+        }
+    )
+    gates = item["training"].get("gate_means") if isinstance(item.get("training"), dict) else {}
+    if isinstance(gates, dict):
+        item["setting"]["tool_gate"] = gates.get("tool")
+        item["setting"]["memory_gate"] = gates.get("memory")
+        item["setting"]["code_gate"] = gates.get("code")
+    item["completed_axes"] = sum(1 for axis in (item["tool"], item["memory"], item["code"]) if axis.get("status") == "done")
+    item["pending_axes"] = [
+        name
+        for name, axis in (("Tool", item["tool"]), ("Memory", item["memory"]), ("Code", item["code"]))
+        if axis.get("status") != "done"
+    ]
+    values = []
+    if isinstance(item["tool"].get("mean_accuracy"), float):
+        values.append(item["tool"]["mean_accuracy"])
+    if isinstance(item["memory"].get("mean_f1"), float):
+        values.append(item["memory"]["mean_f1"])
+    if isinstance(item["code"].get("mean_acc"), float):
+        values.append(item["code"]["mean_acc"])
+    item["composite_mean"] = statistics.mean(values) if values else None
+    item["formal_status"] = formal_status(item["tool"], item["memory"], item["code"])
+
+
+def parse_round_eval_doc(path: Path) -> list[dict[str, Any]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    output = []
+    for section, kind in (("Tool / Memory", "tool_memory"), ("Code / CURE", "code"), ("Training / Bake", "training")):
+        table_rows = parse_markdown_table(section_text(text, section))
+        for row in table_rows:
+            row = {key.lower(): value for key, value in row.items()}
+            if not row.get("id"):
+                continue
+            output.append(
+                {
+                    **row,
+                    "kind": kind,
+                    "id": strip_code(row.get("id")),
+                    "checkpoint": strip_code(row.get("checkpoint")),
+                    "key_config": strip_code(row.get("key config")),
+                    "run id": strip_code(row.get("run id")),
+                    "status": strip_code(row.get("status")),
+                    "decision": strip_code(row.get("decision")),
+                }
+            )
+    return output
+
+
+def section_text(text: str, heading: str) -> str:
+    match = re.search(rf"^##\s+{re.escape(heading)}\s*$", text, flags=re.MULTILINE)
+    if not match:
+        return ""
+    next_match = re.search(r"^##\s+", text[match.end() :], flags=re.MULTILINE)
+    end = match.end() + next_match.start() if next_match else len(text)
+    return text[match.end() : end]
+
+
+def parse_markdown_table(text: str) -> list[dict[str, str]]:
+    lines = [line.strip() for line in text.splitlines() if line.strip().startswith("|")]
+    if len(lines) < 2:
+        return []
+    rows = []
+    idx = 0
+    while idx + 1 < len(lines):
+        headers = split_md_row(lines[idx])
+        sep = split_md_row(lines[idx + 1])
+        if headers and sep and all(set(cell.replace(":", "").replace("-", "")) == set() for cell in sep):
+            idx += 2
+            while idx < len(lines):
+                cells = split_md_row(lines[idx])
+                if len(cells) != len(headers):
+                    break
+                rows.append(dict(zip(headers, cells)))
+                idx += 1
+            continue
+        idx += 1
+    return rows
+
+
+def split_md_row(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def parse_ledger_attempts(path: Path) -> list[dict[str, Any]]:
+    rows = parse_markdown_table(section_text(read_text(path), "Attempt 表"))
+    attempts = []
+    for row in rows:
+        normalized = {key.lower(): strip_code(value) for key, value in row.items()}
+        artifact = normalized.get("run_id / artifact") or normalized.get("run_id") or ""
+        attempts.append(
+            {
+                "id": normalized.get("id"),
+                "artifact": artifact,
+                "layer": normalized.get("layer"),
+                "axis": normalized.get("axis"),
+                "status": normalized.get("status"),
+                "hypothesis": normalized.get("hypothesis"),
+                "decision": normalized.get("decision"),
+            }
+        )
+    return attempts
+
+
+def doc_tool_state(row: dict[str, Any], path: Path) -> dict[str, Any]:
+    keys = ("live_parallel", "live_parallel_multiple", "parallel", "parallel_multiple")
+    rows = [{"name": key, "accuracy": as_float(row.get(key)), "correct": None, "total": None} for key in keys]
+    return {
+        "status": "done" if as_float(row.get("tool mean")) is not None else "pending",
+        "mean_accuracy": as_float(row.get("tool mean")),
+        "live_mean_accuracy": statistics.mean([v for v in (as_float(row.get("live_parallel")), as_float(row.get("live_parallel_multiple"))) if v is not None])
+        if any(as_float(row.get(key)) is not None for key in ("live_parallel", "live_parallel_multiple"))
+        else None,
+        "rows": rows,
+        "path": str(path),
+        "mtime": file_mtime(path),
+    }
+
+
+def doc_memory_state(row: dict[str, Any], path: Path) -> dict[str, Any]:
+    keys = ("eval_50", "eval_100", "qa_32768", "qa_65536")
+    rows = [{"name": key, "f1": as_float(row.get(key)), "em": None, "sub_em": None, "total": None} for key in keys]
+    return {
+        "status": "done" if as_float(row.get("memory mean f1")) is not None else "pending",
+        "mean_f1": as_float(row.get("memory mean f1")),
+        "mean_em": None,
+        "rows": rows,
+        "path": str(path),
+        "mtime": file_mtime(path),
+    }
+
+
+def doc_code_state(row: dict[str, Any], path: Path) -> dict[str, Any]:
+    skipped = str(row.get("run id") or "").lower() == "skipped"
+    status_text = str(row.get("status") or "")
+    livebench = as_float(row.get("livebench acc"))
+    livecode = as_float(row.get("livecodebench acc"))
+    rows = [
+        {"name": "LiveBench", "status": "done" if livebench is not None else ("skipped" if skipped else "partial"), "acc": livebench, "bon": as_float(row.get("livebench bon")), "tp": None},
+        {"name": "LiveCodeBench", "status": "done" if livecode is not None else ("skipped" if skipped else "partial"), "acc": livecode, "bon": as_float(row.get("livecodebench bon")), "tp": None},
+    ]
+    mean_acc = as_float(row.get("mean acc"))
+    return {
+        "status": "skipped" if skipped else ("done" if mean_acc is not None else ("partial" if "pending" in status_text.lower() or status_text else "pending")),
+        "mean_score": mean_acc,
+        "mean_acc": mean_acc,
+        "mean_tp": None,
+        "mean_bon": as_float(row.get("mean bon")),
+        "rows": rows,
+        "run_id": strip_code(row.get("run id")),
+        "status_text": status_text,
+        "path": str(path),
+        "mtime": file_mtime(path),
+    }
+
+
+def build_round13_experiments(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    text = read_text(ROUND13_CONFIG_PATH)
+    if not text:
+        return []
+    variants = {strip_code(row.get("variant")): row for row in parse_markdown_table(section_text(text, "数据"))}
+    specs = [
+        ("R13A", "rfmem_only", "trc_r13a_evalleak_rfmem_compact600_e8_20260520", "No-R1 task vector, RF/Mem trajectories only"),
+        ("R13B", "all_with_r1", "trc_r13b_evalleak_all_r1_compact600_e8_20260520", "all trajectories + scaled R1 task vector"),
+    ]
+    output = []
+    for exp_id, variant, run_id, label in specs:
+        attempt = find_attempt(run_id, exp_id, attempts)
+        variant_row = variants.get(variant) or {}
+        item = base_doc_experiment(exp_id, run_id, "", ROUND13_CONFIG_PATH, attempt)
+        item["label"] = exp_id
+        item["quick_gate"] = (attempt or {}).get("decision")
+        item["failure_reason"] = failure_reason((attempt or {}).get("decision"))
+        item["setting"].update(
+            {
+                "key_config": label,
+                "data_bank": variant,
+                "eval_leak": "yes",
+                "r1": "yes" if variant == "all_with_r1" else "no",
+                "bank_rows": strip_code(variant_row.get("rows")),
+                "bank_tool_rows": strip_code(variant_row.get("Tool")),
+                "bank_memory_rows": strip_code(variant_row.get("Memory")),
+                "bank_code_rows": strip_code(variant_row.get("Code")),
+                "code_source": strip_code(variant_row.get("Code source")),
+                "code_gate_target": strip_code(variant_row.get("Code gate target")),
+            }
+        )
+        enrich_doc_experiment(item, attempts)
+        output.append(item)
+    return output
+
+
+def setting_from_env_and_text(env: dict[str, str], key_config: str) -> dict[str, Any]:
+    lower = key_config.lower()
+    calib = env.get("CALIB") or ""
+    return {
+        "epoch": env.get("EPOCHS") or infer_epoch_from_run_id(env.get("EXP_ID") or ""),
+        "lr": env.get("LR"),
+        "data_bank": infer_data_bank(calib, key_config),
+        "eval_leak": "yes" if "evalleak" in calib.lower() or "eval-leak" in lower else "no",
+        "r1": "yes" if "r1" in (env.get("CONFIG") or "").lower() or "all_r1" in (env.get("EXP_ID") or "") else "no",
+        "span": env.get("TASK_RESPONSE_SPAN_MODE") or infer_span_mode(key_config),
+        "topk": env.get("TASK_TOPK_TOKENS") or infer_topk(key_config),
+        "memory_multiplier": task_assignment_value(env.get("TASK_LOSS_MULTIPLIER"), "memory"),
+        "tool_multiplier": task_assignment_value(env.get("TASK_LOSS_MULTIPLIER"), "tool"),
+        "code_multiplier": task_assignment_value(env.get("TASK_LOSS_MULTIPLIER"), "code"),
+        "loss_multiplier": env.get("TASK_LOSS_MULTIPLIER"),
+        "tool_gate": None,
+        "memory_gate": None,
+        "code_gate": None,
+        "max_seq": env.get("MAX_SEQ_LENGTH"),
+        "max_response": env.get("MAX_RESPONSE_TOKENS"),
+        "calibration": calib,
+        "mode": env.get("MODE"),
+        "config": env.get("CONFIG"),
+    }
+
+
+def parse_run_env(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip().strip("'\"")
+    except OSError:
+        pass
+    return env
+
+
+def task_assignment_value(text: str | None, task: str) -> str | None:
+    if not text:
+        return None
+    for chunk in text.split():
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        if key == task:
+            return value
+    return None
+
+
+def infer_data_bank(calib: str, key_config: str) -> str:
+    text = f"{calib} {key_config}".lower()
+    if "round13" in text or "evalleak" in text:
+        return "round13 eval-leak code16"
+    if "hybrid" in text:
+        return "hybrid stable Tool/Memory + Code"
+    if "rfonly" in text or "rf-only" in text:
+        return "CodeP0 RF-only tag-quota"
+    if "tag" in text:
+        return "CodeP0 tag-quota"
+    if "r8d" in text:
+        return "CodeP0 RF-only code-block"
+    return Path(calib).parent.name if calib else "from evaluation doc"
+
+
+def infer_span_mode(key_config: str) -> str:
+    lower = key_config.lower()
+    if "code-block" in lower or "codeblock" in lower:
+        return "code=code-block"
+    if "response" in lower:
+        return "code=response"
+    return ""
+
+
+def infer_topk(key_config: str) -> str:
+    match = re.search(r"topk\s*(\d+)", key_config, flags=re.IGNORECASE)
+    return f"code={match.group(1)}" if match else ""
+
+
+def infer_epoch_from_run_id(run_id: str) -> str:
+    match = re.search(r"_e(\d+)_", run_id)
+    return match.group(1) if match else ""
+
+
+def selected_epoch_from_run(run_root: Path) -> str:
+    selection = read_json(run_root / "selected.gates.selection.json")
+    if isinstance(selection, dict):
+        for key in ("selected_epoch", "epoch"):
+            if selection.get(key) is not None:
+                return str(selection[key])
+    return ""
+
+
+def run_id_from_checkpoint(checkpoint: str | None) -> str | None:
+    if not checkpoint:
+        return None
+    name = Path(strip_code(checkpoint)).name
+    return re.sub(r"-selected$", "", name) if name else None
+
+
+def infer_run_id_from_eval_id(exp_id: str, by_artifact: dict[str, dict[str, Any]]) -> str | None:
+    lower_id = exp_id.lower()
+    for artifact in by_artifact:
+        if lower_id in artifact.lower():
+            return artifact
+    return None
+
+
+def find_attempt(run_id: str | None, exp_id: str, attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    needles = [value.lower() for value in (run_id, exp_id) if value]
+    for row in attempts:
+        artifact = str(row.get("artifact") or "").lower()
+        if artifact and any(needle in artifact for needle in needles):
+            return row
+    return None
+
+
+def failure_reason(decision: str | None) -> str | None:
+    if not decision:
+        return None
+    lowered = decision.lower()
+    if any(token in lowered for token in ("reject", "below", "failed", "oom", "corrupted", "miss")):
+        return decision
+    return None
+
+
+def experiment_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+    match = re.match(r"R(\d+)([A-Z]*)", str(item.get("id") or ""))
+    if not match:
+        return (999, str(item.get("id") or ""))
+    return (int(match.group(1)), match.group(2))
+
+
+def strip_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("`") and text.endswith("`"):
+        return text[1:-1]
+    return text.replace("`", "")
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def build_eval_state(eval_id: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -393,7 +837,8 @@ def parse_code_artifact(path: Path, suite: str) -> dict[str, Any] | None:
 
 
 def parse_trc_training(spec: dict[str, Any]) -> dict[str, Any]:
-    run_root = Path(str(spec.get("train_run") or ""))
+    train_run = str(spec.get("train_run") or "")
+    run_root = Path(train_run) if train_run else Path("/nonexistent-trc-run")
     setting = spec.get("setting") if isinstance(spec.get("setting"), dict) else {}
     target_epoch = as_int(setting.get("epoch"))
     if not run_root.exists() or target_epoch <= 0:
@@ -648,10 +1093,10 @@ def formal_status(tool: dict[str, Any], memory: dict[str, Any], code: dict[str, 
 
 def build_guidance(evals: list[dict[str, Any]], ranking: list[dict[str, Any]]) -> list[str]:
     ideas = [
-        "本页只显示本轮 stage-1 TRC 候选的正式评测口径；M1/M2 等训练诊断组已隐藏，不参与当前模型选择。",
-        "排序按已完成轴的 Tool mean、Memory F1、Code Acc 均值给出；凡有 pending 的候选只能作为临时排序，不能作为最终结论。",
-        "Tool 采用 BFCL 四个子类平均，并单独显示 live mean；Memory 采用 HotpotQA 四个子集平均 EM/F1；Code 采用 CURE 的 LiveBench/LiveCodeBench Acc、TP、BoN。",
-        "Gate 系数按候选 checkpoint 对应的 target epoch 读取：anchor_i4 是 epoch 4，anchor_i8/dir_i8 是 epoch 8；训练动态只展示 TRC run，不展示 M1/M2。",
+        "本页自动合并 20260520 experiment ledger、Round10-12 evaluation docs、Round13 hidden-state config，以及 /tmp/shared-storage/OnPolicy/runs/trc 下的 run.env / trc_metrics / gates。",
+        "排序按已完成轴的 Tool mean、Memory F1、Code Acc 均值给出；quick-gate 未过的 Code 会显示 skipped，不应按三轴完成候选解读。",
+        "变量列优先使用 run.env：data bank、eval-leak、R1、span mode、topK、Tool/Memory/Code multiplier 和目标 epoch gate mean。",
+        "Round13 是 eval-leak hidden-state diagnostic，不进入论文主结果；当前只展示训练/quick-gate准备状态，正式 Tool/Memory/Code 需后续文档或日志补齐。",
     ]
     if ranking:
         best = ranking[0]
@@ -775,7 +1220,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Stage1 Experiment Dashboard</title>
+  <title>ExpertGym TRC Experiment Dashboard</title>
   <style>
     :root { color-scheme: light; --bg:#f5f7fa; --panel:#ffffff; --ink:#17202a; --muted:#667085; --line:#d8dee9; --accent:#126b63; --warn:#9a5b00; --bad:#a82020; --good:#146c2e; }
     * { box-sizing: border-box; }
@@ -812,8 +1257,8 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <header>
     <div>
-      <h1>ExpertGym Stage1 正式评测看板</h1>
-      <div class="muted" style="color:#c7d7da">候选 checkpoint、训练设置、Tool/Memory/Code 正式评测进度</div>
+      <h1>ExpertGym / TRC 实验决策看板</h1>
+      <div class="muted" style="color:#c7d7da">关键变量、loss 曲线、quick-gate、正式 Tool/Memory/Code 结果</div>
     </div>
     <div id="updated" class="small"></div>
   </header>
@@ -829,7 +1274,7 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
     <section>
-      <h2>候选实验设置 / 评测入口</h2>
+        <h2>实验变量 / quick-gate 决策</h2>
       <div id="settings"></div>
     </section>
     <section>
@@ -913,33 +1358,47 @@ function codeState(code) {
 function renderSettings(evals) {
   const rows = evals.map(ev => {
     const s = ev.setting || {};
-    const setting = [
-      `family=${s.family || 'NA'}`,
-      `epoch=${s.epoch || 'NA'}`,
-      `init=${s.init || 'NA'}`,
-      `lr=${s.lr || 'NA'}`,
-      `beta=${s.beta_base || 'NA'}`,
-      `gamma=${s.gamma_gate || 'NA'}`,
-      `floor=${s.coefficient_floor || 'NA'}`,
-      `accum=${s.accumulation_steps || 'NA'}`,
-      `param=${s.parameterization || 'NA'}`
+    const identity = [
+      `<b>${esc(ev.id || ev.label)}</b>`,
+      esc(ev.run_id || ev.checkpoint || ''),
+      ev.attempt?.id ? `<span class="pill">${esc(ev.attempt.id)}</span>` : ''
     ].join('<br>');
-    const objective = [
-      s.objective,
-      s.span,
-      `calib=${s.calibration || 'NA'}`,
-      `delta=${s.baked_delta_entries || 'NA'}`
+    const data = [
+      `bank=${s.data_bank || s.calibration || 'NA'}`,
+      `eval-leak=${s.eval_leak || 'NA'}`,
+      `R1=${s.r1 || 'NA'}`,
+      s.bank_rows ? `rows=${s.bank_rows} T/M/C=${s.bank_tool_rows || '?'} / ${s.bank_memory_rows || '?'} / ${s.bank_code_rows || '?'}` : '',
+      s.code_source ? `code=${s.code_source}` : ''
+    ].filter(Boolean).join('<br>');
+    const knobs = [
+      `span=${s.span || 'NA'}`,
+      `topK=${s.topk || 'NA'}`,
+      `memory x${s.memory_multiplier || 'NA'}`,
+      `tool x${s.tool_multiplier || 'NA'}`,
+      `code x${s.code_multiplier || 'NA'}`,
+      `epoch=${s.epoch || 'NA'} lr=${s.lr || 'NA'}`
+    ].join('<br>');
+    const gates = [
+      `tool=${fmtNum(s.tool_gate)}`,
+      `memory=${fmtNum(s.memory_gate)}`,
+      `code=${fmtNum(s.code_gate)}`
+    ].join('<br>');
+    const decision = [
+      ev.quick_gate || s.quick_gate || 'pending',
+      s.failure_reason ? `<span class="bad">${esc(s.failure_reason)}</span>` : '',
+      s.hypothesis ? `<span class="muted">${esc(s.hypothesis)}</span>` : ''
     ].filter(Boolean).join('<br>');
     return `<tr>
-      <td><b>${esc(ev.label)}</b><br><span class="muted">${esc(ev.checkpoint || '')}</span></td>
-      <td>${setting}</td>
-      <td>${objective}</td>
-      <td><span class="pill">${esc(ev.formal_status || '')}</span><br>${esc(codeState(ev.code || {}))}</td>
+      <td>${identity}</td>
+      <td>${data}</td>
+      <td>${knobs}</td>
+      <td>${gates}</td>
+      <td>${decision}<br><span class="pill">${esc(ev.formal_status || '')}</span><br>${esc(codeState(ev.code || {}))}</td>
       <td class="small">${esc(ev.checkpoint_path || '')}<br>${esc(ev.train_run || '')}<br>${esc(ev.root || '')}</td>
     </tr>`;
   });
   document.getElementById('settings').innerHTML = table(
-    [{t:'candidate'},{t:'核心超参'},{t:'训练目标 / 数据'},{t:'正式评测状态'},{t:'可追溯路径'}],
+    [{t:'experiment / run_id'},{t:'data bank / leak / R1'},{t:'span / topK / multipliers'},{t:'selected gates'},{t:'quick-gate / failure'},{t:'可追溯路径'}],
     rows
   );
 }
@@ -979,7 +1438,7 @@ function renderTraining(evals) {
       return `<tr><td>${k}</td><td class="num">${fmtInt(row.rows)}</td><td class="num">${fmtNum(row.span_tokens)}</td><td class="num">${fmtNum(row.residual_loss)}</td><td class="num">${fmtNum(row.total_loss)}</td><td class="num">${fmtNum(row.base_drift_loss)}</td></tr>`;
     });
     return `<div class="run">
-      <h2>${esc(ev.label)} <span class="pill">target epoch ${fmtInt(t.target_epoch)}</span></h2>
+      <h2>${esc(ev.id || ev.label)} <span class="muted">${esc(ev.run_id || '')}</span> <span class="pill">target epoch ${fmtInt(t.target_epoch)}</span></h2>
       ${gateSeries.length ? spark(gateSeries) : '<div class="warn">training curve pending</div>'}
       <div class="kv">
         <div class="muted">gate mean</div><div>tool <b>${fmtNum(gm.tool)}</b> · memory <b>${fmtNum(gm.memory)}</b> · code <b>${fmtNum(gm.code)}</b></div>

@@ -16,6 +16,9 @@
 | `20260517_defg_eval6.md` | 2026-05-17 D/E/F/G 正式 eval6 结果，含 F/G final iter20 补充评测 | Tool/Memory/Code `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_defg_20260517_addons.py` |
 | `20260519_r1math_L_eval6.md` | 2026-05-19 Correct-R1 L 系列 `L1 iter009` / `L2 iter009` 正式 Eval6，当前 running | Tool/Memory/Code `summary.json`，eval runner `/mnt/cache/wuruixiao/users/lsc/AgentMerging/skill/plan/v1—feedback/evaluation/eval-batch/eval6-20260502-125748/run_expertgym_r1math_L_20260519_addons.py` |
 | `20260519_stage1_candidates_eval.md` | 2026-05-19 TRC directional stage-1 candidate full-suite evaluation | Tool/Memory done，Code CURE running |
+| `20260519_trc_round1_eval.md` | 2026-05-19/20 TRC Round1/Round2 candidate monitor table | E1/E3 Code running，R2D/R2E Tool done + Memory running |
+| `20260520_trc_round3_eval.md` | 2026-05-20 TRC Round3 memory-trajectory + coefficient-retention evaluation | R3D Tool/Memory done and Code running，R3I/R3J fast eval running |
+| `20260520_trc_round4_eval.md` | 2026-05-20 TRC Round4 stronger-gate code-push evaluation | R4A promoted to Code，R4B/R4C rejected |
 
 ## 记录格式
 

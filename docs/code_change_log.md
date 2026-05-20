@@ -1361,3 +1361,39 @@ PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python tests/test_bak
 ```
 
 `pytest` is not installed in the available BFCL/easyrl/system Python environments, so validation used the direct `unittest` script entrypoints.
+
+## 2026-05-20: Round13 Formal-Code Eval-Leak TRC Diagnostic Builder
+
+Purpose:
+
+- Add a clean diagnostic builder for testing whether TRC hidden-state alignment can learn formal LiveBench/LiveCodeBench Code ability when the calibration trajectories are explicitly aligned to the formal eval distribution.
+- This is eval-leak diagnostic data only; it must not be reported as a paper-main non-leak result.
+
+Changes:
+
+- Added `scripts/trc/build_trc_round13_evalleak_code16_calibration.py`.
+- The builder emits two isolated calibration banks under `/tmp/shared-storage/OnPolicy/data/calibration/20260520_trc_round13_evalleak_code16`:
+  - `rfmem_only`: copies stable Tool32/Memory32 rows and adds only ReasonFlux/MemoryAgent positive Code16 trajectories.
+  - `all_with_r1`: copies stable Tool32/Memory32 rows and adds all positive Code16 trajectories, mapping DeepSeek/R1 rows to the `reasoning` gate expert.
+- Code rows map source trajectory to the matching gate expert:
+  - ReasonFlux -> `code`
+  - MemoryAgent -> `memory`
+  - DeepSeek/R1 -> `reasoning`
+- Code responses are compacted to `critical_reasoning_span + final_code_span`; span metadata is written to `sample_metadata.ability_spans`.
+- The default reasoning context is 600 chars so that the final code block remains inside the stable 512-token response budget used by the TRC train rerun.
+
+Default impact:
+
+- No existing training, reward, GRPO/OPD, retention, or TRC train path is changed.
+- The new builder is standalone and only runs when explicitly invoked.
+
+Config:
+
+- `docs/config/hiddenstate/20260520_round13_evalleak_code16.md`
+
+Validation:
+
+```bash
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/trc/build_trc_round13_evalleak_code16_calibration.py
+```
