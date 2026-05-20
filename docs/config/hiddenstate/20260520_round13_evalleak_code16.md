@@ -109,3 +109,11 @@ tmux new-session -d -s train_r13b_evalleak_all_r1_20260520 \
 - Memory mean F1 >= `0.76`
 
 通过后再跑 Code formal eval。若 R13B Code 明显优于 R13A，说明 DeepSeek/R1 task vector 与 formal-code 正轨迹能提供新能力；若 R13A/R13B 都不涨，说明当前 TRC hidden-state objective 仍不能把 formal code ability 转成可泛化 gate，需要进入 contrastive / guard-test-aware loss。
+
+## 运行状态
+
+2026-05-20 12:09 CST:
+
+- R13A `trc_r13a_evalleak_rfmem_compact600_e8_20260520` 已完成并 bake。自动 selection 实际选中 epoch 4，gate mean：Code `1.0389`，Memory `1.0177`，Tool `1.0685`；epoch 8 gate mean 为 Code `1.0821`，Memory `1.0332`，Tool `1.1346`。这说明 loss-plateau selection 对 Code diagnostic 偏保守；已额外 bake epoch 8 forced checkpoint `/tmp/shared-storage/OnPolicy/checkpoints/trc_r13a_evalleak_rfmem_compact600_e08_forced_20260520-selected` 并启动 Tool/Memory quick gate `eval_r13a_e08_forced_tm_20260520`。
+- R13B `trc_r13b_evalleak_all_r1_compact600_e8_20260520` 两卡 OOM，没有 baked checkpoint。直接原因是 4-expert correct-R1 scaled mode 的 delta 常驻显存高于 3-expert mode，叠加 memory trajectory-turn 的 base/expert/merged 三次 forward。后续若继续测 R1，需要 4 卡 device_map，或把 memory 改为 final-turn/fewer-turn low-memory diagnostic。
+- 已启动 low-memory R1 control：`trc_r13b_evalleak_all_r1_finalmem_e8_20260520`。该 run 保持 all+R1 formal-code bank 和 scaled correct-R1 mode，但关闭 `TRAJECTORY_TURN_LOSS_TASKS=memory`，让 Memory 使用 final response。它不是 R13A 的严格同配置对照，但可以快速判断 R1+formal-code 方向是否值得上 4 卡完整版本。自动 selection 也选中 epoch 4；epoch 8 forced checkpoint 已 bake 到 `/tmp/shared-storage/OnPolicy/checkpoints/trc_r13b_evalleak_all_r1_finalmem_e08_forced_20260520-selected`，等待 BFCL quick gate 空档。

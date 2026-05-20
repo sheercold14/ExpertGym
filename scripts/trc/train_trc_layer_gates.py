@@ -57,6 +57,7 @@ def main() -> None:
     task_projection_weight = parse_task_value_overrides(args.task_directional_projection_weight, float)
     task_loss_multiplier = parse_task_value_overrides(args.task_loss_multiplier, float)
     trajectory_turn_loss_tasks = {str(task).strip() for task in args.trajectory_turn_loss_task if str(task).strip()}
+    contrastive_negative_tasks = {str(task).strip() for task in args.contrastive_negative_task if str(task).strip()}
     run_manifest = {
         "format": "trc_layer_gate_run_manifest_v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -76,6 +77,7 @@ def main() -> None:
         "task_directional_projection_weight": task_projection_weight,
         "task_loss_multiplier": task_loss_multiplier,
         "trajectory_turn_loss_tasks": sorted(trajectory_turn_loss_tasks),
+        "contrastive_negative_tasks": sorted(contrastive_negative_tasks),
         "expert_names": list(expert_names),
         "status": "initialized",
     }
@@ -157,7 +159,9 @@ def main() -> None:
                 max_response_tokens=int(args.max_response_tokens),
                 topk_tokens=int(task_topk_tokens.get(task, int(args.topk_tokens))),
                 prompt_drift_tokens=int(args.prompt_drift_tokens),
+                prompt_residual_tokens=int(args.prompt_residual_tokens),
                 beta_base=float(args.beta_base),
+                prompt_residual_weight=float(args.prompt_residual_weight),
                 gamma_gate=float(args.gamma_gate),
                 residual_weight_power=float(task_residual_weight_power.get(task, float(args.residual_weight_power))),
                 residual_objective=str(args.residual_objective),
@@ -170,6 +174,14 @@ def main() -> None:
                 task_expert_coefficient_floor=float(args.task_expert_coefficient_floor),
                 task_expert_coefficient_floor_weight=float(args.task_expert_coefficient_floor_weight),
                 response_span_mode=str(task_response_span_modes.get(task, str(args.response_span_mode))),
+                contrastive_negative_loss_weight=(
+                    float(args.contrastive_negative_loss_weight)
+                    if float(args.contrastive_negative_loss_weight) > 0.0
+                    and (not contrastive_negative_tasks or task in contrastive_negative_tasks)
+                    else 0.0
+                ),
+                contrastive_negative_margin=float(args.contrastive_negative_margin),
+                contrastive_negative_response_key=str(args.contrastive_negative_response_key),
             )
             if task in trajectory_turn_loss_tasks and row.get("trajectory_turns"):
                 losses = compute_trc_trajectory_turn_loss(**loss_kwargs)
@@ -191,10 +203,15 @@ def main() -> None:
                 "trajectory_id": row.get("trajectory_id"),
                 "total_loss": tensor_item(losses["total_loss"]),
                 "residual_loss": tensor_item(losses["residual_loss"]),
+                "prompt_residual_loss": tensor_item(losses["prompt_residual_loss"]),
                 "base_drift_loss": tensor_item(losses["base_drift_loss"]),
                 "gate_anchor_loss": tensor_item(losses["gate_anchor_loss"]),
                 "coefficient_floor_loss": tensor_item(losses["coefficient_floor_loss"]),
                 "task_expert_coefficient_floor_loss": tensor_item(losses["task_expert_coefficient_floor_loss"]),
+                "contrastive_negative_loss": tensor_item(losses.get("contrastive_negative_loss", 0.0)),
+                "negative_residual_loss": tensor_item(losses.get("negative_residual_loss", 0.0)),
+                "negative_response_tokens": int(losses.get("negative_response_tokens", 0)),
+                "contrastive_negative_active": bool(losses.get("contrastive_negative_active", False)),
                 "loss_scale": loss_scale,
                 "response_tokens": int(losses["response_tokens"]),
                 "prompt_tokens": int(losses["prompt_tokens"]),
@@ -265,7 +282,9 @@ def compute_trc_row_loss(
     max_response_tokens: int,
     topk_tokens: int,
     prompt_drift_tokens: int,
+    prompt_residual_tokens: int,
     beta_base: float,
+    prompt_residual_weight: float,
     gamma_gate: float,
     residual_weight_power: float,
     residual_objective: str,
@@ -278,6 +297,9 @@ def compute_trc_row_loss(
     task_expert_coefficient_floor: float,
     task_expert_coefficient_floor_weight: float,
     response_span_mode: str,
+    contrastive_negative_loss_weight: float,
+    contrastive_negative_margin: float,
+    contrastive_negative_response_key: str,
 ) -> dict[str, Any] | None:
     encoded = encode_prompt_response(
         tokenizer,
@@ -325,7 +347,8 @@ def compute_trc_row_loss(
         hidden_layers=hidden_layers,
     )
     response_positions = torch.arange(prompt_len + span_start, prompt_len + span_end, device=device)
-    prompt_positions = prompt_position_tensor(torch, prompt_len=prompt_len, limit=prompt_drift_tokens, device=device)
+    drift_positions = prompt_position_tensor(torch, prompt_len=prompt_len, limit=prompt_drift_tokens, device=device)
+    prompt_residual_positions = prompt_position_tensor(torch, prompt_len=prompt_len, limit=prompt_residual_tokens, device=device)
     residual_loss = hidden_residual_loss(
         torch,
         base_hidden=base_hidden,
@@ -340,11 +363,28 @@ def compute_trc_row_loss(
         directional_projection_floor=directional_projection_floor,
         directional_projection_weight=directional_projection_weight,
     )
-    if beta_base > 0.0 and prompt_positions.numel() > 0:
+    if prompt_residual_weight > 0.0 and prompt_residual_positions.numel() > 0:
+        prompt_residual_loss = hidden_residual_loss(
+            torch,
+            base_hidden=base_hidden,
+            expert_hidden=expert_hidden,
+            merged_hidden=merged_hidden,
+            positions=prompt_residual_positions,
+            topk_tokens=topk_tokens,
+            residual_weight_power=residual_weight_power,
+            residual_objective=residual_objective,
+            normalize_by_target=normalize_residual_by_target,
+            target_normalize_eps=target_normalize_eps,
+            directional_projection_floor=directional_projection_floor,
+            directional_projection_weight=directional_projection_weight,
+        )
+    else:
+        prompt_residual_loss = torch.zeros((), device=device, dtype=torch.float32)
+    if beta_base > 0.0 and drift_positions.numel() > 0:
         base_drift_loss = hidden_match_loss(
             base_hidden=base_hidden,
             merged_hidden=merged_hidden,
-            positions=prompt_positions,
+            positions=drift_positions,
         )
     else:
         base_drift_loss = torch.zeros((), device=device, dtype=torch.float32)
@@ -356,20 +396,62 @@ def compute_trc_row_loss(
         expert=str(row["expert"]),
         coefficient_floor=task_expert_coefficient_floor,
     )
+    contrastive_negative_loss = torch.zeros((), device=device, dtype=torch.float32)
+    negative_residual_loss = torch.zeros((), device=device, dtype=torch.float32)
+    negative_response_tokens = 0
+    contrastive_negative_active = False
+    negative_response = str(row.get(contrastive_negative_response_key) or "").strip()
+    if contrastive_negative_loss_weight > 0.0 and negative_response:
+        negative_losses = compute_negative_residual_loss(
+            torch=torch,
+            model=model,
+            tokenizer=tokenizer,
+            gate_manager=gate_manager,
+            prompt_text=str(row.get("rendered_prompt") or row.get("prompt") or ""),
+            negative_response=negative_response,
+            expert=str(row["expert"]),
+            hidden_layers=hidden_layers,
+            device=device,
+            max_seq_length=max_seq_length,
+            max_response_tokens=max_response_tokens,
+            topk_tokens=topk_tokens,
+            residual_weight_power=residual_weight_power,
+            residual_objective=residual_objective,
+            normalize_residual_by_target=normalize_residual_by_target,
+            target_normalize_eps=target_normalize_eps,
+            directional_projection_floor=directional_projection_floor,
+            directional_projection_weight=directional_projection_weight,
+            response_span_mode=response_span_mode,
+            task=str(row.get("task") or ""),
+        )
+        if negative_losses is not None:
+            negative_residual_loss = negative_losses["negative_residual_loss"]
+            negative_response_tokens = int(negative_losses["negative_response_tokens"])
+            contrastive_negative_loss = torch.relu(
+                float(contrastive_negative_margin) + residual_loss - negative_residual_loss
+            )
+            contrastive_negative_active = bool(tensor_item(contrastive_negative_loss) > 0.0)
     total_loss = (
         residual_loss
+        + prompt_residual_weight * prompt_residual_loss
         + beta_base * base_drift_loss
         + gamma_gate * gate_anchor_loss
         + coefficient_floor_weight * coefficient_floor_loss
         + task_expert_coefficient_floor_weight * task_expert_coefficient_floor_loss
+        + contrastive_negative_loss_weight * contrastive_negative_loss
     )
     return {
         "total_loss": total_loss,
         "residual_loss": residual_loss.detach(),
+        "prompt_residual_loss": prompt_residual_loss.detach(),
         "base_drift_loss": base_drift_loss.detach(),
         "gate_anchor_loss": gate_anchor_loss.detach(),
         "coefficient_floor_loss": coefficient_floor_loss.detach(),
         "task_expert_coefficient_floor_loss": task_expert_coefficient_floor_loss.detach(),
+        "contrastive_negative_loss": contrastive_negative_loss.detach(),
+        "negative_residual_loss": negative_residual_loss.detach(),
+        "negative_response_tokens": negative_response_tokens,
+        "contrastive_negative_active": contrastive_negative_active,
         "response_tokens": response_len,
         "prompt_tokens": prompt_len,
         "span_mode": resolved_span_mode,
@@ -404,6 +486,7 @@ def compute_trc_trajectory_turn_loss(**kwargs: Any) -> dict[str, Any] | None:
     return {
         "total_loss": total_loss,
         "residual_loss": torch.stack([item["residual_loss"] for item in turn_losses]).mean(),
+        "prompt_residual_loss": torch.stack([item["prompt_residual_loss"] for item in turn_losses]).mean(),
         "base_drift_loss": torch.stack([item["base_drift_loss"] for item in turn_losses]).mean(),
         "gate_anchor_loss": torch.stack([item["gate_anchor_loss"] for item in turn_losses]).mean(),
         "coefficient_floor_loss": torch.stack([item["coefficient_floor_loss"] for item in turn_losses]).mean(),
@@ -417,6 +500,95 @@ def compute_trc_trajectory_turn_loss(**kwargs: Any) -> dict[str, Any] | None:
         "selected_response_tokens": sum(int(item["selected_response_tokens"]) for item in turn_losses),
         "hidden_layers": list(kwargs["hidden_layers"]),
         "trajectory_turns": len(turn_losses),
+    }
+
+
+def compute_negative_residual_loss(
+    *,
+    torch: Any,
+    model: Any,
+    tokenizer: Any,
+    gate_manager: Any,
+    prompt_text: str,
+    negative_response: str,
+    expert: str,
+    hidden_layers: list[int],
+    device: Any,
+    max_seq_length: int,
+    max_response_tokens: int,
+    topk_tokens: int,
+    residual_weight_power: float,
+    residual_objective: str,
+    normalize_residual_by_target: bool,
+    target_normalize_eps: float,
+    directional_projection_floor: float,
+    directional_projection_weight: float,
+    response_span_mode: str,
+    task: str,
+) -> dict[str, Any] | None:
+    encoded = encode_prompt_response(
+        tokenizer,
+        prompt_text=prompt_text,
+        response_text=negative_response,
+        max_seq_length=max_seq_length,
+        max_response_tokens=max_response_tokens,
+    )
+    if encoded is None:
+        return None
+    input_ids, attention_mask, prompt_len, response_len = encoded
+    span_start, span_end, _ = response_token_span(
+        tokenizer,
+        task=task,
+        response_text=negative_response,
+        response_len=response_len,
+        max_response_tokens=max_response_tokens,
+        mode=response_span_mode,
+    )
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+    base_values = torch.zeros_like(gate_manager.raw_coefficients)
+    expert_values = torch.zeros_like(gate_manager.raw_coefficients)
+    expert_idx = list(gate_manager.expert_names).index(str(expert))
+    expert_values[:, expert_idx] = 1.0
+    with torch.no_grad():
+        with temporary_direct_coefficients(torch, gate_manager, base_values):
+            base_hidden = selected_hidden_states(
+                model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                hidden_layers=hidden_layers,
+            )
+        with temporary_direct_coefficients(torch, gate_manager, expert_values):
+            expert_hidden = selected_hidden_states(
+                model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                hidden_layers=hidden_layers,
+            )
+    merged_hidden = selected_hidden_states(
+        model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        hidden_layers=hidden_layers,
+    )
+    response_positions = torch.arange(prompt_len + span_start, prompt_len + span_end, device=device)
+    residual_loss = hidden_residual_loss(
+        torch,
+        base_hidden=base_hidden,
+        expert_hidden=expert_hidden,
+        merged_hidden=merged_hidden,
+        positions=response_positions,
+        topk_tokens=topk_tokens,
+        residual_weight_power=residual_weight_power,
+        residual_objective=residual_objective,
+        normalize_by_target=normalize_residual_by_target,
+        target_normalize_eps=target_normalize_eps,
+        directional_projection_floor=directional_projection_floor,
+        directional_projection_weight=directional_projection_weight,
+    )
+    return {
+        "negative_residual_loss": residual_loss,
+        "negative_response_tokens": response_len,
     }
 
 
@@ -655,10 +827,14 @@ def summarize_epoch(epoch: int, metrics: list[dict[str, Any]], gate_manager: Any
             "rows": len(rows),
             "total_loss": mean(item["total_loss"] for item in rows),
             "residual_loss": mean(item["residual_loss"] for item in rows),
+            "prompt_residual_loss": mean(item["prompt_residual_loss"] for item in rows),
             "base_drift_loss": mean(item["base_drift_loss"] for item in rows),
             "gate_anchor_loss": mean(item["gate_anchor_loss"] for item in rows),
             "coefficient_floor_loss": mean(item.get("coefficient_floor_loss", 0.0) for item in rows),
             "task_expert_coefficient_floor_loss": mean(item.get("task_expert_coefficient_floor_loss", 0.0) for item in rows),
+            "contrastive_negative_loss": mean(item.get("contrastive_negative_loss", 0.0) for item in rows),
+            "negative_residual_loss": mean(item.get("negative_residual_loss", 0.0) for item in rows),
+            "contrastive_negative_active_rate": mean(1.0 if item.get("contrastive_negative_active") else 0.0 for item in rows),
             "span_tokens": mean(item.get("span_tokens", item.get("selected_response_tokens", 0)) for item in rows),
             "trajectory_turns": mean(item.get("trajectory_turns", 1) for item in rows),
             "loss_scale": mean(item.get("loss_scale", 1.0) for item in rows),
@@ -672,10 +848,14 @@ def summarize_epoch(epoch: int, metrics: list[dict[str, Any]], gate_manager: Any
         "elapsed_seconds": elapsed,
         "mean_total_loss": mean(item["total_loss"] for item in metrics),
         "mean_residual_loss": mean(item["residual_loss"] for item in metrics),
+        "mean_prompt_residual_loss": mean(item["prompt_residual_loss"] for item in metrics),
         "mean_base_drift_loss": mean(item["base_drift_loss"] for item in metrics),
         "mean_gate_anchor_loss": mean(item["gate_anchor_loss"] for item in metrics),
         "mean_coefficient_floor_loss": mean(item.get("coefficient_floor_loss", 0.0) for item in metrics),
         "mean_task_expert_coefficient_floor_loss": mean(item.get("task_expert_coefficient_floor_loss", 0.0) for item in metrics),
+        "mean_contrastive_negative_loss": mean(item.get("contrastive_negative_loss", 0.0) for item in metrics),
+        "mean_negative_residual_loss": mean(item.get("negative_residual_loss", 0.0) for item in metrics),
+        "contrastive_negative_active_rate": mean(1.0 if item.get("contrastive_negative_active") else 0.0 for item in metrics),
         "task_loss": task_loss,
         "gate_means": gate_means(gate_manager),
         "gate_values": gate_manager.gate_values(),
@@ -841,6 +1021,18 @@ def parse_args() -> argparse.Namespace:
         help="Override top-k residual tokens for a task, e.g. --task-topk-tokens tool=64.",
     )
     parser.add_argument("--prompt-drift-tokens", type=int, default=256)
+    parser.add_argument(
+        "--prompt-residual-tokens",
+        type=int,
+        default=256,
+        help="Prompt-tail token budget for optional expert-residual prompt alignment. Used only when --prompt-residual-weight > 0.",
+    )
+    parser.add_argument(
+        "--prompt-residual-weight",
+        type=float,
+        default=0.0,
+        help="Optional expert-residual alignment loss on prompt tokens. Default 0 keeps the old output-span-only path.",
+    )
     parser.add_argument("--residual-weight-power", type=float, default=1.0)
     parser.add_argument(
         "--task-residual-weight-power",
@@ -916,6 +1108,29 @@ def parse_args() -> argparse.Namespace:
         "--task-balanced-loss",
         action="store_true",
         help="Scale row losses so each task contributes equally when task counts are imbalanced.",
+    )
+    parser.add_argument(
+        "--contrastive-negative-loss-weight",
+        type=float,
+        default=0.0,
+        help="Optional hinge loss weight for rows with a negative response. Default 0 disables the branch.",
+    )
+    parser.add_argument(
+        "--contrastive-negative-margin",
+        type=float,
+        default=0.05,
+        help="Require negative residual loss to exceed positive residual loss by this margin when contrastive loss is enabled.",
+    )
+    parser.add_argument(
+        "--contrastive-negative-response-key",
+        default="negative_response",
+        help="Row field containing a failed response used by the optional contrastive branch.",
+    )
+    parser.add_argument(
+        "--contrastive-negative-task",
+        action="append",
+        default=[],
+        help="Task allowlist for optional negative contrastive loss, e.g. --contrastive-negative-task code. Empty means all tasks.",
     )
     parser.add_argument("--beta-base", type=float, default=0.02)
     parser.add_argument("--gamma-gate", type=float, default=0.001)

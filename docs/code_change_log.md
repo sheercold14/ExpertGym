@@ -1397,3 +1397,143 @@ Validation:
 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
   scripts/trc/build_trc_round13_evalleak_code16_calibration.py
 ```
+
+## 2026-05-20: Optional Code Negative-Contrastive TRC Diagnostic
+
+Purpose:
+
+- Add a default-off diagnostic path for Code: use same-prompt failed CURE generations as negative trajectories, so TRC can learn to approach expert-positive residuals while not matching failed-response residuals.
+- This is meant to test whether Code needs execution-aware contrastive signal rather than positive-only hidden-state alignment.
+
+Changes:
+
+- `scripts/trc/train_trc_layer_gates.py`
+  - Added optional CLI args:
+    - `--contrastive-negative-loss-weight` (default `0.0`, branch disabled)
+    - `--contrastive-negative-margin` (default `0.05`)
+    - `--contrastive-negative-response-key` (default `negative_response`)
+    - `--contrastive-negative-task` (repeatable allowlist)
+  - When enabled and a row has `negative_response`, the trainer computes a hinge loss:
+    `relu(margin + positive_residual_loss - negative_residual_loss)`.
+  - The negative branch does extra base/expert/merged hidden-state forwards for that failed response, so it is slower by design.
+  - Default training commands with weight `0.0` do not enter this branch.
+- `skill/command/run_20260519_trc_round_train_one.sh`
+  - Exposes the new contrastive args through `CONTRASTIVE_NEGATIVE_*` environment variables.
+  - Defaults keep old behavior unchanged.
+- `scripts/trc/build_trc_round14_code_contrast_calibration.py`
+  - Builds a calibration JSONL by copying a positive TRC bank and adding `negative_response` to Code rows from failed CURE temp outputs.
+  - Default output:
+    `/tmp/shared-storage/OnPolicy/data/calibration/20260520_trc_round14_code_contrast_v1/trc_expert_trajectories.jsonl`
+- `scripts/trc/build_trc_round14_mixed_train_contrast_calibration.py`
+  - Builds a 96-row mixed bank where Code keeps original CodeP0 train prompts and adds a small formal contrast hard-anchor slice.
+  - Default output:
+    `/tmp/shared-storage/OnPolicy/data/calibration/20260520_trc_round14_mixed_train_contrast_v1/trc96_expert_trajectories.jsonl`
+  - Default Code composition: 24 CodeContests_train / CodeP0 rows + 8 formal contrast rows with `negative_response`.
+
+Default impact:
+
+- Existing reward, GRPO/OPD, retention, Tool/Memory TRC, positive TRC residual loss, task balancing, task weights, and checkpoint selection are unchanged when `CONTRASTIVE_NEGATIVE_LOSS_WEIGHT=0.0`.
+
+Validation:
+
+```bash
+PYTHONPATH=. python -m py_compile \
+  scripts/trc/train_trc_layer_gates.py \
+  scripts/trc/build_trc_round14_code_contrast_calibration.py \
+  scripts/trc/build_trc_round14_mixed_train_contrast_calibration.py
+
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/trc/build_trc_round14_code_contrast_calibration.py
+
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/trc/build_trc_round14_mixed_train_contrast_calibration.py
+```
+
+## 2026-05-20: Round16 Non-Leak CodeP0 Pass/Fail Contrast Builder
+
+Purpose:
+
+- Build a paper-main-safe Code contrast calibration bank without formal Code eval anchors.
+- Keep Tool/Memory from the stable R5A bank, but make all Code rows come from CodeP0-v3 `CodeContests_train` expert rollouts.
+- Support the main Code hypothesis: same-prompt pass code block direction should dominate fail code block direction.
+
+Changes:
+
+- Added `scripts/trc/build_trc_round16_nonleak_code_contrast_calibration.py`.
+- Default output:
+  `/tmp/shared-storage/OnPolicy/data/calibration/20260520_trc_round16_nonleak_code_contrast_v1/trc96_expert_trajectories.jsonl`
+- The builder emits:
+  - Tool32 from stable R5A Tool bank.
+  - Memory32 from stable R5A late3 Memory bank.
+  - Code22 pass/fail rows from CodeP0-v3 train rollouts, each with `negative_response`.
+  - Code10 positive-fill rows from CodeP0-v3 train rollouts.
+- Strict RF+DS-merged non-leak data only provides 22 unique pass/fail prompts, so the default is explicitly `22 + 10` rather than silently duplicating prompts or importing formal eval anchors.
+- All Code rows keep `expert=code`; DeepSeek fallback rows are marked in metadata for audit.
+- The builder now supports explicit `--code-rollout` overrides. This is used by R16C to build a ReasonFlux-only contrast bank.
+- Positive-fill selection prefers prompts outside the contrast set, then allows additional successful trajectories if a strict single-source bank does not have enough unique prompts. This keeps RF-only probes possible while recording unique prompt counts in `summary.json`.
+
+Default impact:
+
+- No existing train path changes.
+- The new builder is standalone and only affects experiments that explicitly set `CALIB` to its output.
+- The optional contrast branch in `train_trc_layer_gates.py` remains default-off.
+
+Config:
+
+- `docs/config/20260520_trc_round16_nonleak_code_contrast.md`
+
+Validation:
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/trc/build_trc_round16_nonleak_code_contrast_calibration.py
+```
+
+RF-only probe:
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/trc/build_trc_round16_nonleak_code_contrast_calibration.py \
+  --output-dir /tmp/shared-storage/OnPolicy/data/calibration/20260520_trc_round16_rfonly_code_contrast_v1 \
+  --code-rollout /tmp/shared-storage/OnPolicy/data/calibration/code_p0_v3_20260518/expert_rollouts/code_expert_reasonflux_coder7b_code_p0_v3_train64_s8_seed20260518.jsonl \
+  --code-contrast-count 16 \
+  --code-positive-fill-count 16
+```
+
+## 2026-05-20: Optional TRC Prompt Expert-Residual Loss
+
+Purpose:
+
+- Test the hypothesis that prompt hidden states contain task-vector understanding, so pulling prompt tokens back to base can suppress useful expert behavior.
+- Keep the old path unchanged by default while allowing a clean R17 comparison:
+  - no prompt-base drift;
+  - no prompt-base drift plus expert-residual alignment on prompt tokens.
+
+Changes:
+
+- Updated `scripts/trc/train_trc_layer_gates.py`.
+- Added CLI flags:
+  - `--prompt-residual-weight`, default `0.0`;
+  - `--prompt-residual-tokens`, default `256`.
+- When `--prompt-residual-weight > 0`, the trainer computes `prompt_residual_loss` on the prompt-tail token positions using the same `hidden_residual_loss` objective as output span residual alignment:
+  `merged_hidden - base_hidden -> expert_hidden - base_hidden`.
+- `prompt_residual_loss` is logged at row, task-summary, and epoch-summary levels.
+- Existing `base_drift_loss` remains controlled only by `--beta-base`; setting `BETA_BASE=0` cleanly disables prompt-to-base drift.
+- Updated `skill/command/run_20260519_trc_round_train_one.sh` to record and pass:
+  - `PROMPT_RESIDUAL_WEIGHT`;
+  - `PROMPT_RESIDUAL_TOKENS`;
+  - `PROMPT_DRIFT_TOKENS`.
+
+Default impact:
+
+- With `PROMPT_RESIDUAL_WEIGHT=0.0`, the new prompt residual branch is not used.
+- Existing R16 / earlier TRC experiments keep the same loss path unless explicitly setting the new env vars or `BETA_BASE=0`.
+
+Validation:
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  -m py_compile scripts/trc/train_trc_layer_gates.py
+
+bash -n skill/command/run_20260519_trc_round_train_one.sh
+```

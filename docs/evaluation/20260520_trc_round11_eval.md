@@ -21,10 +21,10 @@ R11B/R11F/R11G/R11H Code evals are launched from passing quick gates.
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | R10A | `code_20260520_0955` | 0.3477 | 0.4453 | 0.2715 | 0.3581 | 0.3096 | 0.4017 | done; recorded in Round10 |
 | R10D | `code_20260520_1022` | 0.3672 | 0.4453 | 0.2652 | 0.3601 | 0.3162 | 0.4027 | done; recorded in Round10 |
-| R11B | `code_20260520_1039` | 0.3750 | 0.5000 | pending | pending | pending | pending | LiveCodeBench ground-truth unit tests `321/512` at 2026-05-20 11:40 CST |
-| R11F | `code_20260520_1057` | 0.3555 | 0.4688 | pending | pending | pending | pending | LiveCodeBench ground-truth unit tests `230/512` at 2026-05-20 11:40 CST |
-| R11G | `code_20260520_1110` | 0.3516 | 0.4297 | pending | pending | pending | pending | LiveCodeBench generated-unit execution done; ground-truth unit tests `24/512` at 2026-05-20 11:44 CST |
-| R11H | `code_20260520_1123` | 0.3477 | 0.4375 | pending | pending | pending | pending | LiveBench done; LiveCodeBench started at 2026-05-20 11:38 CST |
+| R11B | `code_20260520_1039` | 0.3750 | 0.5000 | 0.2794 | 0.3620 | 0.3272 | 0.4310 | done |
+| R11F | `code_20260520_1057` | 0.3555 | 0.4688 | 0.2657 | 0.3444 | 0.3106 | 0.4066 | done |
+| R11G | `code_20260520_1110` | 0.3516 | 0.4297 | 0.2784 | 0.3542 | 0.3150 | 0.3919 | done |
+| R11H | `code_20260520_1123` | 0.3477 | 0.4375 | 0.2652 | 0.3640 | 0.3064 | 0.4007 | done |
 
 ## Training / Bake
 
@@ -45,9 +45,9 @@ R11B/R11F/R11G/R11H Code evals are launched from passing quick gates.
   `51431/81559 MiB`, GPU2 `51063/81559 MiB`, GPU3 `67223/81559 MiB`, GPU4
   `67749/81559 MiB`, GPU6 `76031/81559 MiB`, GPU7 `55759/81559 MiB`; GPU5
   reports `2/81559 MiB`.
-- R11H Tool/Memory pass is confirmed (`0.8048` / `0.7619`), and Code is now
-  running. LiveBench is complete at `0.3477` Acc / `0.4375` BoN; LiveCodeBench
-  generation is about halfway complete.
+- R11H Tool/Memory pass is confirmed (`0.8048` / `0.7619`), but Code finished
+  at mean Acc `0.3064`; code-block topK384 does not improve formal Code despite
+  better Tool quick-gate.
 - R12B is still training and has no selected/baked checkpoint in this monitor
   snapshot.
 - R12D quick gate is complete in Round12: Tool mean `0.7788`, Memory mean F1

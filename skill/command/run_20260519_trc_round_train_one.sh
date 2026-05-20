@@ -43,6 +43,7 @@ append_repeated_args "--task-directional-projection-weight" "${TASK_DIRECTIONAL_
 append_repeated_args "--task-response-span-mode" "${TASK_RESPONSE_SPAN_MODE:-}" TASK_ARGS
 append_repeated_args "--task-loss-multiplier" "${TASK_LOSS_MULTIPLIER:-}" TASK_ARGS
 append_repeated_args "--trajectory-turn-loss-task" "${TRAJECTORY_TURN_LOSS_TASKS:-}" TASK_ARGS
+append_repeated_args "--contrastive-negative-task" "${CONTRASTIVE_NEGATIVE_TASKS:-}" TASK_ARGS
 
 cd "$REPO"
 mkdir -p "$RUN_DIR"
@@ -58,6 +59,9 @@ mkdir -p "$RUN_DIR"
   echo "MAX_ROWS_PER_TASK=${MAX_ROWS_PER_TASK:-0}"
   echo "LR=${LR:-0.02}"
   echo "BETA_BASE=${BETA_BASE:-0.05}"
+  echo "PROMPT_DRIFT_TOKENS=${PROMPT_DRIFT_TOKENS:-256}"
+  echo "PROMPT_RESIDUAL_WEIGHT=${PROMPT_RESIDUAL_WEIGHT:-0.0}"
+  echo "PROMPT_RESIDUAL_TOKENS=${PROMPT_RESIDUAL_TOKENS:-256}"
   echo "GAMMA_GATE=${GAMMA_GATE:-0.005}"
   echo "COEFFICIENT_FLOOR=${COEFFICIENT_FLOOR:-0.95}"
   echo "COEFFICIENT_FLOOR_WEIGHT=${COEFFICIENT_FLOOR_WEIGHT:-0.1}"
@@ -71,6 +75,10 @@ mkdir -p "$RUN_DIR"
   echo "TASK_RESPONSE_SPAN_MODE=${TASK_RESPONSE_SPAN_MODE:-}"
   echo "TASK_LOSS_MULTIPLIER=${TASK_LOSS_MULTIPLIER:-}"
   echo "TRAJECTORY_TURN_LOSS_TASKS=${TRAJECTORY_TURN_LOSS_TASKS:-}"
+  echo "CONTRASTIVE_NEGATIVE_LOSS_WEIGHT=${CONTRASTIVE_NEGATIVE_LOSS_WEIGHT:-0.0}"
+  echo "CONTRASTIVE_NEGATIVE_MARGIN=${CONTRASTIVE_NEGATIVE_MARGIN:-0.05}"
+  echo "CONTRASTIVE_NEGATIVE_RESPONSE_KEY=${CONTRASTIVE_NEGATIVE_RESPONSE_KEY:-negative_response}"
+  echo "CONTRASTIVE_NEGATIVE_TASKS=${CONTRASTIVE_NEGATIVE_TASKS:-}"
   echo "GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-0}"
 } > "$RUN_DIR/run.env"
 
@@ -100,6 +108,8 @@ fi
   --max-response-tokens "${MAX_RESPONSE_TOKENS:-512}" \
   --topk-tokens "${TOPK_TOKENS:-128}" \
   --prompt-drift-tokens "${PROMPT_DRIFT_TOKENS:-256}" \
+  --prompt-residual-weight "${PROMPT_RESIDUAL_WEIGHT:-0.0}" \
+  --prompt-residual-tokens "${PROMPT_RESIDUAL_TOKENS:-256}" \
   --residual-weight-power "${RESIDUAL_WEIGHT_POWER:-0.5}" \
   --residual-objective "${RESIDUAL_OBJECTIVE:-directional}" \
   --directional-projection-floor "${DIRECTIONAL_PROJECTION_FLOOR:-0.8}" \
@@ -110,6 +120,9 @@ fi
   --task-expert-coefficient-floor-weight "${TASK_EXPERT_COEFFICIENT_FLOOR_WEIGHT:-0.0}" \
   --response-span-mode "${RESPONSE_SPAN_MODE:-auto}" \
   --task-balanced-loss \
+  --contrastive-negative-loss-weight "${CONTRASTIVE_NEGATIVE_LOSS_WEIGHT:-0.0}" \
+  --contrastive-negative-margin "${CONTRASTIVE_NEGATIVE_MARGIN:-0.05}" \
+  --contrastive-negative-response-key "${CONTRASTIVE_NEGATIVE_RESPONSE_KEY:-negative_response}" \
   --beta-base "${BETA_BASE:-0.05}" \
   --gamma-gate "${GAMMA_GATE:-0.005}" \
   --device "${DEVICE:-cuda}" \
