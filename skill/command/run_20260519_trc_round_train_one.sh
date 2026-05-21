@@ -42,6 +42,8 @@ append_repeated_args "--task-directional-projection-floor" "${TASK_DIRECTIONAL_P
 append_repeated_args "--task-directional-projection-weight" "${TASK_DIRECTIONAL_PROJECTION_WEIGHT:-}" TASK_ARGS
 append_repeated_args "--task-response-span-mode" "${TASK_RESPONSE_SPAN_MODE:-}" TASK_ARGS
 append_repeated_args "--task-loss-multiplier" "${TASK_LOSS_MULTIPLIER:-}" TASK_ARGS
+append_repeated_args "--task-residual-target-coefficients" "${TASK_RESIDUAL_TARGET_COEFFICIENTS:-}" TASK_ARGS
+append_repeated_args "--task-response-nll-weight" "${TASK_RESPONSE_NLL_WEIGHT:-}" TASK_ARGS
 append_repeated_args "--trajectory-turn-loss-task" "${TRAJECTORY_TURN_LOSS_TASKS:-}" TASK_ARGS
 append_repeated_args "--contrastive-negative-task" "${CONTRASTIVE_NEGATIVE_TASKS:-}" TASK_ARGS
 
@@ -56,12 +58,17 @@ mkdir -p "$RUN_DIR"
   echo "CONFIG=$CONFIG"
   echo "MODE=$MODE"
   echo "EPOCHS=${EPOCHS:-12}"
+  echo "TRAIN_TASKS=${TRAIN_TASKS:-}"
+  echo "TRAINABLE_EXPERTS=${TRAINABLE_EXPERTS:-}"
   echo "MAX_ROWS_PER_TASK=${MAX_ROWS_PER_TASK:-0}"
   echo "LR=${LR:-0.02}"
   echo "BETA_BASE=${BETA_BASE:-0.05}"
   echo "PROMPT_DRIFT_TOKENS=${PROMPT_DRIFT_TOKENS:-256}"
+  echo "RESPONSE_RESIDUAL_WEIGHT=${RESPONSE_RESIDUAL_WEIGHT:-1.0}"
   echo "PROMPT_RESIDUAL_WEIGHT=${PROMPT_RESIDUAL_WEIGHT:-0.0}"
   echo "PROMPT_RESIDUAL_TOKENS=${PROMPT_RESIDUAL_TOKENS:-256}"
+  echo "RESPONSE_NLL_WEIGHT=${RESPONSE_NLL_WEIGHT:-0.0}"
+  echo "TASK_RESPONSE_NLL_WEIGHT=${TASK_RESPONSE_NLL_WEIGHT:-}"
   echo "GAMMA_GATE=${GAMMA_GATE:-0.005}"
   echo "COEFFICIENT_FLOOR=${COEFFICIENT_FLOOR:-0.95}"
   echo "COEFFICIENT_FLOOR_WEIGHT=${COEFFICIENT_FLOOR_WEIGHT:-0.1}"
@@ -74,17 +81,26 @@ mkdir -p "$RUN_DIR"
   echo "TASK_DIRECTIONAL_PROJECTION_WEIGHT=${TASK_DIRECTIONAL_PROJECTION_WEIGHT:-}"
   echo "TASK_RESPONSE_SPAN_MODE=${TASK_RESPONSE_SPAN_MODE:-}"
   echo "TASK_LOSS_MULTIPLIER=${TASK_LOSS_MULTIPLIER:-}"
+  echo "RESIDUAL_TARGET_SOURCE=${RESIDUAL_TARGET_SOURCE:-row-expert}"
+  echo "RESIDUAL_TARGET_COEFFICIENTS=${RESIDUAL_TARGET_COEFFICIENTS:-}"
+  echo "TASK_RESIDUAL_TARGET_COEFFICIENTS=${TASK_RESIDUAL_TARGET_COEFFICIENTS:-}"
+  echo "RESIDUAL_TARGET_GATE_CHECKPOINT=${RESIDUAL_TARGET_GATE_CHECKPOINT:-}"
   echo "TRAJECTORY_TURN_LOSS_TASKS=${TRAJECTORY_TURN_LOSS_TASKS:-}"
   echo "CONTRASTIVE_NEGATIVE_LOSS_WEIGHT=${CONTRASTIVE_NEGATIVE_LOSS_WEIGHT:-0.0}"
   echo "CONTRASTIVE_NEGATIVE_MARGIN=${CONTRASTIVE_NEGATIVE_MARGIN:-0.05}"
   echo "CONTRASTIVE_NEGATIVE_RESPONSE_KEY=${CONTRASTIVE_NEGATIVE_RESPONSE_KEY:-negative_response}"
   echo "CONTRASTIVE_NEGATIVE_TASKS=${CONTRASTIVE_NEGATIVE_TASKS:-}"
   echo "GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-0}"
+  echo "PROGRESS_EVERY_ROWS=${PROGRESS_EVERY_ROWS:-0}"
+  echo "LOG_GATE_GRADIENTS=${LOG_GATE_GRADIENTS:-0}"
 } > "$RUN_DIR/run.env"
 
 EXTRA_ARGS=()
 if [[ "${GRADIENT_CHECKPOINTING:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--gradient-checkpointing)
+fi
+if [[ "${LOG_GATE_GRADIENTS:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--log-gate-gradients)
 fi
 
 "$PY" scripts/trc/train_trc_layer_gates.py \
@@ -95,6 +111,8 @@ fi
   --gate-parameterization layer-band-coefficient \
   --init-value "${INIT_VALUE:-1.0}" \
   --epochs "${EPOCHS:-12}" \
+  --train-tasks "${TRAIN_TASKS:-}" \
+  --trainable-experts "${TRAINABLE_EXPERTS:-}" \
   --max-rows-per-task "${MAX_ROWS_PER_TASK:-0}" \
   --shuffle \
   --seed "${SEED:-20260519}" \
@@ -103,15 +121,21 @@ fi
   --weight-decay "${WEIGHT_DECAY:-0.0}" \
   --grad-clip-norm "${GRAD_CLIP_NORM:-1.0}" \
   --accumulation-steps "${ACCUMULATION_STEPS:-96}" \
+  --progress-every-rows "${PROGRESS_EVERY_ROWS:-0}" \
   --hidden-layers "${HIDDEN_LAYERS:-8,16,24,28}" \
   --max-seq-length "${MAX_SEQ_LENGTH:-1536}" \
   --max-response-tokens "${MAX_RESPONSE_TOKENS:-512}" \
   --topk-tokens "${TOPK_TOKENS:-128}" \
   --prompt-drift-tokens "${PROMPT_DRIFT_TOKENS:-256}" \
+  --response-residual-weight "${RESPONSE_RESIDUAL_WEIGHT:-1.0}" \
   --prompt-residual-weight "${PROMPT_RESIDUAL_WEIGHT:-0.0}" \
   --prompt-residual-tokens "${PROMPT_RESIDUAL_TOKENS:-256}" \
+  --response-nll-weight "${RESPONSE_NLL_WEIGHT:-0.0}" \
   --residual-weight-power "${RESIDUAL_WEIGHT_POWER:-0.5}" \
   --residual-objective "${RESIDUAL_OBJECTIVE:-directional}" \
+  --residual-target-source "${RESIDUAL_TARGET_SOURCE:-row-expert}" \
+  --residual-target-coefficients "${RESIDUAL_TARGET_COEFFICIENTS:-}" \
+  --residual-target-gate-checkpoint "${RESIDUAL_TARGET_GATE_CHECKPOINT:-}" \
   --directional-projection-floor "${DIRECTIONAL_PROJECTION_FLOOR:-0.8}" \
   --directional-projection-weight "${DIRECTIONAL_PROJECTION_WEIGHT:-0.1}" \
   --coefficient-floor "${COEFFICIENT_FLOOR:-0.95}" \

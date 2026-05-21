@@ -1537,3 +1537,322 @@ PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
 
 bash -n skill/command/run_20260519_trc_round_train_one.sh
 ```
+
+## 2026-05-20: Optional TRC Response NLL Auxiliary Loss
+
+Purpose:
+
+- Address the observed Code gap where hidden-residual steering raises BoN but not single-sample Code accuracy.
+- Keep TRC default behavior unchanged while allowing an explicit teacher-forcing term on successful expert trajectories.
+
+Changes:
+
+- Updated `scripts/trc/train_trc_layer_gates.py`.
+- Added CLI flags:
+  - `--response-nll-weight`, default `0.0`;
+  - `--task-response-nll-weight`, repeated task override such as `code=0.2`.
+- When enabled, the trainer computes language-model NLL only on the selected response span tokens. Prompt tokens and non-selected response tokens are masked with `-100`.
+- The NLL is logged as `response_nll_loss` at row, task, and epoch levels.
+- Updated `skill/command/run_20260519_trc_round_train_one.sh` to record and pass:
+  - `RESPONSE_NLL_WEIGHT`;
+  - `TASK_RESPONSE_NLL_WEIGHT`.
+
+Default impact:
+
+- With `RESPONSE_NLL_WEIGHT=0.0`, no extra forward pass is made and the previous hidden-residual loss path is unchanged.
+- Reward, calibration data, contrastive residual loss, task filters, trainable expert masking, and selection/bake behavior are unchanged.
+
+Validation:
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  -m py_compile scripts/trc/train_trc_layer_gates.py
+
+bash -n skill/command/run_20260519_trc_round_train_one.sh
+```
+
+## 2026-05-20: Optional TRC Code-Only / Expert-Slice Gate Training
+
+Purpose:
+
+- Isolate whether Code hidden-residual steering can improve formal Code evaluation without Memory/Tool loss or floor gradients disturbing the gate update.
+- Keep default TRC training unchanged; the new behavior only activates when explicit allowlists are passed.
+
+Changes:
+
+- Updated `scripts/trc/train_trc_layer_gates.py`.
+- Added CLI flags:
+  - `--train-tasks`, default empty: optional comma/space separated task allowlist for rows used in training.
+  - `--trainable-experts`, default empty: optional comma/space separated expert allowlist whose gate gradients are kept.
+- When `--trainable-experts code` is set, the trainer masks `raw_coefficients.grad` before clipping and `optimizer.step()`, so non-Code expert gate slices stay fixed.
+- Updated `skill/command/run_20260519_trc_round_train_one.sh` to record and pass:
+  - `TRAIN_TASKS`;
+  - `TRAINABLE_EXPERTS`.
+
+Default impact:
+
+- Empty `TRAIN_TASKS` keeps all calibration rows.
+- Empty `TRAINABLE_EXPERTS` keeps the old full gate gradient path.
+- Reward, calibration rows, hidden-residual loss, contrastive loss, task-balanced loss, and selection/bake logic are unchanged unless these env vars are set.
+
+Validation:
+
+```bash
+PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  -m py_compile scripts/trc/train_trc_layer_gates.py
+
+bash -n skill/command/run_20260519_trc_round_train_one.sh
+```
+
+## 2026-05-21: Attention / MLP Diagnostic Probes
+
+Purpose:
+
+- Diagnose task-specific information flow and OP-VEC residual expression before changing the merge/training method.
+- Separate three signals that should not be conflated:
+  - attention matrix routing;
+  - linear / MLP residual exposure;
+  - signed first-order utility from teacher-forced gradients.
+
+Changes:
+
+- Added `scripts/attention_pauh/probe_attention_matrix_patterns.py`.
+  - Runs base-model forward with `output_attentions=True`.
+  - Reports prompt, prompt-tail, response-local, long-response, marker, sink, entropy, and head-specialization metrics.
+- Added `scripts/attention_pauh/probe_linear_module_exposure_patterns.py`.
+  - Hooks OP-VEC target linear modules from the mode manifest.
+  - Computes prompt/response activation diagonals and scores expert deltas with `E||Delta W x||^2`.
+  - Supports attention, MLP, or all-linear scopes and raw or delta-norm normalization.
+- Added `scripts/attention_pauh/probe_signed_utility.py`.
+  - Uses teacher-forced backward passes to estimate `-grad(loss) · Delta`.
+  - Reports owner utility, protected-task harm, and induced residual conflict cosines.
+- Added `linear_delta_probe()` to `scripts/attention_pauh/core.py`.
+- Added unit coverage in `tests/test_attention_pauh.py`.
+
+Default impact:
+
+- No training, reward, rollout, gate update, or evaluation logic is changed.
+- These scripts are standalone diagnostics and only write to explicit output directories.
+
+Validation:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  -m unittest discover -s tests -p 'test_attention_pauh.py' -v
+```
+
+## 2026-05-21: Signature-Preserving Residual Editing Gate Builder
+
+Purpose:
+
+- Build simple structure-aware OP-VEC gate checkpoints from attention / MLP diagnostics.
+- Provide a clean baseline for testing whether preserving MLP residuals and only mildly shrinking risky attention families can maintain task abilities without reward sweeps.
+
+Changes:
+
+- Added `scripts/attention_pauh/build_signature_preserving_gates.py`.
+  - Starts from `init=1` full expert prior.
+  - Keeps MLP residuals at coefficient 1 by default.
+  - Supports three explicit methods:
+    - `exposure-shrink`: shrink only families with owner/protected exposure evidence.
+    - `static-code-attn-shrink`: shrink Code attention q/k/v/o by fixed scales.
+    - `mlp-preserve-attn-calm`: keep all MLP at 1 while calming all attention modules.
+  - Writes `spre_gates.json`, `spre_config.json`, and `spre_summary.md` under the requested output directory.
+- Extended `tests/test_attention_pauh.py` to cover SPRE helper behavior and coefficient summaries.
+- Added structural validation report: `docs/report/20260521_spre_structure_validation.md`.
+
+Default impact:
+
+- No training, reward, rollout, update, evaluation, or existing gate behavior is changed.
+- The builder only runs when explicitly invoked and writes to the provided output directory.
+
+## 2026-05-21: Task-Signature Spans for Signed Utility Probe
+
+Purpose:
+
+- Make signed utility diagnostics inspect task-relevant behavior spans instead of only coarse prompt / response / all spans.
+- Separate Tool tool-call behavior and Code final code behavior when estimating `-grad(loss) · delta`.
+
+Changes:
+
+- Updated `scripts/attention_pauh/probe_signed_utility.py`.
+- Added `--span` choices:
+  - `tool-call`: spans matching `<tool_call>...</tool_call>`.
+  - `code-block`: markdown fenced code blocks.
+  - `reasoning`: `<think>...</think>` when present, otherwise text before code/tool-call span.
+  - `signature`: maps `tool -> tool-call`, `code -> code-block`, `memory -> response`.
+- Response-specific spans use causal-LM alignment: selected response token `k` probes the output position that predicts it, i.e. `prompt_len + k - 1`.
+- Added unit coverage for tool-call / code-block interval extraction and causal-shifted signature masks.
+
+Default impact:
+
+- Existing `response`, `prompt`, and `all` behavior is preserved.
+- No training, reward, rollout, update, evaluation, or gate building logic is changed.
+
+## 2026-05-21: Gate Structure Summary Utility
+
+Purpose:
+
+- Connect gate coefficients to downstream metrics by summarizing checkpoints at expert, layer, attention, and MLP granularity.
+- Support both full OP-VEC gate files and TRC layer-band gate files in one diagnostic format.
+
+Changes:
+
+- Added `scripts/attention_pauh/summarize_gate_structure.py`.
+  - Loads one or more gate JSON files.
+  - Expands full keys like `model.layers.N.xxx.weight::expert`.
+  - Expands TRC keys like `layerN.expert` through the mode manifest so layer-band gates can be summarized as attention / MLP groups.
+  - Writes JSON and Markdown summaries when requested.
+- Added unit coverage for layer-gate expansion and group summaries.
+- Added structure-performance matrix report:
+  - `docs/report/20260521_gate_structure_performance_matrix.md`.
+
+Default impact:
+
+- Pure read-only diagnostic utility.
+- No training, reward, rollout, update, evaluation, or gate building behavior is changed.
+
+## 2026-05-21: PAUH Shuffle Mechanism Check Materialization
+
+Purpose:
+
+- Add a deterministic PAUH layer-shuffle mechanism check for testing whether PAUH layer ordering matters beyond expert-average scale.
+
+Artifacts:
+
+- Materialized with existing `scripts/attention_pauh/materialize_pauh_variant.py`.
+- Gate: `/tmp/shared-storage/ExpertGym/pauh/pauh_alpha1_shuffle_20260521/pauh_gates.json`.
+- Baked checkpoint: `/tmp/shared-storage/ExpertGym/pauh/pauh_alpha1_shuffle_20260521/baked_policy`.
+- Quick Tool/Memory eval: `/tmp/shared-storage/ExpertGym/pauh/eval/pauh_alpha1_shuffle_20260521/quick_tool_memory`.
+- Reports updated:
+  - `docs/report/20260521_prompt_attention_utility_harm.md`.
+  - `docs/report/20260521_gate_structure_performance_matrix.md`.
+
+Default impact:
+
+- No code path was changed for this artifact; it uses the existing PAUH variant script.
+
+## 2026-05-21: Memory-Only Attention Calm SPRE Ablation
+
+Purpose:
+
+- Isolate whether Memory performance depends on its own attention residuals after MLP residuals are preserved.
+- Separate Memory attention causality from the broader `mlp-preserve-attn-calm` variant, which also calmed Tool and Code attention.
+
+Changes:
+
+- Updated `scripts/attention_pauh/build_signature_preserving_gates.py`.
+- Added SPRE method `memory-attn-calm`:
+  - starts from `init=1`;
+  - scales only Memory attention families `q/k/v/o` by `--attention-calm-scale`;
+  - keeps Memory MLP at `1.0`;
+  - keeps Tool and Code at `1.0`.
+- Added unit coverage in `tests/test_attention_pauh.py`.
+
+Artifacts:
+
+- Gate: `/tmp/shared-storage/ExpertGym/spre/spre_memory_attn_calm_20260521/spre_gates.json`.
+- Baked checkpoint: `/tmp/shared-storage/OnPolicy/checkpoints/spre_memory_attn_calm_20260521`.
+- Quick Tool/Memory eval: `/tmp/shared-storage/ExpertGym/spre/eval/spre_memory_attn_calm_20260521/quick_tool_memory`.
+- Gate structure summary:
+  - `/tmp/shared-storage/ExpertGym/attention_matrix/gate_structure_representatives_20260521/spre_memory_attn_calm_gate_summary.json`.
+  - `/tmp/shared-storage/ExpertGym/attention_matrix/gate_structure_representatives_20260521/spre_memory_attn_calm_gate_summary.md`.
+- Reports updated:
+  - `docs/report/20260521_spre_structure_validation.md`.
+  - `docs/report/20260521_gate_structure_performance_matrix.md`.
+
+Observed diagnostic result:
+
+- BFCL quick mean stays close to SPRE-v2: `0.7788` vs `0.7825`.
+- HotpotQA quick mean F1 drops: `0.7479` vs SPRE-v2 `0.7761`.
+- This supports the structural claim that Memory relies on attention routing in addition to MLP residual magnitude.
+
+Default impact:
+
+- The new behavior is only used when explicitly passing `--method memory-attn-calm`.
+- No training, reward, rollout, update, evaluation, or existing gate building default behavior is changed.
+
+## 2026-05-21: Structured Capability Gates v1
+
+Purpose:
+
+- Turn the attention/MLP/signed-utility findings into a small first-principles gate family for second-stage capability search.
+- Preserve known-useful Tool and Memory channels while testing whether Code can be expressed through middle-layer positive residual families.
+
+Changes:
+
+- Added `scripts/attention_pauh/build_structured_capability_gates.py`.
+  - Generates a tiny mechanism-constrained candidate family.
+  - Keeps `memory:* = 1.0` and `tool:* = 1.0`.
+  - Splits Code into:
+    - middle positive families: `mlp_gate`, `mlp_up`, `attn_o`, `attn_v` on layers `8-20`;
+    - middle weak families: `mlp_down`, `attn_q`, `attn_k`;
+    - conflict layers: default `24,27`;
+    - background Code residual.
+  - Writes one `gates.json` and `summary.md` per candidate plus a family `candidate_manifest.json`.
+- Added `skill/command/run_20260521_structured_capability_gates_v1.sh`.
+  - `PHASE=generate`: build gates.
+  - `PHASE=bake`: bake all candidates.
+  - `PHASE=quick_eval`: run Tool+Memory quick evaluation.
+  - `PHASE=all`: run the full sequence.
+  - `CANDIDATES=name1,name2`: restrict bake/eval to selected candidates. This is useful because BFCL harness setup mutates shared config files and should not be run concurrently across candidates.
+- Added unit coverage in `tests/test_attention_pauh.py`.
+- Added config/method document:
+  - `docs/config/20260521_structured_capability_gates_v1.md`.
+
+Artifacts:
+
+- Candidate manifest: `/tmp/shared-storage/ExpertGym/structured_capability_gates/scg_v1_20260521/candidate_manifest.json`.
+- Candidates:
+  - `balanced`;
+  - `code_mid_push`;
+  - `code_safe`.
+- Quick evaluation summary is recorded in `docs/config/20260521_structured_capability_gates_v1.md`.
+  - Best current Tool/Memory tradeoff: `code_safe`.
+  - Tool quick mean: `0.7813`.
+  - Memory F1: `0.7714` on `eval_50`, `0.7427` on `eval_100`.
+
+Default impact:
+
+- Standalone generation/evaluation path only.
+- No training, reward, rollout, update, existing SPRE, PAUH, TRC, or evaluation default behavior is changed.
+
+## 2026-05-21: Response-Conditioned Residual Filtering v1
+
+Purpose:
+
+- Test a minimal mechanism hypothesis: the useful merge unit is module-level `DeltaW h` on task response spans, not an expert-level coefficient.
+- Produce a training-free gate from signed utility, cross-task agreement, conflict, and low-energy/noise diagnostics.
+
+Changes:
+
+- Added `scripts/attention_pauh/build_response_conditioned_residual_filtering_gates.py`.
+  - Builds `rcrf` and `energy_only` candidates from an existing signed-utility summary.
+  - `rcrf` keeps stable owner residuals, mildly amplifies agreement, and suppresses conflict/noise.
+  - `energy_only` is the single ablation that only uses response-conditioned expression energy.
+- Added `skill/command/run_20260521_rcrf_v1.sh`.
+  - `PHASE=generate`: build gates.
+  - `PHASE=bake`: bake selected candidates.
+  - `PHASE=quick_eval`: run Tool+Memory quick evaluation.
+  - `CANDIDATES=name1,name2`: restrict bake/eval to selected candidates.
+- Added unit coverage in `tests/test_attention_pauh.py`.
+- Added config/result document:
+  - `docs/config/20260521_rcrf_v1.md`.
+
+Artifacts:
+
+- Candidate manifest: `/tmp/shared-storage/ExpertGym/rcrf/rcrf_v1_20260521/candidate_manifest.json`.
+- Baked checkpoints:
+  - `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_v1_20260521/rcrf`;
+  - `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_v1_20260521/energy_only`.
+
+Observed quick result:
+
+- `rcrf`: BFCL quick mean `0.7956`, HotpotQA F1 `0.7708 / 0.7567`.
+- `energy_only`: BFCL quick mean `0.7800`, HotpotQA F1 `0.7720 / 0.7296`.
+- The Tool gap between `rcrf` and `energy_only` supports the role of signed utility / conflict beyond raw `DeltaW h` energy.
+
+Default impact:
+
+- Standalone generation/evaluation path only.
+- No training, reward, rollout, update, existing SPRE, PAUH, TRC, or evaluation default behavior is changed.

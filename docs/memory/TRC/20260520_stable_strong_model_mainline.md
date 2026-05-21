@@ -19,8 +19,8 @@ Promotion rule remains evaluation-first:
 | family | status | lesson |
 |---|---|---|
 | R5A / R11B | historically strongest balanced TRC candidates | Tool and Memory can be kept stable; Code has high BoN but modest single-sample Acc. |
-| R16B | passed quick gate; Code running | Non-leak CodeP0 pass/fail contrast with weight 3.0 can keep Tool/Memory above threshold. Code result decides whether this is a useful mainline. |
-| R16C | quick gate passed; Code running | ReasonFlux-only Code rows do not break Tool/Memory, but Tool non-live still lags stronger historical runs. Code eval tests whether RF-only trajectories improve Acc. |
+| R16B | Code done; hold | Non-leak CodeP0 pass/fail contrast with weight 3.0 keeps Tool/Memory above threshold and reaches mean Acc `0.3289`, but mean BoN is only `0.3998`; keep as diagnostic rather than primary Code mainline. |
+| R16C | Code done; reject | ReasonFlux-only Code rows do not break Tool/Memory, but Code mean is only `0.3115/0.3890`; keep as RF-only ablation, not a primary candidate. |
 | R17A | Tool/Memory passed | No prompt-base drift gives faster hidden-loss descent and Tool mean `0.7969`; despite low memory-gate telemetry, official Memory F1 is `0.7645`, so it is a valid Code candidate. |
 | R17B | Tool/Memory passed | Prompt expert-residual loss is the cleaner hypothesis test for prompt understanding. Tool passes (`0.7969`) and official Memory passes (`0.7643`), but `qa_65536=0.7391` remains weak. |
 
@@ -61,10 +61,10 @@ Memory is fragile under prompt-span changes. Removing prompt-base drift may remo
 
 ## Next Decisions
 
-1. Finish R16B Code eval. If Code improves over R5A/R11B while Tool/Memory pass, R16B becomes a mainline candidate.
-2. Finish R16C Memory. If it passes, run Code only if GPU budget is acceptable; RF-only Code rows test expert-vector purity.
-3. Run R16D quick gate after a Tool slot opens. It tests whether Code response span is better than code-block span.
-4. Finish R17A/R17B, then quick gate. If R17A fails Memory and R17B passes, the prompt story becomes: "do not pull prompt to base; use task-vector prompt residual carefully." If both fail Memory, keep prompt alignment out of the main method.
+1. Keep R16B as a diagnostic checkpoint, not a primary mainline promote: Acc is marginally acceptable, but BoN is too low.
+2. Reject R16C as a primary candidate; retain it only as the RF-only purity ablation.
+3. Promote R16D, R17A, and R17B to Code-candidate status from Tool/Memory gates; do not infer Code quality until formal Code eval is run.
+4. Use R17A/R17B Code outcomes to decide whether prompt-span changes belong in the paper method; current Tool/Memory gates say they are viable to test, not proven improvements.
 5. Add a Tool non-live repair branch only after current Code/prompt tests are recorded, so the paper story remains disentangled.
 
 ## Next Repair Branches
@@ -105,11 +105,35 @@ R17A/R17B are ablations, not mainline by default. If either fails Memory, prompt
 
 ## Live Update 2026-05-20 15:48 CST
 
-- R16B Code formal eval is near completion. LiveBench is `Acc=0.3770, BoN=0.4375`; final decision waits for LiveCodeBench and mean Acc.
-- R16C Tool/Memory passed (`0.7931` / `0.7632`), and Code formal eval has been launched. It can test whether RF-only Code trajectories are cleaner than mixed RF/DeepSeek trajectories.
-- R16D quick gate has started. This is the clean span-control against R16A/B.
-- R17A Tool/Memory passed (`0.7969` / `0.7645`) despite Memory telemetry decline; this supports treating prompt-base drift removal as a real candidate, pending Code.
-- R17B completed and baked; final Memory telemetry remains low. This suggests prompt residual is not obviously a free improvement; evaluate before making it part of the paper method.
+- R16B Code formal eval completed. LiveBench is `Acc=0.3770, BoN=0.4375`; LiveCodeBench is `Acc=0.2808, BoN=0.3620`; mean is `Acc=0.3289, BoN=0.3998`. This is not a clean mainline promote because BoN falls well below the stronger high-BoN anchors.
+- R16C Tool/Memory passed (`0.7931` / `0.7632`), but Code formal eval is weak: LiveBench `0.3477/0.4219`, LiveCodeBench `0.2754/0.3562`, mean `0.3115/0.3890`. RF-only rows do not solve the BoN-to-Acc gap in this setup.
 - R16D Tool/Memory passed (`0.7944` / `0.7604`), barely above the Memory threshold. It is a valid Code candidate and directly tests whether Code response-span topK256 improves formal Code over code-block384.
+- R17A Tool/Memory passed (`0.7969` / `0.7645`) despite Memory telemetry decline; this supports treating prompt-base drift removal as a real candidate, pending Code.
+- R17B Tool/Memory passed (`0.7969` / `0.7643`) despite low Memory telemetry. This makes it a valid Code candidate, but not yet evidence that prompt residual improves the paper method.
 - R17B Tool/Memory passed (`0.7969` / `0.7643`). Because both R17A and R17B passed despite similar low Memory telemetry, prompt-span experiments should be judged by Code outcome and long-context Memory stability, not by gate telemetry alone.
 - R17B Tool matches R17A, so prompt-span experiments are specifically about long-context Memory preservation and Code transfer, not Tool robustness.
+
+## Live Update 2026-05-20 16:56 CST
+
+Added a read-only residual coefficient diagnostic:
+
+```text
+scripts/trc/diagnose_residual_coefficients.py
+```
+
+It fits a chosen target hidden residual with expert basis residuals:
+
+```text
+r_target ~= alpha_tool v_tool + alpha_memory v_memory + alpha_code v_code
+```
+
+This directly addresses the current one-way TRC problem. If target is row Code expert, the sanity check returns `alpha_code ~= 1.0`, confirming the diagnostic path. If target is a `0.75/0.75/0.75` mixture witness on the first 8 Round16 Code rows, it returns:
+
+```text
+alpha_tool mean   ~= 0.4586
+alpha_memory mean ~= 0.5712
+alpha_code mean   ~= 0.0446
+alpha_code median ~= 0.0244
+```
+
+This is evidence that Code can be pushed down if the target is a successful merged/witness residual instead of the full Code expert residual. Current TRC builders only guarantee expert success, not `base/current fail + expert success`; this must become the next calibration bank rule.

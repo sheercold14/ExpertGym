@@ -11,8 +11,8 @@ Gate coefficients are telemetry only. Promotion uses official evaluation:
 
 | ID | run id | prompt base drift | prompt expert residual | checkpoint | status |
 |---|---|---:|---:|---|---|
-| R17A | `trc_r17a_no_prompt_drift_contrast22_w15_e12_20260520` | 0.0 | 0.0 | `/tmp/shared-storage/OnPolicy/checkpoints/trc_r17a_no_prompt_drift_contrast22_w15_e12_20260520-selected` | baked; quick eval running |
-| R17B | `trc_r17b_prompt_residual_contrast22_w15_e12_20260520` | 0.0 | 0.15 | `/tmp/shared-storage/OnPolicy/checkpoints/trc_r17b_prompt_residual_contrast22_w15_e12_20260520-selected` | baked; quick eval pending |
+| R17A | `trc_r17a_no_prompt_drift_contrast22_w15_e12_20260520` | 0.0 | 0.0 | `/tmp/shared-storage/OnPolicy/checkpoints/trc_r17a_no_prompt_drift_contrast22_w15_e12_20260520-selected` | Tool/Memory passed; Code candidate |
+| R17B | `trc_r17b_prompt_residual_contrast22_w15_e12_20260520` | 0.0 | 0.15 | `/tmp/shared-storage/OnPolicy/checkpoints/trc_r17b_prompt_residual_contrast22_w15_e12_20260520-selected` | Tool/Memory passed; Code candidate |
 
 ## Quick Gate
 
@@ -25,8 +25,8 @@ Gate coefficients are telemetry only. Promotion uses official evaluation:
 
 | ID | LiveBench Acc | LiveBench BoN | LiveCodeBench Acc | LiveCodeBench BoN | mean Acc | mean BoN | status |
 |---|---:|---:|---:|---:|---:|---:|---|
-| R17A | pending | pending | pending | pending | pending | pending | recommended for Code; not launched by this monitor |
-| R17B | pending | pending | pending | pending | pending | pending | recommended for Code; not launched by this monitor |
+| R17A | 0.3516 | 0.4922 | 0.2578 | 0.3640 | 0.3047 | 0.4281 | done; high BoN diagnostic |
+| R17B | 0.3613 | 0.4297 | 0.2696 | 0.3738 | 0.3154 | 0.4017 | done; best Round17 Acc, not primary |
 
 ## Notes
 
@@ -40,3 +40,14 @@ Gate coefficients are telemetry only. Promotion uses official evaluation:
 - R17B completed at epoch 12 and was baked. Selected telemetry is `code=1.2429, memory=0.7573, tool=1.2319`; this is almost the same Memory-risk pattern as R17A, so quick eval is required before any Code run.
 - R17B Tool quick passes with mean `0.7969` (`0.8125/0.6250/0.8950/0.8550`), essentially matching R17A. Memory mean F1 is `0.7643`
   (`0.7477/0.7770/0.7933/0.7391`), so prompt residual is a Code candidate; note that long-context `qa_65536` is weak.
+- R17A/R17B Code full CURE evals launched at 2026-05-20 23:00 CST:
+  - `r17a_code_20260520` on GPU group `[[0,1]]`, checkpoint `/tmp/shared-storage/OnPolicy/checkpoints/trc_r17a_no_prompt_drift_contrast22_w15_e12_20260520-selected`.
+  - `r17b_code_20260520` on GPU group `[[2,3]]`, checkpoint `/tmp/shared-storage/OnPolicy/checkpoints/trc_r17b_prompt_residual_contrast22_w15_e12_20260520-selected`.
+- LiveBench partial results:
+  - R17A: `Acc=0.3516`, `BoN=0.4922`.
+  - R17B: `Acc=0.3613`, `BoN=0.4297`.
+  R17A has the stronger BoN but lower single-sample Acc; R17B has the better single-sample Acc. Both need LiveCodeBench before final ranking.
+- Full Code completed:
+  - R17A LiveCodeBench: `Acc=0.2578`, `BoN=0.3640`; mean Code `Acc=0.3047`, `BoN=0.4281`.
+  - R17B LiveCodeBench: `Acc=0.2696`, `BoN=0.3738`; mean Code `Acc=0.3154`, `BoN=0.4017`.
+  R17B is the stronger Round17 single-sample Acc candidate, but it does not beat existing non-leak anchors such as R16B on mean Acc or R5A/R11B on BoN. R17A's high LiveBench BoN did not transfer to LiveCodeBench.
