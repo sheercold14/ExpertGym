@@ -60,7 +60,7 @@ signed utility summary:
 | task | 选取的响应 span | 理由 |
 |---|---|---|
 | Tool | `<tool_call>...</tool_call>` | Tool 能力主要体现在函数名、参数、调用格式 |
-| Code | markdown code block | Code 能力主要体现在最终代码实现 |
+| Code | markdown code block | 当前先看最终代码实现；从结果看，这不足以解释 hidden-test 正确性 |
 | Memory | response span | Memory 任务需要完整轨迹和最终答案，当前先用响应整体近似 |
 
 这一步的作用是减少无关 token 的干扰。例如 Tool 任务里普通解释文字不应该主导 tool-call 参数能力；Code 任务里代码块外的文本也不应该主导代码能力。
@@ -211,7 +211,7 @@ theta_merge = theta_base + sum_{e,m} alpha_{e,m} Delta W_{e,m}
 | Tool | BFCL quick 四类：parallel / parallel_multiple / live_parallel / live_parallel_multiple |
 | Memory | HotpotQA eval_50 / eval_100 F1 |
 
-Code 完整评测成本高，所以作为后续确认项。当前报告先不把 Code 结论写死。
+Code 完整评测成本高，所以当前方法先用 Tool / Memory 建立机制证据，再用 Code quick 检查是否能迁移到 hidden-test 程序正确性。
 
 ### 算法伪代码
 
@@ -346,14 +346,29 @@ shared 子集上的结果：
 
 ## 当前还需要验证什么
 
-### P0：确认 Code 是否也受益
+### P0：Code 结果说明当前 span 不够
 
-Tool 和 Memory 已经支持机制假设，但 Code 仍在完整评测中。需要等 LiveCodeBench 结果后判断：
+RCRF Code quick 已完成：
 
-- 如果 Code 也提升，说明该方法可以作为三任务统一方法。
-- 如果 Code 不提升，说明 Code 能力可能不是由当前 residual 表达统计捕获，可能需要更贴近评测的 code span / reasoning span。
+| dataset | code acc | accumulate acc | BoN `(4,4)` acc | BoN `(4,4)` accumulate acc |
+|---|---:|---:|---:|---:|
+| LiveBench | 0.3789 | 0.4819 | 0.4297 | 0.5544 |
+| LiveCodeBench | 0.2862 | 0.4023 | 0.3464 | 0.4962 |
 
-当前已看到的 LiveBench code 部分较强，但不能提前下结论。
+对比 TA init1 历史结果：
+
+| dataset | TA init1 acc | RCRF acc | 判断 |
+|---|---:|---:|---|
+| LiveBench | 0.3809 | 0.3789 | 基本持平 |
+| LiveCodeBench | 0.3038 | 0.2862 | RCRF 更低 |
+
+这说明当前 response/code-block 一阶 utility 没有抓住 Code hidden-test 正确性的关键 residual。Code 的下一步不应该继续调同一个 gate 公式，而应该做 span-aware / pass-fail contrastive probe：
+
+- `prompt_only`：看题意理解 residual 是否关键。
+- `prompt_plus_code`：同时看题目理解和最终代码表达。
+- `pass_minus_fail`：同一 prompt 下，用能过测试的代码减去失败代码的 utility。
+
+只有当这些 attribution 能通过 bake 后提升 Code acc，Code 才能纳入主方法 claim。
 
 ### P0：验证“只看本任务”是不是足够简单的主方法
 
@@ -383,6 +398,31 @@ BFCL live 子集波动大，单次 live 分数不能完全代表 Tool 能力。�
 - BFCL parallel / live：反映泛化和真实工具格式。
 - ToolRL 80：反映源任务工具调用能力是否保留。
 
+当前 ToolRL 80 对照：
+
+| method | success_rate | mean_reward | tool_exact_rate | parseable_rate | zero_call_rate |
+|---|---:|---:|---:|---:|---:|
+| TA init1 | 0.6375 | 0.8363 | 0.5500 | 0.9000 | 0.1000 |
+| 主版本 | 0.6250 | 0.8318 | 0.5250 | 0.9000 | 0.1000 |
+| 只看能量 | 0.6250 | 0.8315 | 0.5250 | 0.9000 | 0.1000 |
+
+这个结果需要谨慎解释：
+
+- RCRF 的 BFCL live 提升并不是因为 ToolRL 源分布能力更强；在 ToolRL 80 上 TA init1 反而略高。
+- RCRF 更像是在保持源分布 tool-call 能力基本不掉的同时，提高 BFCL live / parallel 场景的格式和参数稳定性。
+- 因此 Tool 结论不能只写“Tool 能力更强”，而应该写成“源分布能力基本保留，live/generalization 子集更稳”。
+
+进一步逐样本比较显示差距很集中：
+
+| transition | count |
+|---|---:|
+| both exact | 42 |
+| both non-exact | 36 |
+| TA init1 exact only | 2 |
+| RCRF exact only | 0 |
+
+这意味着 ToolRL 差距不是大面积退化，而是 2 条 exact case 的源分布细节丢失。后续应把这两条作为 source-preserve 因果验证子集：如果恢复被 RCRF 压低的少量 tool residual 能补回这 2 条，且 BFCL live 不掉，则说明需要加入源分布保护项；如果 BFCL live 掉，则说明源分布 exact 和 live 泛化之间存在真实冲突。
+
 ### P2：确认是否需要更强的稀疏化
 
 当前主版本只是温和压制和放大。后面可以验证：
@@ -403,9 +443,46 @@ BFCL live 子集波动大，单次 live 分数不能完全代表 Tool 能力。�
 
 ## 当前风险
 
-- Tool / Memory 快评已经正向，但 Code 完整结果还没回来，不能把三任务结论写死。
+- Tool / Memory 快评已经正向，但 Code 结果没有超过 TA init1，不能把当前 RCRF 写成三任务统一最优。
 - “只看本任务”版本很强，主版本必须证明额外冲突项带来的收益值得保留。
-- 如果 Code 不提升，论文主线应转为“机制性 residual 过滤提升 Tool/Memory，并解释 Code 为什么需要更细的 code-specific span”。
+- Code 主线必须转为“机制性 residual 过滤提升 Tool/Memory；Code 需要 outcome-aware / span-aware attribution”，除非后续 contrastive Code 实验补上提升。
+
+## Code Span-Aware v2 的 Tool / Memory 副作用
+
+`rcrf_code_spanaware_conservative_v2` 用 Code hurt pass/fail contrast 加上 prompt/reasoning span 做保守 residual 重分配。它在 Code hurt subset 上比 final-code-only v1 更强：
+
+| Code hurt subset | RCRF pass_any | v1 pass_any | v2 pass_any |
+|---|---:|---:|---:|
+| LiveBench hurt16 | 0.0000 | 0.2500 | 0.4375 |
+| LiveCodeBench hurt16 | 0.0000 | 0.7500 | 0.8125 |
+
+为了判断它是不是合理的模式组合，而不是局部 Code 修补，补跑 Tool / Memory quick eval：
+
+| metric | RCRF v1 | Code span-aware v2 | delta |
+|---|---:|---:|---:|
+| Tool parallel | 0.8800 | 0.8800 | 0.0000 |
+| Tool parallel_multiple | 0.8650 | 0.8550 | -0.0100 |
+| Tool live_parallel | 0.8125 | 0.8125 | 0.0000 |
+| Tool live_parallel_multiple | 0.6250 | 0.6250 | 0.0000 |
+| Tool mean | 0.7956 | 0.7931 | -0.0025 |
+| Memory eval50 F1 | 0.7708 | 0.7650 | -0.0058 |
+| Memory eval100 F1 | 0.7567 | 0.7478 | -0.0089 |
+
+判断：
+
+- Tool 基本保持，说明 Code pass/fail span-aware routing 没有明显破坏工具调用格式和并行调用行为。
+- Memory 有小幅下降，说明 shared residual 的 Code 修复会触碰 Memory 需要的长轨迹稳定 residual。
+- 这和前面的结构结论一致：Memory 对 MLP 和自身 attention 都敏感，不能只靠 Code outcome contrast 决定 shared residual。
+- 下一版如果要成为三任务主候选，应加入 Memory-preserve 约束：对 Memory 高 utility residual 设 floor，或在同一个 conservative aggregation 中加入 Memory eval/recovery span 的 positive utility。
+
+随后测试了一个最直接的保护对照 `rcrf_code_spanaware_memory_preserve_v3`：所有 memory expert 负向 overlay 归零，memory expert 不参与 recenter。
+
+| Code hurt subset | v2 pass_any | v3 pass_any | v2 test-point | v3 test-point |
+|---|---:|---:|---:|---:|
+| LiveBench hurt16 | 0.4375 | 0.4375 | 0.3398 | 0.4121 |
+| LiveCodeBench hurt16 | 0.8125 | 0.6250 | 0.5189 | 0.3424 |
+
+这个结果说明 expert-level hard floor 不够合理：它帮助 LiveBench near-miss，但破坏 LiveCodeBench final-code 修复。更合理的 Memory-preserve 不能保护所有 Memory expert residual，而应该保护在 Memory behavior span 上有高 utility 的 residual。
 
 ## 结果路径
 
@@ -414,3 +491,9 @@ BFCL live 子集波动大，单次 live 分数不能完全代表 Tool 能力。�
 - 不抑制冲突 checkpoint：`/tmp/shared-storage/OnPolicy/checkpoints/rcrf_v1_20260521/no_conflict`
 - 只看本任务 checkpoint：`/tmp/shared-storage/OnPolicy/checkpoints/rcrf_v1_20260521/owner_only`
 - 快评结果目录：`/tmp/shared-storage/ExpertGym/rcrf/eval/rcrf_v1_20260521`
+- ToolRL 80 对照目录：`/tmp/shared-storage/ExpertGym/rcrf/eval/toolrl_rlla4k_20260521`
+- ToolRL init1 vs RCRF 逐样本对照：`/tmp/shared-storage/ExpertGym/rcrf/eval/toolrl_rlla4k_20260521/ta_init1_vs_rcrf_toolrl80_comparison.md`
+- Code quick summary：`/tmp/shared-storage/OnPolicy/eval/cure_feedback/rcrf-v1-rcrf-code/rcrf-v1-rcrf/rcrf_v1_rcrf_code_quick_20260521/summary.json`
+- Code span-aware v2 checkpoint：`/tmp/shared-storage/OnPolicy/checkpoints/rcrf_code_spanaware_conservative_v2`
+- Code span-aware v2 quick Tool/Memory：`/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/side_effect_eval/rcrf_code_spanaware_conservative_v2/quick_tool_memory`
+- Code span-aware memory-preserve v3 checkpoint：`/tmp/shared-storage/OnPolicy/checkpoints/rcrf_code_spanaware_memory_preserve_v3`

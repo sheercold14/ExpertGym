@@ -1,5 +1,90 @@
 # Code Change Log
 
+## 2026-05-21 CURE Code Hurt Subset
+
+Context:
+
+- Full CURE Code evaluation is too slow for every mechanism iteration.
+- Many Code samples are not diagnostic because all compared models either solve them or fail them.
+- We need a small high-information subset where a reference TA model succeeds but the current RCRF model is hurt.
+
+Changes:
+
+- `scripts/eval/build_cure_hurt_subset.py`
+  - Added an offline CURE output comparer that reads per-sample `test_bool_table`.
+  - Computes `pass_any`, `pass_count`, and hidden-test `test_point_rate` per model.
+  - Selects samples where at least one reference model passes and the target model fails or drops by `--min-point-delta`.
+  - Excludes all-pass and all-fail samples.
+  - Writes subset JSON, selected case metadata, manifest, and a Markdown review table.
+  - Optionally installs the subset under `CURE/data` so `eval.py --dataset <subset>` can run directly.
+
+- `docs/report/RCRF/20260521_code_hurt_subset.md`
+  - Documented the RCRF-vs-TA Code hurt subsets and exact reproduction commands.
+  - Installed diagnostic datasets:
+    - `LiveBenchCodeHurtRcrfVsTa16`
+    - `LiveCodeBenchCodeHurtRcrfVsTa16`
+
+- `scripts/eval/run_cure_code_hurt_eval.sh`
+  - Added a fixed quick-eval wrapper for the two Code hurt subsets.
+  - Keeps the official CURE `eval.py` path unchanged while making per-candidate regression runs reproducible with `MODEL=/path/to/model`.
+  - Passes `GPU` as the physical CURE `--gpu_groups` id; it does not rely on outer `CUDA_VISIBLE_DEVICES`, because CURE workers set their own visibility internally.
+
+- `scripts/eval/build_cure_hurt_case_pack.py`
+  - Converts a hurt subset manifest into a readable case pack.
+  - Extracts the target model's best candidate and the best reference candidate per case.
+  - Records candidate hidden-test pass counts, code snippets, simple code signatures, ability tags, and failure buckets.
+  - Writes aggregate JSON and Markdown outputs under the chosen analysis directory.
+
+- `scripts/eval/build_cure_hurt_span_pair_manifest.py`
+  - Converts CURE hurt manifests into residual-probe-ready positive/negative JSONL files.
+  - Writes full-generation rows for prompt/reasoning-span attribution.
+  - Writes extracted-code-only rows for final-code-span attribution.
+  - Writes same-prompt contrast rows with `negative_response` for pass-vs-fail code residual analysis.
+  - Verified with `probe_signed_utility.py --plan-only`: each generated subset exposes 16 Code rows and 588 OP-VEC residual entries.
+
+- `scripts/analysis/compare_signed_utility_contrast.py`
+  - Compares two `probe_signed_utility.py --write-row-details` outputs.
+  - Aligns rows by `pair_id`, expert, layer, and parameter name.
+  - Computes `signed_effect(pass) - signed_effect(fail)` per residual entry.
+  - Writes module-level JSONL, pair-level JSONL, and a Markdown summary.
+
+- `scripts/attention_pauh/build_contrast_aware_residual_gates.py`
+  - Adds a training-free, default-off gate candidate builder.
+  - Starts from an existing parameter-level gate checkpoint and applies a small pass/fail contrast overlay.
+  - Preserves each expert's mean coefficient by default, so the candidate tests structural residual redistribution rather than global task-vector scaling.
+  - Outputs bake-compatible `gates.json`, `decision_rows.jsonl`, and `summary.md`.
+  - Added `--normalization per-file`, `--aggregation conservative`, and `--conflict-penalty` for span-aware overlays where multiple contrast sources disagree.
+  - Conservative aggregation suppresses residual entries with source/sign conflict instead of averaging them into a misleading direction.
+  - Added optional `--protect-negative-expert EXPERT`, default off.
+  - Protected experts skip negative contrast overlay and mean recentering, allowing a capability-preserve floor ablation without affecting the default path.
+
+- `scripts/analysis/compare_contrast_source_conflicts.py`
+  - Compares multiple `contrast_module_summary.jsonl` sources by `(param_name, expert)`.
+  - Reports pairwise Pearson correlation, sign conflicts, sign agreements, and top conflicting residual entries.
+  - Used to diagnose why LiveBench prompt and LiveCodeBench prompt residual directions are nearly anti-correlated.
+
+- `docs/report/RCRF/20260521_code_hurt_signed_utility_contrast.md`
+  - Recorded a 4-sample LiveCodeBench hurt sanity probe over layers 20-27.
+  - Key finding: Code positive imitation utility is weak; pass/fail contrast is the useful residual-selection signal.
+  - Added full all-layer code-span probes for LiveBench hurt16 and LiveCodeBench hurt16.
+  - Key update: LiveBench final-code contrast is weak and likely needs prompt/reasoning attribution; LiveCodeBench final-code contrast is strong and reveals non-owner Memory residuals with high positive contrast.
+  - Added span-aware conservative v2 results:
+    - LiveBench hurt16 pass_any: `0.4375`
+    - LiveCodeBench hurt16 pass_any: `0.8125`
+    - LiveCodeBench hidden test-point rate: `0.5189`
+  - Recorded the source-conflict diagnosis: LiveBench prompt vs LiveCodeBench prompt has Pearson `-0.9948` and `376/588` sign conflicts.
+  - Added Tool/Memory side-effect check for v2:
+    - BFCL quick mean `0.7931`, live mean `0.7188`
+    - HotpotQA eval_50 F1 `0.7650`, eval_100 F1 `0.7478`
+    - Conclusion: Tool is preserved, Memory has a small side-effect and needs a preserve constraint in the next candidate.
+  - Added memory-preserve v3 ablation:
+    - Memory expert negative overlays protected: `130`
+    - LiveBench hurt16 test-point improves to `0.4121`
+    - LiveCodeBench hurt16 test-point drops to `0.3424`
+    - Conclusion: expert-level hard floor is too coarse; preserve constraints must be span/source/outcome specific.
+
+No training, reward, gate, or model-baking logic was changed.
+
 ## 2026-05-12 Native Batch Update
 
 ### Goal
@@ -1817,6 +1902,33 @@ Default impact:
 - Standalone generation/evaluation path only.
 - No training, reward, rollout, update, existing SPRE, PAUH, TRC, or evaluation default behavior is changed.
 
+## 2026-05-21: ToolRL rollout pair comparison for capability attribution
+
+Purpose:
+
+- Add a reusable per-sample comparison tool for RL capability attribution.
+- Diagnose whether a merge changes source-distribution Tool behavior globally or only on a small set of exact-match prompts.
+
+Changes:
+
+- Added `scripts/eval/compare_toolrl_rollouts.py`.
+  - Compares two OP-VEC rollout JSONL files by `prompt_id`.
+  - Reports reward, success, exact-tool, parseability, zero-call, and name-recall transitions.
+  - Writes both JSON and Markdown outputs with top reward drops/gains and exact-match regressions.
+
+Observed use:
+
+- Compared TA init1 (`ta_scale_sweep_c100`) against RCRF on ToolRL all80.
+- Output:
+  - `/tmp/shared-storage/ExpertGym/rcrf/eval/toolrl_rlla4k_20260521/ta_init1_vs_rcrf_toolrl80_comparison.json`
+  - `/tmp/shared-storage/ExpertGym/rcrf/eval/toolrl_rlla4k_20260521/ta_init1_vs_rcrf_toolrl80_comparison.md`
+- Result: RCRF has the same parseable and zero-call rates as TA init1; ToolRL loss is concentrated in two TA-only exact-match cases.
+
+Default impact:
+
+- Standalone analysis script only.
+- No training, reward, rollout generation, evaluation harness, or gate-building behavior is changed.
+
 ## 2026-05-21: Response-Conditioned Residual Filtering v1
 
 Purpose:
@@ -1856,3 +1968,64 @@ Default impact:
 
 - Standalone generation/evaluation path only.
 - No training, reward, rollout, update, existing SPRE, PAUH, TRC, or evaluation default behavior is changed.
+
+## 2026-05-21 RCRF Memory-Code 冲突可视化与机制报告
+
+### 新增脚本
+
+- `scripts/analysis/build_memory_code_conflict_visuals.py`
+- `scripts/analysis/build_behavior_span_manifest.py`
+- `scripts/analysis/build_residual_evidence_table.py`
+- `scripts/attention_pauh/build_evidence_routed_residual_gates.py`
+
+### 功能
+
+- 汇总现有 RCRF code-hurt 实验的 v1-v4 结果。
+- 读取 source/span contrast conflict、code hurt eval 输出、gate delta 统计。
+- 输出 CSV/JSON/SVG，用于分析 Memory-Code residual 级冲突。
+- 只读模型产物，不修改训练、reward、gate bake 或评测逻辑。
+- 新增 residual-level evidence table：按 `(param_name, expert)` 对齐 Code source/span contrast、Tool/Memory/Code behavior utility、v1-v4 gate delta。
+- evidence table 只生成诊断推荐动作，不训练、不 bake、不改 reward；现已支持多个 `--signed-utility-summary` 按 count 加权合并。
+- 新增 behavior-span manifest 构建器：从 rollout / inference 输出抽取 Tool/Memory/Code 的 positive / negative behavior rows，供 `probe_signed_utility.py` 直接使用。
+- 新增 evidence-routed gate 生成：只 materialize `keep_or_raise/suppress`，冲突和无决策 residual 保持 base。
+
+### 主要输出
+
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/memory_code_conflict_20260521/source_conflict_pairs.csv`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/memory_code_conflict_20260521/code_hurt_metrics.csv`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/memory_code_conflict_20260521/gate_memory_summary.csv`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/memory_code_conflict_20260521/*.svg`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/residual_evidence_table_20260521/residual_evidence_rows.csv`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/residual_evidence_table_20260521/residual_evidence_summary.md`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/behavior_span_manifests/tool_memory_20260521/behavior_positive.jsonl`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/behavior_span_manifests/tool_memory_20260521/behavior_negative.jsonl`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_evidence_routed_v1/gates.json`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/probes/tool_memory_positive_signature_s8_20260521/signed_utility_summary.json`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/residual_evidence_table_tmpos_s8_20260521/residual_evidence_rows.csv`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_evidence_routed_tmpos_s8_v1/gates.json`
+- `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_evidence_routed_tmpos_s8_v1`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/probes/tool_memory_positive_signature_s32_20260521/signed_utility_summary.json`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/residual_evidence_table_tmpos_s32_20260521/residual_evidence_rows.csv`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_evidence_routed_tmpos_s32_v1/gates.json`
+- `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_evidence_routed_tmpos_s32_v1`
+
+### 报告
+
+- `docs/report/RCRF/20260521_memory_code_conflict_visual_report.md`
+- `docs/report/RCRF/20260521_residual_evidence_table_framework.md`
+
+### 结论
+
+- Code residual 方向强烈依赖 source/span；`LB_prompt` 与 `LCB_prompt` 的 Pearson 为 `-0.9948`，冲突率 `63.95%`。
+- Memory expert residual 不能被视为纯 Memory 能力包；expert-level hard preserve 会损伤 LiveCodeBench 修复。
+- v2 span-aware conservative routing 是当前最干净的机制正结果；v3/v4 作为反例说明粗粒度保护不可靠。
+- 后续主线应转向 residual key 级 outcome-aware utility / harm / conflict routing，而不是继续阈值调参。
+- 当前 evidence table 覆盖 `588` 个 residual key；在 informative source sign 下，`400/588` 为 `hold_conflict`，`76` 为 `keep_or_raise`，`43` 为 `suppress`，说明多数位置不适合 task-level scalar，但存在一批可保守处理的 residual。
+- 第一版 evidence-routed gate 仅改变 `56/588` 个 residual key，其中 `35` 个增强、`21` 个抑制；未进行 bake/eval，因此只能作为下一步闭环候选，不作为性能结论。
+- Tool/Memory behavior manifest 当前选中：Memory positive `32` / negative `10`，Tool positive `32` / negative `32`；`probe_signed_utility.py --plan-only` 验证可读，覆盖 `196` 个模块和 `588` 个 expert residual entry。
+- 已完成 Tool/Memory positive s8 真实 probe。合入后 evidence table 的 `hold_conflict` 从 `400` 增到 `466`，`suppress` 从 `43` 降到 `12`，`preserve` 从 `17` 增到 `39`。
+- 新 gate `rcrf_evidence_routed_tmpos_s8_v1` 只改 `25/588` 个 residual key，其中 Memory expert 改动从 `25` 收缩到 `5`，Tool expert 改动从 `12` 收缩到 `1`。
+- `rcrf_evidence_routed_tmpos_s8_v1` 已 bake 并完成 quick eval：Tool BFCL quick = `0.8800 / 0.8550 / 0.6875 / 0.6250`，Memory eval_50 avg_f1 = `0.7648`。
+- 已完成 Tool/Memory positive s32 真实 probe。合入后 evidence table 为：`hold_conflict=463`，`keep_or_raise=44`，`suppress=12`，`preserve=39`，`no_decision=30`。
+- 新 gate `rcrf_evidence_routed_tmpos_s32_v1` 只改 `29/588` 个 residual key：Code `19`、Memory `7`、Tool `3`；增强 `24`、抑制 `5`。
+- `rcrf_evidence_routed_tmpos_s32_v1` 已 bake 并完成 quick eval：Tool BFCL quick = `0.8800 / 0.8600 / 0.8125 / 0.6250`，Memory eval_50 avg_f1 = `0.7802`。
