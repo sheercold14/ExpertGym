@@ -1,0 +1,214 @@
+{
+  "rows": [
+    {
+      "candidate": "bcrc_v18_alias_v9",
+      "model": "bcrc-v18-alias-v9",
+      "role": "main method: soft behavior-constrained residual field",
+      "checkpoint": "/tmp/shared-storage/OnPolicy/checkpoints/rcrf_code_spanaware_tmpos_s32_memoryfull_softveto_v9",
+      "run_id": "iclr_main_eval6_20260523",
+      "root": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/bcrc_v18_alias_v9/iclr_main_eval6_20260523",
+      "status": "ready",
+      "tool_status": "ready",
+      "memory_status": "ready",
+      "code_status": "ready",
+      "tool_mean": 0.793125,
+      "tool_live_mean": 0.71875,
+      "tool_scores": {
+        "live_parallel": 0.8125,
+        "live_parallel_multiple": 0.625,
+        "parallel": 0.88,
+        "parallel_multiple": 0.855
+      },
+      "tool_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/bcrc_v18_alias_v9/iclr_main_eval6_20260523/tool_memory/logs/tool_bfcl.log",
+      "memory_em": 0.626953125,
+      "memory_f1": 0.7569814560439561,
+      "memory_datasets": [
+        {
+          "dataset": "eval_50",
+          "exact_match_rate": 0.609375,
+          "avg_f1": 0.75127442002442,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_100",
+          "exact_match_rate": 0.6015625,
+          "avg_f1": 0.7589071085164835,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_qa_1_32768",
+          "exact_match_rate": 0.65625,
+          "avg_f1": 0.7767547123015875,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_qa_1_65536",
+          "exact_match_rate": 0.640625,
+          "avg_f1": 0.7409895833333333,
+          "total_samples": 128
+        }
+      ],
+      "memory_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/bcrc_v18_alias_v9/iclr_main_eval6_20260523/tool_memory/logs/memory_hotpotqa.log",
+      "code_acc": 0.33011443554305286,
+      "code_tp": 0.43731828690381996,
+      "code_bon": 0.3938891267123288,
+      "code_datasets": [
+        {
+          "dataset": "LiveBench",
+          "code_acc": 0.373046875,
+          "code_tp": 0.4640058765915769,
+          "code_bon": 0.4453125
+        },
+        {
+          "dataset": "LiveCodeBench",
+          "code_acc": 0.2871819960861057,
+          "code_tp": 0.41063069721606305,
+          "code_bon": 0.3424657534246575
+        }
+      ],
+      "code_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/bcrc_v18_alias_v9/iclr_main_eval6_20260523/code/logs/code_cure.log",
+      "simple_avg": 0.6267402971956696,
+      "worst_task": 0.33011443554305286
+    },
+    {
+      "candidate": "no_behavior_v1_code_only",
+      "model": "no-behavior-v1-code-only",
+      "role": "ablation: no behavior constraint",
+      "checkpoint": "/tmp/shared-storage/OnPolicy/checkpoints/rcrf_code_contrast_v1",
+      "run_id": "iclr_main_eval6_20260523",
+      "root": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/no_behavior_v1_code_only/iclr_main_eval6_20260523",
+      "status": "ready",
+      "tool_status": "ready",
+      "memory_status": "ready",
+      "code_status": "ready",
+      "tool_mean": 0.795625,
+      "tool_live_mean": 0.71875,
+      "tool_scores": {
+        "live_parallel": 0.8125,
+        "live_parallel_multiple": 0.625,
+        "parallel": 0.88,
+        "parallel_multiple": 0.865
+      },
+      "tool_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/no_behavior_v1_code_only/iclr_main_eval6_20260523/tool_memory/logs/tool_bfcl.log",
+      "memory_em": 0.638671875,
+      "memory_f1": 0.7649798010149573,
+      "memory_datasets": [
+        {
+          "dataset": "eval_50",
+          "exact_match_rate": 0.6015625,
+          "avg_f1": 0.7531345390720392,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_100",
+          "exact_match_rate": 0.6015625,
+          "avg_f1": 0.7508341918498167,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_qa_1_32768",
+          "exact_match_rate": 0.6875,
+          "avg_f1": 0.7837716536935289,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_qa_1_65536",
+          "exact_match_rate": 0.6640625,
+          "avg_f1": 0.7721788194444446,
+          "total_samples": 128
+        }
+      ],
+      "memory_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/no_behavior_v1_code_only/iclr_main_eval6_20260523/tool_memory/logs/memory_hotpotqa.log",
+      "code_acc": 0.32596930039138944,
+      "code_tp": 0.43550221162437786,
+      "code_bon": 0.4075801125244618,
+      "code_datasets": [
+        {
+          "dataset": "LiveBench",
+          "code_acc": 0.359375,
+          "code_tp": 0.4537218413320274,
+          "code_bon": 0.453125
+        },
+        {
+          "dataset": "LiveCodeBench",
+          "code_acc": 0.2925636007827789,
+          "code_tp": 0.41728258191672823,
+          "code_bon": 0.36203522504892366
+        }
+      ],
+      "code_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/no_behavior_v1_code_only/iclr_main_eval6_20260523/code/logs/code_cure.log",
+      "simple_avg": 0.6288580338021156,
+      "worst_task": 0.32596930039138944
+    },
+    {
+      "candidate": "hard_behavior_v8",
+      "model": "hard-behavior-v8",
+      "role": "ablation: hard behavior constraint",
+      "checkpoint": "/tmp/shared-storage/OnPolicy/checkpoints/rcrf_code_spanaware_tmpos_s32_memoryfull_v8",
+      "run_id": "iclr_main_eval6_20260523",
+      "root": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/hard_behavior_v8/iclr_main_eval6_20260523",
+      "status": "ready",
+      "tool_status": "ready",
+      "memory_status": "ready",
+      "code_status": "ready",
+      "tool_mean": 0.791875,
+      "tool_live_mean": 0.71875,
+      "tool_scores": {
+        "live_parallel": 0.8125,
+        "live_parallel_multiple": 0.625,
+        "parallel": 0.88,
+        "parallel_multiple": 0.85
+      },
+      "tool_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/hard_behavior_v8/iclr_main_eval6_20260523/tool_memory/logs/tool_bfcl.log",
+      "memory_em": 0.62890625,
+      "memory_f1": 0.7567741799521993,
+      "memory_datasets": [
+        {
+          "dataset": "eval_50",
+          "exact_match_rate": 0.609375,
+          "avg_f1": 0.7670978327228327,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_100",
+          "exact_match_rate": 0.6015625,
+          "avg_f1": 0.7644316620879121,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_qa_1_32768",
+          "exact_match_rate": 0.671875,
+          "avg_f1": 0.7728109599014339,
+          "total_samples": 128
+        },
+        {
+          "dataset": "eval_qa_1_65536",
+          "exact_match_rate": 0.6328125,
+          "avg_f1": 0.7227562650966184,
+          "total_samples": 128
+        }
+      ],
+      "memory_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/hard_behavior_v8/iclr_main_eval6_20260523/tool_memory/logs/memory_hotpotqa.log",
+      "code_acc": 0.3274389218444227,
+      "code_tp": 0.43808980973346373,
+      "code_bon": 0.40465998043052837,
+      "code_datasets": [
+        {
+          "dataset": "LiveBench",
+          "code_acc": 0.357421875,
+          "code_tp": 0.4534769833496572,
+          "code_bon": 0.4375
+        },
+        {
+          "dataset": "LiveCodeBench",
+          "code_acc": 0.2974559686888454,
+          "code_tp": 0.42270263611727027,
+          "code_bon": 0.37181996086105673
+        }
+      ],
+      "code_log": "/tmp/shared-storage/ExpertGym/iclr_main_eval6_20260523/hard_behavior_v8/iclr_main_eval6_20260523/code/logs/code_cure.log",
+      "simple_avg": 0.625362700598874,
+      "worst_task": 0.3274389218444227
+    }
+  ]
+}

@@ -62,6 +62,10 @@ def main() -> None:
         args=args,
         base_gates=base_gates,
     )
+    harm_veto_signals, harm_veto_summary = build_harm_veto_signals(
+        args=args,
+        base_gates=base_gates,
+    )
     gates, decision_rows = apply_overlay(
         base_gates=base_gates,
         overlay=overlay,
@@ -72,6 +76,11 @@ def main() -> None:
         protect_negative_experts=set(args.protect_negative_expert),
         preserve_signals=preserve_signals,
         preserve_negative_scale=args.preserve_negative_scale,
+        harm_veto_signals=harm_veto_signals,
+        harm_veto_positive_scale=args.harm_veto_positive_scale,
+        harm_veto_positive_scale_mode=args.harm_veto_positive_scale_mode,
+        harm_veto_task_positive_scales=args.harm_veto_task_positive_scales,
+        eps=args.harm_veto_ratio_eps,
     )
     if args.preserve_expert_mean:
         gates = recenter_by_expert(
@@ -81,7 +90,7 @@ def main() -> None:
             max_coeff=args.max_coeff,
             passes=args.recenter_passes,
             skip_experts=set(args.protect_negative_expert),
-            skip_keys=set(preserve_signals),
+            skip_keys=set(preserve_signals) | set(harm_veto_signals),
         )
         decision_rows = refresh_decision_deltas(decision_rows, gates=gates, base_gates=base_gates)
 
@@ -112,16 +121,25 @@ def main() -> None:
             "preserve_expert_mean": args.preserve_expert_mean,
             "recenter_passes": args.recenter_passes,
             "protect_negative_expert": args.protect_negative_expert,
-            "preserve_summary": str(args.preserve_summary.expanduser().resolve()) if args.preserve_summary else None,
+            "preserve_summary": [str(path.expanduser().resolve()) for path in args.preserve_summary],
             "preserve_task": args.preserve_task,
             "preserve_expert": args.preserve_expert,
             "preserve_min_normalized_utility": args.preserve_min_normalized_utility,
             "preserve_min_positive_fraction": args.preserve_min_positive_fraction,
             "preserve_negative_scale": args.preserve_negative_scale,
+            "harm_veto_summary": [str(path.expanduser().resolve()) for path in args.harm_veto_summary],
+            "harm_veto_task": args.harm_veto_task,
+            "harm_veto_expert": args.harm_veto_expert,
+            "harm_veto_min_normalized_harm": args.harm_veto_min_normalized_harm,
+            "harm_veto_positive_scale": args.harm_veto_positive_scale,
+            "harm_veto_positive_scale_mode": args.harm_veto_positive_scale_mode,
+            "harm_veto_task_positive_scale": args.harm_veto_task_positive_scale,
+            "harm_veto_ratio_eps": args.harm_veto_ratio_eps,
             "experts": args.expert,
         },
         "scale_info": scale_info,
         "preserve_signal_summary": preserve_summary,
+        "harm_veto_signal_summary": harm_veto_summary,
         "gates": gates,
         "coefficient_summary": coefficient_summary(gates),
         "delta_summary": delta_summary(base_gates, gates),
@@ -202,10 +220,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preserve-summary",
         type=Path,
-        default=None,
+        action="append",
+        default=[],
         help=(
             "Optional signed_utility_summary.json used to protect residual entries that are useful "
-            "on a specified behavior task. Default: disabled."
+            "on a specified behavior task. Can be passed multiple times. Default: disabled."
         ),
     )
     parser.add_argument(
@@ -228,7 +247,61 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Multiplier applied to negative contrast deltas for preserve-protected entries. 0 means floor at base.",
     )
+    parser.add_argument(
+        "--harm-veto-summary",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Optional signed_utility_summary.json used to veto positive contrast deltas on residual "
+            "entries that are harmful to specified behavior tasks. Can be passed multiple times. Default: disabled."
+        ),
+    )
+    parser.add_argument(
+        "--harm-veto-task",
+        action="append",
+        default=[],
+        help="Task whose harm_mean marks a residual as unsafe to increase, e.g. --harm-veto-task memory.",
+    )
+    parser.add_argument(
+        "--harm-veto-expert",
+        action="append",
+        default=[],
+        help="Expert allowlist for harm veto signals. Defaults to all experts.",
+    )
+    parser.add_argument("--harm-veto-min-normalized-harm", type=float, default=0.40)
+    parser.add_argument(
+        "--harm-veto-positive-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Constant multiplier applied to positive contrast deltas for harm-vetoed entries, or the "
+            "minimum multiplier when --harm-veto-positive-scale-mode=evidence-ratio. 0 means no floor."
+        ),
+    )
+    parser.add_argument(
+        "--harm-veto-positive-scale-mode",
+        choices=("constant", "evidence-ratio"),
+        default="constant",
+        help=(
+            "constant keeps the old fixed harm-veto multiplier; evidence-ratio scales positive deltas by "
+            "code_utility / (code_utility + protected_harm), with --harm-veto-positive-scale as a floor."
+        ),
+    )
+    parser.add_argument(
+        "--harm-veto-task-positive-scale",
+        action="append",
+        default=[],
+        metavar="TASK=SCALE",
+        help=(
+            "Optional task-specific positive delta multiplier for harm-vetoed entries, e.g. "
+            "--harm-veto-task-positive-scale tool=0 --harm-veto-task-positive-scale memory=0.5. "
+            "Overrides --harm-veto-positive-scale-mode for the matching harm task."
+        ),
+    )
+    parser.add_argument("--harm-veto-ratio-eps", type=float, default=1e-12)
     args = parser.parse_args()
+    args.harm_veto_task_positive_scales = parse_task_scales(args.harm_veto_task_positive_scale)
     if not args.contrast_summary:
         args.contrast_summary = list(DEFAULT_CONTRAST_SUMMARIES)
     if not args.expert:
@@ -237,13 +310,45 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--scale-quantile must be in (0, 1]")
     if args.preserve_summary and not args.preserve_task:
         raise ValueError("--preserve-summary requires at least one --preserve-task")
+    if args.harm_veto_summary and not args.harm_veto_task:
+        raise ValueError("--harm-veto-summary requires at least one --harm-veto-task")
     if not (0.0 <= args.preserve_negative_scale <= 1.0):
         raise ValueError("--preserve-negative-scale must be in [0, 1]")
+    if not (0.0 <= args.harm_veto_positive_scale <= 1.0):
+        raise ValueError("--harm-veto-positive-scale must be in [0, 1]")
+    if args.harm_veto_ratio_eps <= 0.0:
+        raise ValueError("--harm-veto-ratio-eps must be positive")
     return args
 
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.expanduser().read_text(encoding="utf-8"))
+
+
+def parse_task_scales(raw_items: Iterable[str]) -> dict[str, float]:
+    scales: dict[str, float] = {}
+    for raw in raw_items:
+        if "=" not in raw:
+            raise ValueError(f"--harm-veto-task-positive-scale must be TASK=SCALE, got: {raw}")
+        task, value = raw.split("=", 1)
+        task = task.strip()
+        if not task:
+            raise ValueError(f"Missing task in --harm-veto-task-positive-scale: {raw}")
+        scale = float(value)
+        if not (0.0 <= scale <= 1.0):
+            raise ValueError(f"Task-specific harm-veto scale must be in [0, 1], got {raw}")
+        scales[task] = scale
+    return scales
+
+
+def iter_summary_modules(paths: Iterable[Path], option_name: str) -> Iterable[tuple[Path, Mapping[str, Any]]]:
+    for path in paths:
+        resolved = path.expanduser()
+        payload = load_json(resolved)
+        module_summary = payload.get("module_summary", {})
+        if not isinstance(module_summary, Mapping):
+            raise ValueError(f"{option_name} must contain a module_summary mapping: {resolved}")
+        yield resolved, module_summary
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -415,23 +520,21 @@ def build_preserve_signals(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     if not args.preserve_summary:
         return {}, {"enabled": False}
-    payload = load_json(args.preserve_summary)
-    module_summary = payload.get("module_summary", {})
-    if not isinstance(module_summary, Mapping):
-        raise ValueError("--preserve-summary must contain a module_summary mapping")
+    module_summaries = list(iter_summary_modules(args.preserve_summary, "--preserve-summary"))
     allowed_experts = set(args.preserve_expert or [key.rsplit("::", 1)[-1] for key in base_gates])
     preserve_tasks = set(args.preserve_task)
 
     positive_values: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for expert, param_map in module_summary.items():
-        if str(expert) not in allowed_experts:
-            continue
-        for task_stats in dict(param_map).values():
-            for task in preserve_tasks:
-                stats = dict(task_stats).get(task, {})
-                effect = float(stats.get("signed_effect_mean", 0.0))
-                if effect > 0.0:
-                    positive_values[(str(expert), str(task))].append(effect)
+    for _summary_path, module_summary in module_summaries:
+        for expert, param_map in module_summary.items():
+            if str(expert) not in allowed_experts:
+                continue
+            for task_stats in dict(param_map).values():
+                for task in preserve_tasks:
+                    stats = dict(task_stats).get(task, {})
+                    effect = float(stats.get("signed_effect_mean", 0.0))
+                    if effect > 0.0:
+                        positive_values[(str(expert), str(task))].append(effect)
 
     scales = {
         key: robust_abs_quantile(values, 0.75, args.min_scale)
@@ -440,52 +543,139 @@ def build_preserve_signals(
     signals: dict[str, dict[str, Any]] = {}
     task_counts: dict[str, int] = defaultdict(int)
     expert_counts: dict[str, int] = defaultdict(int)
-    for expert, param_map in module_summary.items():
-        expert = str(expert)
-        if expert not in allowed_experts:
-            continue
-        for param_name, task_stats in dict(param_map).items():
-            key = f"{param_name}::{expert}"
-            if key not in base_gates:
+    for summary_path, module_summary in module_summaries:
+        for expert, param_map in module_summary.items():
+            expert = str(expert)
+            if expert not in allowed_experts:
                 continue
-            best_signal: dict[str, Any] | None = None
-            for task in preserve_tasks:
-                stats = dict(task_stats).get(task, {})
-                effect = float(stats.get("signed_effect_mean", 0.0))
-                positive_fraction = float(stats.get("positive_fraction", 0.0))
-                scale = max(float(scales.get((expert, str(task)), args.min_scale)), args.min_scale)
-                normalized = effect / scale
-                if effect <= 0.0:
+            for param_name, task_stats in dict(param_map).items():
+                key = f"{param_name}::{expert}"
+                if key not in base_gates:
                     continue
-                if normalized < float(args.preserve_min_normalized_utility):
-                    continue
-                if positive_fraction < float(args.preserve_min_positive_fraction):
-                    continue
-                candidate = {
-                    "task": str(task),
-                    "expert": expert,
-                    "signed_effect_mean": effect,
-                    "positive_fraction": positive_fraction,
-                    "expression_mean": float(stats.get("expression_mean", 0.0)),
-                    "normalized_preserve_utility": normalized,
-                    "scale": scale,
-                }
-                if best_signal is None or normalized > float(best_signal["normalized_preserve_utility"]):
-                    best_signal = candidate
-            if best_signal is not None:
-                signals[key] = best_signal
-                task_counts[str(best_signal["task"])] += 1
-                expert_counts[expert] += 1
+                best_signal = signals.get(key)
+                for task in preserve_tasks:
+                    stats = dict(task_stats).get(task, {})
+                    effect = float(stats.get("signed_effect_mean", 0.0))
+                    positive_fraction = float(stats.get("positive_fraction", 0.0))
+                    scale = max(float(scales.get((expert, str(task)), args.min_scale)), args.min_scale)
+                    normalized = effect / scale
+                    if effect <= 0.0:
+                        continue
+                    if normalized < float(args.preserve_min_normalized_utility):
+                        continue
+                    if positive_fraction < float(args.preserve_min_positive_fraction):
+                        continue
+                    candidate = {
+                        "task": str(task),
+                        "expert": expert,
+                        "summary_path": str(summary_path.resolve()),
+                        "signed_effect_mean": effect,
+                        "positive_fraction": positive_fraction,
+                        "expression_mean": float(stats.get("expression_mean", 0.0)),
+                        "normalized_preserve_utility": normalized,
+                        "scale": scale,
+                    }
+                    if best_signal is None or normalized > float(best_signal["normalized_preserve_utility"]):
+                        best_signal = candidate
+                if best_signal is not None:
+                    signals[key] = best_signal
+    for signal in signals.values():
+        task_counts[str(signal["task"])] += 1
+        expert_counts[str(signal["expert"])] += 1
 
     summary = {
         "enabled": True,
-        "summary_path": str(args.preserve_summary.expanduser().resolve()),
+        "summary_paths": [str(path.expanduser().resolve()) for path in args.preserve_summary],
         "tasks": sorted(preserve_tasks),
         "experts": sorted(allowed_experts),
         "min_normalized_utility": args.preserve_min_normalized_utility,
         "min_positive_fraction": args.preserve_min_positive_fraction,
         "negative_scale": args.preserve_negative_scale,
         "num_preserved_keys": len(signals),
+        "task_counts": dict(sorted(task_counts.items())),
+        "expert_counts": dict(sorted(expert_counts.items())),
+        "scales": {f"{expert}:{task}": value for (expert, task), value in sorted(scales.items())},
+    }
+    return signals, summary
+
+
+def build_harm_veto_signals(
+    *,
+    args: argparse.Namespace,
+    base_gates: Mapping[str, float],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if not args.harm_veto_summary:
+        return {}, {"enabled": False}
+    module_summaries = list(iter_summary_modules(args.harm_veto_summary, "--harm-veto-summary"))
+    allowed_experts = set(args.harm_veto_expert or [key.rsplit("::", 1)[-1] for key in base_gates])
+    veto_tasks = set(args.harm_veto_task)
+
+    harm_values: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for _summary_path, module_summary in module_summaries:
+        for expert, param_map in module_summary.items():
+            if str(expert) not in allowed_experts:
+                continue
+            for task_stats in dict(param_map).values():
+                for task in veto_tasks:
+                    stats = dict(task_stats).get(task, {})
+                    harm = float(stats.get("harm_mean", 0.0))
+                    if harm > 0.0:
+                        harm_values[(str(expert), str(task))].append(harm)
+
+    scales = {
+        key: robust_abs_quantile(values, 0.75, args.min_scale)
+        for key, values in harm_values.items()
+    }
+    signals: dict[str, dict[str, Any]] = {}
+    task_counts: dict[str, int] = defaultdict(int)
+    expert_counts: dict[str, int] = defaultdict(int)
+    for summary_path, module_summary in module_summaries:
+        for expert, param_map in module_summary.items():
+            expert = str(expert)
+            if expert not in allowed_experts:
+                continue
+            for param_name, task_stats in dict(param_map).items():
+                key = f"{param_name}::{expert}"
+                if key not in base_gates:
+                    continue
+                best_signal = signals.get(key)
+                for task in veto_tasks:
+                    stats = dict(task_stats).get(task, {})
+                    harm = float(stats.get("harm_mean", 0.0))
+                    scale = max(float(scales.get((expert, str(task)), args.min_scale)), args.min_scale)
+                    normalized = harm / scale
+                    if harm <= 0.0:
+                        continue
+                    if normalized < float(args.harm_veto_min_normalized_harm):
+                        continue
+                    candidate = {
+                        "task": str(task),
+                        "expert": expert,
+                        "summary_path": str(summary_path.resolve()),
+                        "harm_mean": harm,
+                        "signed_effect_mean": float(stats.get("signed_effect_mean", 0.0)),
+                        "positive_fraction": float(stats.get("positive_fraction", 0.0)),
+                        "expression_mean": float(stats.get("expression_mean", 0.0)),
+                        "normalized_harm": normalized,
+                        "scale": scale,
+                    }
+                    if best_signal is None or normalized > float(best_signal["normalized_harm"]):
+                        best_signal = candidate
+                if best_signal is not None:
+                    signals[key] = best_signal
+    for signal in signals.values():
+        task_counts[str(signal["task"])] += 1
+        expert_counts[str(signal["expert"])] += 1
+
+    summary = {
+        "enabled": True,
+        "summary_paths": [str(path.expanduser().resolve()) for path in args.harm_veto_summary],
+        "tasks": sorted(veto_tasks),
+        "experts": sorted(allowed_experts),
+        "min_normalized_harm": args.harm_veto_min_normalized_harm,
+        "positive_scale": args.harm_veto_positive_scale,
+        "task_positive_scales": dict(sorted(args.harm_veto_task_positive_scales.items())),
+        "num_veto_keys": len(signals),
         "task_counts": dict(sorted(task_counts.items())),
         "expert_counts": dict(sorted(expert_counts.items())),
         "scales": {f"{expert}:{task}": value for (expert, task), value in sorted(scales.items())},
@@ -511,6 +701,11 @@ def apply_overlay(
     protect_negative_experts: set[str],
     preserve_signals: Mapping[str, Mapping[str, Any]],
     preserve_negative_scale: float,
+    harm_veto_signals: Mapping[str, Mapping[str, Any]],
+    harm_veto_positive_scale: float,
+    harm_veto_positive_scale_mode: str,
+    harm_veto_task_positive_scales: Mapping[str, float],
+    eps: float,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     gates: dict[str, float] = dict(base_gates)
     decision_rows: list[dict[str, Any]] = []
@@ -520,8 +715,10 @@ def apply_overlay(
         if not metrics:
             delta = 0.0
             reason = "no_contrast_signal"
+            effective_harm_scale = None
         else:
             score = float(metrics["score"])
+            effective_harm_scale = None
             if abs(score) < min_abs_score:
                 delta = 0.0
                 reason = "below_min_abs_score"
@@ -535,6 +732,19 @@ def apply_overlay(
                 if preserve_signal and delta < 0.0:
                     delta *= float(preserve_negative_scale)
                     reason = "preserve_utility_floor"
+                harm_veto_signal = harm_veto_signals.get(key)
+                if harm_veto_signal and delta > 0.0:
+                    effective_harm_scale = harm_veto_scale(
+                        mode=harm_veto_positive_scale_mode,
+                        task=str(harm_veto_signal.get("task", "")),
+                        score=score,
+                        normalized_harm=float(harm_veto_signal.get("normalized_harm", 0.0)),
+                        floor=harm_veto_positive_scale,
+                        task_positive_scales=harm_veto_task_positive_scales,
+                        eps=eps,
+                    )
+                    delta *= effective_harm_scale
+                    reason = "behavior_harm_veto"
         new_coeff = clamp(float(base_coeff) + delta, min_coeff, max_coeff)
         gates[key] = new_coeff
         param_name = key.rsplit("::", 1)[0]
@@ -550,9 +760,33 @@ def apply_overlay(
                 "reason": reason,
                 "metrics": dict(metrics or {}),
                 "preserve_signal": dict(preserve_signals.get(key, {})),
+                "harm_veto_signal": dict(harm_veto_signals.get(key, {})),
+                "harm_veto_effective_positive_scale": effective_harm_scale,
             }
         )
     return gates, decision_rows
+
+
+def harm_veto_scale(
+    *,
+    mode: str,
+    task: str,
+    score: float,
+    normalized_harm: float,
+    floor: float,
+    task_positive_scales: Mapping[str, float],
+    eps: float,
+) -> float:
+    if task in task_positive_scales:
+        return float(task_positive_scales[task])
+    if mode == "constant":
+        return float(floor)
+    if mode == "evidence-ratio":
+        code_utility = max(float(score), 0.0)
+        protected_harm = max(float(normalized_harm), 0.0)
+        ratio = code_utility / (code_utility + protected_harm + eps)
+        return clamp(max(float(floor), ratio), 0.0, 1.0)
+    raise ValueError(f"Unsupported harm-veto scale mode: {mode}")
 
 
 def recenter_by_expert(
@@ -692,10 +926,23 @@ def render_summary(payload: Mapping[str, Any]) -> str:
                 "",
                 "## Preserve Signals",
                 "",
-                f"- summary: `{preserve_summary.get('summary_path')}`",
+                f"- summaries: `{json.dumps(preserve_summary.get('summary_paths', []), sort_keys=True)}`",
                 f"- preserved keys: `{preserve_summary.get('num_preserved_keys', 0)}`",
                 f"- task counts: `{json.dumps(preserve_summary.get('task_counts', {}), sort_keys=True)}`",
                 f"- expert counts: `{json.dumps(preserve_summary.get('expert_counts', {}), sort_keys=True)}`",
+            ]
+        )
+    harm_veto_summary = payload.get("harm_veto_signal_summary", {})
+    if harm_veto_summary.get("enabled"):
+        lines.extend(
+            [
+                "",
+                "## Harm Veto Signals",
+                "",
+                f"- summaries: `{json.dumps(harm_veto_summary.get('summary_paths', []), sort_keys=True)}`",
+                f"- veto keys: `{harm_veto_summary.get('num_veto_keys', 0)}`",
+                f"- task counts: `{json.dumps(harm_veto_summary.get('task_counts', {}), sort_keys=True)}`",
+                f"- expert counts: `{json.dumps(harm_veto_summary.get('expert_counts', {}), sort_keys=True)}`",
             ]
         )
     lines.extend(["", "## Coefficients", "", "| expert | mean | std | min | max |", "|---|---:|---:|---:|---:|"])

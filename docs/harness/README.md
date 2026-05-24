@@ -25,6 +25,8 @@ Task vectors provide structured priors; executable feedback learns their composi
 | 文件 | 用途 |
 |---|---|
 | [20260517_72h_master_plan.md](20260517_72h_master_plan.md) | 72 小时科研执行计划、GPU 调度、晋级规则 |
+| [20260523_mechanism_first_iclr_plan.md](20260523_mechanism_first_iclr_plan.md) | 机制优先的 ICLR 收束计划：先诊断 residual utility/harm，再形成简单可泛化算法 |
+| [20260522_rcf_bc_reproducible_loop.md](20260522_rcf_bc_reproducible_loop.md) | RCF-BC 主方法的诊断、gate 生成、bake、快评和 Code hurt 复现闭环 |
 | [experiment_matrix.md](experiment_matrix.md) | 主实验矩阵、每个实验和论文表格的对应关系 |
 | [runbook_5h_fast_iteration.md](runbook_5h_fast_iteration.md) | 单实验 5 小时内的训练设置、命令模板、停止规则 |
 | [calibration_design.md](calibration_design.md) | reward-aware calibration bank 设计、OPD target 选择、heldout 防过拟合规则 |

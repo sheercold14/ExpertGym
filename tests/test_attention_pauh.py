@@ -25,6 +25,10 @@ from scripts.attention_pauh.build_response_conditioned_residual_filtering_gates 
     RcrfProfile,
     build_rcrf_gates,
 )
+from scripts.attention_pauh.build_contrast_aware_residual_gates import (
+    harm_veto_scale,
+    parse_task_scales,
+)
 from scripts.attention_pauh.probe_signed_utility import (
     build_probe_token_mask,
     response_char_intervals,
@@ -480,6 +484,48 @@ class AttentionPauhCoreTest(unittest.TestCase):
 
         self.assertLess(gates["model.layers.0.self_attn.q_proj.weight::tool"], 1.0)
         self.assertEqual(decisions[0]["reason"], "suppress_low_energy_or_unstable_residual")
+
+    def test_task_specific_harm_veto_scale_overrides_global_mode(self):
+        task_scales = parse_task_scales(["tool=0", "memory=0.5"])
+
+        self.assertEqual(task_scales, {"tool": 0.0, "memory": 0.5})
+        self.assertAlmostEqual(
+            harm_veto_scale(
+                mode="evidence-ratio",
+                task="tool",
+                score=1.0,
+                normalized_harm=0.1,
+                floor=0.25,
+                task_positive_scales=task_scales,
+                eps=1e-12,
+            ),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            harm_veto_scale(
+                mode="constant",
+                task="memory",
+                score=1.0,
+                normalized_harm=10.0,
+                floor=0.0,
+                task_positive_scales=task_scales,
+                eps=1e-12,
+            ),
+            0.5,
+        )
+
+    def test_evidence_ratio_harm_veto_scale_uses_utility_harm_balance(self):
+        scale = harm_veto_scale(
+            mode="evidence-ratio",
+            task="memory",
+            score=0.25,
+            normalized_harm=0.75,
+            floor=0.0,
+            task_positive_scales={},
+            eps=1e-12,
+        )
+
+        self.assertAlmostEqual(scale, 0.25, places=6)
 
 
 if __name__ == "__main__":

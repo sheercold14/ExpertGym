@@ -15,6 +15,7 @@ does not train or modify a model; it only writes probe summaries.
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import json
 import math
@@ -35,6 +36,7 @@ from scripts.attention_pauh.core import (  # noqa: E402
     default_owner_task,
     is_attention_param,
     linear_delta_probe,
+    linear_delta_probe_with_tokens,
     manifest_expert_names,
     normalize_task_name,
     parse_layer_index,
@@ -112,6 +114,7 @@ def main() -> None:
         span=args.span,
         response_tail_tokens=args.response_tail_tokens,
         write_row_details=args.write_row_details,
+        write_projection_summary=args.write_projection_summary,
         output_dir=output_dir,
     )
     payload = {"config": config, **summary}
@@ -155,6 +158,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--write-row-details", action="store_true")
+    parser.add_argument(
+        "--write-projection-summary",
+        action="store_true",
+        help=(
+            "Also summarize token-level activation-update projection against "
+            "the successful task owner expert. This is used for projection "
+            "decomposition gates and does not change signed utility rows."
+        ),
+    )
     parser.add_argument("--plan-only", action="store_true")
     return parser.parse_args()
 
@@ -271,6 +283,7 @@ def run_signed_utility_probe(
     span: str,
     response_tail_tokens: int,
     write_row_details: bool,
+    write_projection_summary: bool,
     output_dir: Path,
 ) -> dict[str, Any]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -303,6 +316,9 @@ def run_signed_utility_probe(
     conflict_stats: dict[str, dict[int, dict[str, dict[str, float]]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     )
+    projection_stats: dict[str, dict[str, dict[str, dict[str, float]]]] | None = None
+    if write_projection_summary:
+        projection_stats = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(float))))
     row_writer = None
     if write_row_details:
         row_writer = (output_dir / "signed_utility_rows.jsonl").open("w", encoding="utf-8")
@@ -333,6 +349,7 @@ def run_signed_utility_probe(
                 layer_task_stats=layer_task_stats,
                 module_task_stats=module_task_stats,
                 conflict_stats=conflict_stats,
+                projection_stats=projection_stats,
                 write_row_details=write_row_details,
             )
             if row_writer is not None:
@@ -353,7 +370,7 @@ def run_signed_utility_probe(
     layer_summary = finalize_layer_summary(layer_task_stats)
     module_summary = finalize_module_summary(module_task_stats)
     conflict_summary = finalize_conflict_summary(conflict_stats)
-    return {
+    summary = {
         "row_counts": count_rows_by_task(rows),
         "layer_summary": layer_summary,
         "module_summary": module_summary,
@@ -365,6 +382,11 @@ def run_signed_utility_probe(
             "conflict_cosine": "Cosine between induced residual updates D x for two experts on the same task/module.",
         },
     }
+    if projection_stats is not None:
+        projection_summary = finalize_projection_summary(projection_stats)
+        summary["projection_summary"] = projection_summary
+        write_projection_csv(output_dir / "activation_update_projection_summary.csv", projection_summary)
+    return summary
 
 
 def register_linear_hooks(
@@ -577,6 +599,7 @@ def process_captured_row(
     layer_task_stats: dict[str, dict[int, dict[str, dict[str, float]]]],
     module_task_stats: dict[str, dict[str, dict[str, dict[str, float]]]],
     conflict_stats: dict[str, dict[int, dict[str, dict[str, float]]]],
+    projection_stats: dict[str, dict[str, dict[str, dict[str, float]]]] | None,
     write_row_details: bool,
 ) -> dict[str, Any]:
     row_details: list[dict[str, Any]] = []
@@ -591,14 +614,24 @@ def process_captured_row(
         inputs = tensors["input"].detach()
         output_grads = grad.detach()
         mean_updates: dict[str, torch.Tensor] = {}
+        token_updates: dict[str, torch.Tensor] = {}
         for entry in entries:
             delta = torch.load(entry.storage_path, map_location="cpu")
-            expression, signed_effect, mean_update = linear_delta_probe(
-                delta=delta,
-                inputs=inputs,
-                output_grads=output_grads,
-                token_mask=token_mask,
-            )
+            if projection_stats is None:
+                expression, signed_effect, mean_update = linear_delta_probe(
+                    delta=delta,
+                    inputs=inputs,
+                    output_grads=output_grads,
+                    token_mask=token_mask,
+                )
+            else:
+                expression, signed_effect, mean_update, induced = linear_delta_probe_with_tokens(
+                    delta=delta,
+                    inputs=inputs,
+                    output_grads=output_grads,
+                    token_mask=token_mask,
+                )
+                token_updates[entry.expert] = induced
             update_stats(layer_task_stats[entry.expert][entry.layer][task], expression, signed_effect)
             update_stats(module_task_stats[entry.expert][param_name][task], expression, signed_effect)
             mean_updates[entry.expert] = mean_update
@@ -615,6 +648,16 @@ def process_captured_row(
                     }
                 )
             del delta
+        if projection_stats is not None:
+            update_projection_decomposition(
+                projection_stats=projection_stats,
+                param_name=param_name,
+                task=task,
+                row_id=row_id,
+                layer=entries[0].layer,
+                token_updates=token_updates,
+            )
+            token_updates.clear()
         update_conflicts(
             conflict_stats=conflict_stats,
             param_name=param_name,
@@ -655,6 +698,59 @@ def update_conflicts(
             stats["negative_count"] += 1.0 if cosine < 0.0 else 0.0
             stats["param_count"] += 1.0
             stats["last_param_hash"] = float(abs(hash(param_name)) % 1_000_000)
+
+
+def update_projection_decomposition(
+    *,
+    projection_stats: dict[str, dict[str, dict[str, dict[str, float]]]],
+    param_name: str,
+    task: str,
+    row_id: str,
+    layer: int,
+    token_updates: Mapping[str, torch.Tensor],
+) -> None:
+    """Decompose each expert update against the successful task owner update.
+
+    This measures geometry, not ownership.  For the current successful task
+    span, the owner expert's induced activation update is used as a local
+    capability direction.  Other expert updates are split into aligned,
+    conflicting, and orthogonal norm mass relative to that direction.
+    """
+
+    owner = default_owner_task(task)
+    owner_update = token_updates.get(owner)
+    if owner_update is None or owner_update.numel() == 0:
+        return
+    basis = owner_update.detach().float()
+    owner_norm_sq = basis.pow(2).sum(dim=-1)
+    owner_norm = owner_norm_sq.clamp_min(1.0e-24).sqrt()
+    for expert, raw_update in token_updates.items():
+        update = raw_update.detach().float()
+        if update.shape != basis.shape:
+            continue
+        total_sq = update.pow(2).sum(dim=-1)
+        total_norm = total_sq.clamp_min(1.0e-24).sqrt()
+        dot = (update * basis).sum(dim=-1)
+        signed_projection = dot / owner_norm.clamp_min(1.0e-12)
+        align = signed_projection.clamp_min(0.0)
+        conflict = (-signed_projection).clamp_min(0.0)
+        orth_sq = (total_sq - signed_projection.pow(2)).clamp_min(0.0)
+        orth = orth_sq.sqrt()
+        cosine = dot / (total_norm * owner_norm).clamp_min(1.0e-12)
+        token_count = float(total_norm.numel())
+        stats = projection_stats[task][param_name][expert]
+        stats["count"] += 1.0
+        stats["token_count"] += token_count
+        stats["layer"] = float(layer)
+        stats["align_norm_sum"] += float(align.sum().item())
+        stats["conflict_norm_sum"] += float(conflict.sum().item())
+        stats["orth_norm_sum"] += float(orth.sum().item())
+        stats["total_norm_sum"] += float(total_norm.sum().item())
+        stats["owner_norm_sum"] += float(owner_norm.sum().item())
+        stats["cosine_sum"] += float(cosine.sum().item())
+        stats["negative_token_count"] += float((cosine < 0.0).sum().item())
+        stats["positive_token_count"] += float((cosine > 0.0).sum().item())
+        stats["last_row_hash"] = float(abs(hash(row_id)) % 1_000_000)
 
 
 def finalize_layer_summary(
@@ -721,6 +817,82 @@ def finalize_conflict_summary(
                     "count": float(stats.get("count", 0.0)),
                 }
     return summary
+
+
+def finalize_projection_summary(
+    projection_stats: Mapping[str, Mapping[str, Mapping[str, Mapping[str, float]]]]
+) -> dict[str, dict[str, dict[str, float]]]:
+    summary: dict[str, dict[str, dict[str, float]]] = {}
+    for task, param_map in projection_stats.items():
+        summary[task] = {}
+        for param_name, expert_map in sorted(param_map.items()):
+            for expert, stats in sorted(expert_map.items()):
+                total_norm_sum = max(float(stats.get("total_norm_sum", 0.0)), 1.0e-24)
+                token_count = max(float(stats.get("token_count", 0.0)), 1.0)
+                key = f"{param_name}::{expert}"
+                summary[task][key] = {
+                    "param_name": param_name,
+                    "expert": expert,
+                    "layer": float(stats.get("layer", parse_layer_index(param_name))),
+                    "module": module_name_from_param(param_name),
+                    "family": module_family_from_param(param_name),
+                    "count": float(stats.get("count", 0.0)),
+                    "token_count": float(stats.get("token_count", 0.0)),
+                    "align_ratio": float(stats.get("align_norm_sum", 0.0)) / total_norm_sum,
+                    "conflict_ratio": float(stats.get("conflict_norm_sum", 0.0)) / total_norm_sum,
+                    "orth_ratio": float(stats.get("orth_norm_sum", 0.0)) / total_norm_sum,
+                    "total_norm_mean": total_norm_sum / token_count,
+                    "owner_norm_mean": float(stats.get("owner_norm_sum", 0.0)) / token_count,
+                    "cosine_mean": float(stats.get("cosine_sum", 0.0)) / token_count,
+                    "negative_fraction": float(stats.get("negative_token_count", 0.0)) / token_count,
+                    "positive_fraction": float(stats.get("positive_token_count", 0.0)) / token_count,
+                }
+    return summary
+
+
+def write_projection_csv(path: Path, projection_summary: Mapping[str, Mapping[str, Mapping[str, float]]]) -> None:
+    fieldnames = [
+        "task",
+        "param_name",
+        "expert",
+        "layer",
+        "module",
+        "family",
+        "count",
+        "token_count",
+        "align_ratio",
+        "conflict_ratio",
+        "orth_ratio",
+        "total_norm_mean",
+        "owner_norm_mean",
+        "cosine_mean",
+        "negative_fraction",
+        "positive_fraction",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for task, rows in sorted(projection_summary.items()):
+            for row in rows.values():
+                writer.writerow({"task": task, **{key: row.get(key, "") for key in fieldnames if key != "task"}})
+
+
+def module_name_from_param(param_name: str) -> str:
+    for module in ("q", "k", "v", "o"):
+        if param_name.endswith(f"self_attn.{module}_proj.weight"):
+            return module
+    for module in ("gate", "up", "down"):
+        if param_name.endswith(f"mlp.{module}_proj.weight"):
+            return module
+    return "unknown"
+
+
+def module_family_from_param(param_name: str) -> str:
+    if ".self_attn." in param_name:
+        return "attention"
+    if ".mlp." in param_name:
+        return "mlp"
+    return "unknown"
 
 
 def top_owner_utility(layer_summary: Mapping[str, Mapping[str, Mapping[str, Any]]]) -> dict[str, list[dict[str, float]]]:

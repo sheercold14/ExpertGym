@@ -50,6 +50,7 @@ def main() -> None:
                 min_positive_reward=args.min_positive_reward,
                 max_negative_reward=args.max_negative_reward,
                 include_unscored_as_positive=args.include_unscored_as_positive,
+                memory_response_mode=args.memory_response_mode,
             )
         )
     positive, negative = select_records(
@@ -99,6 +100,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use inference rows without summary correctness as positive behavior rows. Default off.",
     )
+    parser.add_argument(
+        "--memory-response-mode",
+        choices=("final", "memory-plus-final", "full-trajectory"),
+        default="final",
+        help=(
+            "How to build teacher-forced memory responses from inference rows. "
+            "final keeps the old behavior; memory-plus-final uses the memory field plus final answer; "
+            "full-trajectory concatenates memory update turns plus final answer."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -133,6 +144,7 @@ def load_source_records(
     min_positive_reward: float,
     max_negative_reward: float,
     include_unscored_as_positive: bool,
+    memory_response_mode: str,
 ) -> list[dict[str, Any]]:
     rows = read_json_rows(path)
     records: list[dict[str, Any]] = []
@@ -157,6 +169,7 @@ def load_source_records(
                 row_index=row_index,
                 summary_correct=summary_correct,
                 include_unscored_as_positive=include_unscored_as_positive,
+                memory_response_mode=memory_response_mode,
             )
             if item is not None:
                 records.append(item)
@@ -267,6 +280,7 @@ def inference_record(
     row_index: int,
     summary_correct: Mapping[str, set[int]],
     include_unscored_as_positive: bool,
+    memory_response_mode: str,
 ) -> dict[str, Any] | None:
     task = normalize_task(row.get("task") or row.get("ability") or row.get("data_source"))
     index = int(row.get("index") if row.get("index") is not None else row_index)
@@ -280,7 +294,7 @@ def inference_record(
         label_reason = "unscored included as positive behavior"
     else:
         return None
-    response = str(row.get("response") or row.get("completion") or row.get("expert_response") or row.get("chosen_response") or "")
+    response = inference_response(row=row, task=task, memory_response_mode=memory_response_mode)
     if not response:
         return None
     prompt = str(row.get("prompt") or "")
@@ -302,6 +316,37 @@ def inference_record(
         details=row.get("details") or {},
         reference=row.get("ground_truth") or row.get("reference"),
     )
+
+
+def inference_response(*, row: Mapping[str, Any], task: str, memory_response_mode: str) -> str:
+    if task == "memory" and memory_response_mode != "final":
+        final_response = str(row.get("response") or row.get("completion") or "")
+        if memory_response_mode == "memory-plus-final":
+            memory = str(row.get("memory") or "")
+            parts = []
+            if memory:
+                parts.extend(["<memory>", memory.strip(), "</memory>"])
+            if final_response:
+                parts.extend(["<final_answer>", final_response.strip(), "</final_answer>"])
+            return "\n".join(parts).strip()
+        if memory_response_mode == "full-trajectory":
+            parts = []
+            for turn_index, turn in enumerate(row.get("chunk_rounds") or [], start=1):
+                if not isinstance(turn, Mapping):
+                    continue
+                update = str(turn.get("response") or "").strip()
+                if update:
+                    parts.extend(
+                        [
+                            f"<memory_update_{turn_index}>",
+                            update,
+                            f"</memory_update_{turn_index}>",
+                        ]
+                    )
+            if final_response:
+                parts.extend(["<final_answer>", final_response.strip(), "</final_answer>"])
+            return "\n".join(parts).strip()
+    return str(row.get("response") or row.get("completion") or row.get("expert_response") or row.get("chosen_response") or "")
 
 
 def make_record(
@@ -428,6 +473,7 @@ def build_summary(
             "min_positive_reward": args.min_positive_reward,
             "max_negative_reward": args.max_negative_reward,
             "include_unscored_as_positive": args.include_unscored_as_positive,
+            "memory_response_mode": args.memory_response_mode,
         },
         "record_counts": dict(Counter(row["role"] for row in records)),
         "selected_counts": {

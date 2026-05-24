@@ -1,5 +1,426 @@
 # Code Change Log
 
+## 2026-05-23 ICLR Heldout Protocol
+
+Context:
+
+- The mechanism-first paper uses behavior probes to build residual evidence.
+- The submission audit still marked heldout/generalization as not ready because the protocol was not explicitly separated from probe/calibration data.
+
+Changes:
+
+- `docs/paper/ExpertGym_ICLR/HELDOUT_PROTOCOL.md`
+  - Added the paper-facing heldout protocol.
+  - Separates `probe`, `monitor`, `guard`, `formal_eval`, and `diagnostic_eval_leak`.
+  - Defines task-specific split rules for Tool, Memory, and Code.
+  - States which evidence is paper-main safe and which is diagnostic only.
+
+- `docs/paper/ExpertGym_ICLR/main.tex`
+  - Added a heldout-discipline paragraph to the experimental protocol.
+
+- `docs/paper/ExpertGym_ICLR/SUBMISSION_READINESS_AUDIT.md`
+- `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`
+- `docs/paper/ExpertGym_ICLR/README.md`
+  - Marked the protocol as ready while keeping empirical heldout support not ready until full Eval6 finishes.
+
+Validation:
+
+```bash
+cd docs/paper/ExpertGym_ICLR
+pdflatex -interaction=nonstopmode main.tex
+bibtex main
+pdflatex -interaction=nonstopmode main.tex
+pdflatex -interaction=nonstopmode main.tex
+```
+
+The final LaTeX build produced `main.pdf` with no errors, no undefined citations/references, and one existing benign underfull hbox in the semantic table.
+
+No training, reward, rollout, bake, or evaluation harness logic was changed.
+
+## 2026-05-23 ICLR Main Diagnostic Figure
+
+Context:
+
+- The 8765 Streamlit workbench and RCRF reports contained strong mechanism evidence, but the ICLR draft needed one compact paper-facing figure.
+- The figure should connect the diagnostic finding to the method: code is span-conditioned, residual rows are mostly conflict/weak evidence, and method variants expose a Memory-Code trade-off.
+
+Changes:
+
+- `scripts/analysis/build_iclr_diagnostic_figure.py`
+  - Added an artifact-only figure builder.
+  - Reads existing RCRF analysis outputs:
+    - `source_conflict_pairs.csv`
+    - `archetype_summary.csv`
+    - `rcrf_paper_evidence_table.csv`
+  - Writes a three-panel diagnostic figure:
+    - Code source/span Pearson heatmap.
+    - Residual role row-count atlas.
+    - Memory-Code trade-off scatter for v8/v18/v19/v14/v15.
+
+- `docs/paper/ExpertGym_ICLR/figures/diagnostic_residual_field.pdf`
+- `docs/paper/ExpertGym_ICLR/figures/diagnostic_residual_field.png`
+- `docs/paper/ExpertGym_ICLR/figures/diagnostic_residual_field_summary.json`
+  - Added generated figure artifacts.
+
+- `docs/report/RCRF/20260523_iclr_main_diagnostic_figure.md`
+  - Added a short paper-facing report recording the figure inputs, top conflicts, role counts, and method claim supported.
+
+- `docs/paper/ExpertGym_ICLR/main.tex`
+  - Inserted the diagnostic figure after the residual-response/code-span diagnostic discussion.
+
+- `docs/paper/ExpertGym_ICLR/README.md`
+- `docs/paper/ExpertGym_ICLR/SUBMISSION_READINESS_AUDIT.md`
+- `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`
+  - Linked the figure builder and marked the main diagnostic figure as ready.
+
+Validation:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/analysis/build_iclr_diagnostic_figure.py
+
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/analysis/build_iclr_diagnostic_figure.py
+
+cd docs/paper/ExpertGym_ICLR
+pdflatex -interaction=nonstopmode main.tex
+bibtex main
+pdflatex -interaction=nonstopmode main.tex
+pdflatex -interaction=nonstopmode main.tex
+```
+
+The final LaTeX build produced `main.pdf` with no errors, no undefined citations/references, and one existing benign underfull hbox in the semantic table.
+
+No training, reward, rollout, bake, or evaluation harness logic was changed.
+
+## 2026-05-23 ICLR Paper-Main Eval Aggregator
+
+Context:
+
+- The paper-main Eval6 queue now has a reproducible launch script, but the paper still needs a stable path from finished logs to table rows.
+- Tool, Memory, and Code harnesses write different log/JSON formats, so manual aggregation would be error-prone.
+
+Changes:
+
+- `scripts/analysis/aggregate_iclr_paper_main_eval.py`
+  - Added an artifact-only aggregator for the directory layout produced by `skill/command/run_20260523_iclr_paper_main_eval.sh`.
+  - Parses:
+    - BFCL Tool log JSON for per-category accuracy, Tool mean, and Tool live mean.
+    - Memory HotpotQA log JSON for dataset EM/F1 and mean Memory EM/F1.
+    - Code/CURE log JSON for LiveBench/LiveCodeBench pass@1, TP, and BoN.
+  - Keeps missing evaluation legs as explicit `missing` values rather than silently dropping rows.
+  - Reports per-leg status (`tool_status`, `memory_status`, `code_status`) so partially completed long evaluations are visible as `partial`.
+  - Writes Markdown, CSV, and JSON outputs for the ICLR draft.
+
+- `docs/paper/ExpertGym_ICLR/PAPER_MAIN_EVAL6_AGGREGATE.md`
+- `docs/paper/ExpertGym_ICLR/paper_main_eval6_aggregate.csv`
+- `docs/paper/ExpertGym_ICLR/paper_main_eval6_aggregate.json`
+  - Added the current aggregate state. The minimum candidates are currently `missing`, as expected before full Eval6 jobs are launched.
+
+- `docs/paper/ExpertGym_ICLR/PAPER_MAIN_EVAL_QUEUE.md`
+- `docs/paper/ExpertGym_ICLR/SUBMISSION_READINESS_AUDIT.md`
+- `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`
+- `docs/paper/ExpertGym_ICLR/README.md`
+  - Linked the aggregator as the canonical post-eval table path.
+
+Validation:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/analysis/aggregate_iclr_paper_main_eval.py
+
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python - <<'PY'
+from pathlib import Path
+from scripts.analysis.aggregate_iclr_paper_main_eval import parse_tool_log, parse_memory_log, parse_code_log
+base = Path('/tmp/shared-storage/ExpertGym/eval/p1_evaltarget_20260518/main_global_i7')
+print(parse_tool_log(base/'tool/logs/tool_bfcl.log')['tool_mean'])
+print(parse_memory_log(base/'memory_code/logs/memory_hotpotqa.log')['memory_f1'])
+print(parse_code_log(base/'memory_code/logs/code_cure.log')['code_acc'])
+PY
+
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/analysis/aggregate_iclr_paper_main_eval.py
+```
+
+No training, reward, rollout, bake, or evaluation harness logic was changed.
+
+## 2026-05-23 ICLR Paper-Main Eval Queue
+
+Context:
+
+- The ICLR readiness audit showed that static baselines already have comparable full Eval6 rows, but RCF-BC currently only has mechanism/quick evidence.
+- The next paper-critical step is to evaluate one main RCF-BC candidate and two principled ablations with the same full harness as the baselines.
+
+Changes:
+
+- `skill/command/run_20260523_iclr_paper_main_eval.sh`
+  - Added a dry-run-first wrapper around `skill/command/run_full_eval_suite.sh`.
+  - Freezes the minimum paper-main queue:
+    - `bcrc_v18_alias_v9`
+    - `no_behavior_v1_code_only`
+    - `hard_behavior_v8`
+  - Supports optional candidates:
+    - `strict_cleanup_v19`
+    - `scalar_code_half_v14`
+    - `scalar_code_zero_v15`
+  - Splits phases into `list`, `tool_memory`, `code`, and `all`.
+  - Defaults to `DRY_RUN=1` so it prints commands without launching long evaluations.
+
+- `docs/paper/ExpertGym_ICLR/PAPER_MAIN_EVAL_QUEUE.md`
+  - Added the paper-main candidate table, exact checkpoint paths, gate paths, metric requirements, commands, scheduling notes, and paper decision rule.
+  - Records the important artifact alias: the `v18` gate and `v9` gate have identical 588 gate coefficients, but only the `v9` baked checkpoint currently exists, so `bcrc_v18_alias_v9` is the explicit full-eval target.
+
+- `docs/paper/ExpertGym_ICLR/SUBMISSION_READINESS_AUDIT.md`
+- `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`
+- `docs/paper/ExpertGym_ICLR/README.md`
+  - Linked the queue and made the remaining benchmark blocker explicit.
+
+Validation:
+
+```bash
+bash -n skill/command/run_20260523_iclr_paper_main_eval.sh
+DRY_RUN=1 PHASE=list bash skill/command/run_20260523_iclr_paper_main_eval.sh
+DRY_RUN=1 PHASE=tool_memory CANDIDATES=bcrc_v18_alias_v9 bash skill/command/run_20260523_iclr_paper_main_eval.sh
+DRY_RUN=1 PHASE=code CANDIDATES=bcrc_v18_alias_v9 bash skill/command/run_20260523_iclr_paper_main_eval.sh
+```
+
+No training, reward, rollout, bake, or evaluation harness logic was changed.
+
+## 2026-05-23 ICLR Main Benchmark Draft Builder
+
+Context:
+
+- The submission audit identified the main benchmark table as the largest remaining paper gap.
+- Existing Eval6 baseline results and RCF-BC mechanism results were scattered across reports and shared-storage artifacts.
+
+Changes:
+
+- `scripts/analysis/build_iclr_main_benchmark_draft.py`
+  - Added an artifact-only table builder.
+  - Parses full Eval6 baseline rows from `docs/evaluation/20260518_baselines_eval6.md` and `docs/evaluation/20260517_p0_static_baselines_eval6.md`.
+  - Reads the historical best-model note from `docs/evaluation/best_ever_model.md`.
+  - Reads selected RCF-BC mechanism rows from `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_paper_evidence_table_20260522/rcrf_paper_evidence_table.csv`.
+  - Writes a paper-facing draft table and a missing-eval queue.
+
+- `docs/paper/ExpertGym_ICLR/MAIN_BENCHMARK_TABLE_DRAFT.md`
+  - Added the generated benchmark draft.
+  - Separates comparable full Eval6 rows from RCF-BC mechanism rows to avoid overclaiming.
+  - Identifies the missing full Eval6 runs needed before RCF-BC can be used in the final main table.
+
+- `docs/paper/ExpertGym_ICLR/main_benchmark_table_draft.csv`
+- `docs/paper/ExpertGym_ICLR/main_benchmark_table_draft.json`
+  - Added machine-readable versions of the benchmark draft.
+
+- `docs/paper/ExpertGym_ICLR/README.md`
+- `docs/paper/ExpertGym_ICLR/SUBMISSION_READINESS_AUDIT.md`
+- `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`
+  - Linked the benchmark draft and updated the readiness/evidence status.
+
+Validation:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/analysis/build_iclr_main_benchmark_draft.py
+
+PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/analysis/build_iclr_main_benchmark_draft.py
+```
+
+No training, reward, rollout, bake, or evaluation behavior was changed.
+
+## 2026-05-23 8765 RCRF Frontend Diagnostic Summary
+
+Context:
+
+- The active Streamlit frontend on port `8765` is the RCRF mechanism discovery workbench.
+- The user asked to distill the frontend experiment analysis into diagnostic methodology and conclusions.
+
+Changes:
+
+- `docs/report/RCRF/20260523_8765_frontend_diagnostic_method_and_findings.md`
+  - Added a Chinese, paper-facing summary of what the 8765 frontend proves.
+  - Records loaded data scale: `2016` residual records, `2352` gate records, `504` interference records, and `73` eval records.
+  - Summarizes the diagnostic protocol: behavior span definition, outcome-aware pass/fail residual utility, Tool/Memory harm/support constraints, residual role classification, and conservative routing.
+  - Consolidates the key findings: Code source/span conflict, Memory-Code residual conflict, hard-routing failure, scalar shrink negative controls, and RCF-BC as the main mechanism direction.
+
+- `docs/paper/ExpertGym_ICLR/main.tex`
+  - Integrated the 8765 diagnostic evidence into the ICLR draft.
+  - Added span-conditioned residual-response definitions and the key Code source/span conflict statistic.
+  - Added atlas-level evidence explaining why residual routing is needed before the main method table.
+  - Wrapped the main evidence table to fit the ICLR page width.
+
+- `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`
+  - Added claim-to-artifact rows for the 8765 diagnostic protocol, Code source/span conflict, and Memory-Code residual-key conflict.
+
+No training, reward, rollout, bake, or evaluation behavior was changed.
+
+## 2026-05-23 BCRC Algorithm Box and Submission Audit
+
+Context:
+
+- The ICLR draft needed to move from a conceptual method description to an auditable algorithmic form.
+- The active goal requires diagnosing first, then deriving a simple generalizable method, and keeping the submission state explicit.
+
+Changes:
+
+- `docs/paper/ExpertGym_ICLR/main.tex`
+  - Added an algorithm box for Behavior-Constrained Residual Composition.
+  - The box specifies inputs, residual-response recording, capability evidence, behavior evidence, conservative update, and output ledger.
+  - The text clarifies that calibration probes are diagnostic instruments rather than answer-memorization data.
+
+- `docs/paper/ExpertGym_ICLR/SUBMISSION_READINESS_AUDIT.md`
+  - Added a submission-readiness audit.
+  - Tracks ready/partial/not-ready requirements for the ICLR goal.
+  - Identifies the critical remaining gaps: consolidated main benchmark table, exact paper-main config, heldout protocol, and RAM artifact audit.
+
+- `docs/paper/ExpertGym_ICLR/README.md`
+  - Added the 8765 diagnostic report to evidence dependencies.
+  - Linked the submission-readiness audit.
+
+No training, reward, rollout, bake, or evaluation behavior was changed.
+
+## 2026-05-23 RAIN / ExpertGym Vector Semantics Diagnosis
+
+Context:
+
+- The research direction is shifting from coefficient tuning to a mechanism-first ICLR story.
+- RAIN-Merging reproduced successfully after full lambda grid, but its task-vector semantics differ from ExpertGym.
+- We need a clean diagnostic bridge before using RAIN/RAM ideas inside ExpertGym.
+
+Changes:
+
+- `scripts/analysis/compare_rain_expertgym_task_vectors.py`
+  - Added a lightweight artifact-only diagnostic script.
+  - Reads RAIN Stage1/Stage3 stats, RAIN lambda-grid summary, ExpertGym OP-VEC manifests, and delta norm diagnostics.
+  - Reports anchor model, additive vector semantics, selected modules, norm summaries, and first-order findings.
+  - Does not load large model weights or modify training/eval paths.
+
+- `docs/report/RCRF/20260523_rain_expertgym_task_vector_diagnosis.md`
+  - Documents that RAIN adds projected instruction delta into a protected R1 anchor, while ExpertGym adds Tool/Memory/Code RL expert deltas relative to Qwen2.5-Instruct.
+  - Records the key norm mismatch: code `0.620`, tool `1.255`, memory `5.362`, raw R1/Math `347.068`.
+  - Concludes that ExpertGym should borrow RAIN's behavior-preserving principle rather than copy its alpha formula directly.
+
+- `docs/harness/20260523_mechanism_first_iclr_plan.md`
+  - Added the mechanism-first ICLR plan.
+  - Defines the paper claim, diagnostic phases, simple behavior-constrained residual composition rule, main experiments, stop rules, and immediate next actions.
+
+- `docs/harness/README.md`
+  - Linked the new ICLR mechanism-first harness.
+
+Validation:
+
+```bash
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python \
+  scripts/analysis/compare_rain_expertgym_task_vectors.py \
+  --output-json /tmp/shared-storage/ExpertGym/rain_expertgym_task_vector_diagnosis_20260523/summary.json \
+  --output-md docs/report/RCRF/20260523_rain_expertgym_task_vector_diagnosis.md
+
+/mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile \
+  scripts/analysis/compare_rain_expertgym_task_vectors.py
+```
+
+No training, reward, rollout, bake, or evaluation behavior was changed.
+
+## 2026-05-23 ICLR Mechanism-First Paper Draft
+
+Context:
+
+- The old paper draft still centers on executable-feedback coefficient learning with GRPO/OPD/retention.
+- Current evidence supports a cleaner mechanism-first story: residual-level capability utility and behavior harm.
+- We need an ICLR-style draft without destroying the existing ACL/EMNLP-style draft.
+
+Changes:
+
+- `docs/paper/ExpertGym_ICLR/`
+  - Added a separate ICLR 2026 draft directory.
+  - Copied official ICLR 2026 style assets from `https://github.com/ICLR/Master-Template/raw/master/iclr2026.zip`.
+  - Does not overwrite `docs/paper/ExpertGym/main.tex`.
+
+- `docs/paper/ExpertGym_ICLR/main.tex`
+  - Added a mechanism-first draft titled `ExpertGym: Behavior-Constrained Residual Composition for Agent Task Vectors`.
+  - Reframes the method as `BCRC = Behavior-Constrained Residual Composition`.
+  - Uses current RCF-BC evidence: vector semantics audit, residual evidence table, scalar-code-shrink negative controls, hard-routing ablations, and counterfactual residual interventions.
+
+- `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`
+  - Maps paper claims to current artifacts.
+  - Marks which claims are ready, partial, or not ready.
+  - Prevents the draft from overclaiming SOTA before heldout/main benchmark tables are filled.
+
+- `docs/paper/ExpertGym_ICLR/references.bib`
+  - Added local bibliography for the ICLR draft, including RAIN, RAM, model merging, BFCL, HotpotQA, LiveCodeBench, and CURE.
+
+No training, reward, rollout, bake, or evaluation behavior was changed.
+
+## 2026-05-22 RCF-BC Reproducible Harness
+
+Context:
+
+- RCRF has converged from coefficient tuning to residual-level capability attribution.
+- The current main method is `RCF-BC = Residual Capability Field with Behavior Constraints`.
+- We need one clean command surface for diagnosis, gate generation, baking, quick evaluation, and Code hurt regression.
+
+Changes:
+
+- `skill/command/run_20260522_rcrf_pareto_frontier.sh`
+  - Added `PHASE=diagnose`, which rebuilds the residual conflict atlas and runs operating-point delta comparison.
+  - Added `PHASE=paper_main`, which runs `generate -> bake -> quick_eval -> code_hurt_eval -> diagnose -> dashboard -> clusters -> paper_table`.
+  - Added `PHASE=dashboard`, which builds the static residual diagnostic dashboard.
+  - Added `PHASE=clusters`, which summarizes residual rows into mechanism-facing conflict archetypes.
+  - Added `PHASE=paper_table`, which rebuilds the paper-facing evidence table from existing evaluation artifacts.
+  - Existing phases and defaults are preserved.
+
+- `scripts/analysis/compare_rcrf_operating_points.py`
+  - Added `v18_rcf_bc` to the default diagnostic candidate set.
+  - Existing reference remains `v9`, so historical comparison behavior stays interpretable while the semantic method name is included.
+
+- `docs/harness/20260522_rcf_bc_reproducible_loop.md`
+  - Added the Obsidian-friendly RCF-BC reproduction loop.
+  - Records the method claim, artifact paths, command sequence, negative controls, and next experiment priority.
+
+- `scripts/analysis/build_rcrf_diagnostic_dashboard.py`
+  - Added a dependency-free static HTML dashboard for `operating_point_rows.jsonl`.
+  - Shows candidate overview, layer/module/expert delta heatmaps, role aggregates, and a residual row explorer.
+  - Writes `dashboard_data.json`, aggregate CSVs, `index.html`, and a local README under the analysis output directory.
+
+- `scripts/analysis/build_rcrf_conflict_clusters.py`
+  - Added an offline mechanism summarizer over the dashboard row data.
+  - Groups the 588 residual rows into `clean_code_repair`, `code_repair_with_behavior_harm`, `code_source_conflict`, `code_negative_with_behavior_support`, `code_negative_noise`, `behavior_only`, and `weak_or_uninformative`.
+  - Writes JSONL rows, aggregate CSVs, and a Markdown report for paper-facing mechanism analysis.
+
+- `scripts/analysis/build_rcrf_archetype_policy_gates.py`
+  - Added `v19_archetype_consistency`, a deterministic projection from `v18_rcf_bc`.
+  - Resets deltas that contradict their conflict-cluster semantics: weak/uninformative drift, behavior-only drift, positive deltas on Code-negative noise, and negative deltas on behavior-supporting rows.
+  - Keeps continuous `code_source_conflict` deltas, so this is not a hard routing fallback.
+
+- `scripts/analysis/build_rcrf_paper_evidence_table.py`
+  - Added a deterministic table builder for `v8-v19` gate provenance and Tool/Memory/Code metrics.
+  - Treats `v18_rcf_bc` as a semantic alias of `v9` for evaluation artifacts, while keeping its own gate provenance.
+  - Uses CURE `code_acc / BoN acc` consistently for Code hurt subset reporting.
+
+- `scripts/analysis/build_rcrf_counterfactual_effect_table.py`
+  - Added a counterfactual effect table over `v14-v23`.
+  - Reads direct intervention summaries plus the paper evidence table, then reports metric deltas relative to `v18_rcf_bc`.
+  - Computes non-additivity for `v20` versus `v22+v23`, showing that residual group effects are not independent.
+
+- `scripts/analysis/build_rcrf_archetype_scaled_gate_ablation.py`
+  - Added a generic residual-row coefficient ablation tool.
+  - Selects rows by conflict-cluster metadata such as `archetype`, `expert`, `role`, `module_family`, and strength thresholds.
+  - Rewrites only selected coefficients with `--scale-coefficient` or `--set-coefficient`; no reward, rollout, or training path is touched.
+
+- `skill/command/run_20260522_rcrf_pareto_frontier.sh`
+  - Added diagnostic candidates `v20_code_noise_half`, `v21_code_noise_zero`, `v22_code_negative_noise_half`, and `v23_code_weak_half`.
+  - These start from `v18_rcf_bc` and only change `code` rows in `code_negative_noise + weak_or_uninformative`, providing a residual-level counterpart to global `v14/v15`.
+  - `v22/v23` split `v20` into true negative-noise rows and weak evidence rows to identify where Code hurt originates.
+  - Added `PHASE=effect_table` and included it in `PHASE=paper_main`.
+
+- `docs/report/RCRF/20260522_archetype_consistency_v19.md`
+  - Documents the v19 rule, delta summary, reset reasons, and intended evaluation as a mechanism ablation against `v18_rcf_bc`.
+
+- `docs/report/RCRF/20260522_residual_level_code_scale_ablation.md`
+  - Documents the v20/v21 hypotheses, commands, selected row counts, and expected interpretation.
+
+No reward, rollout, training, or gate-construction semantics were changed.
+
 ## 2026-05-21 CURE Code Hurt Subset
 
 Context:
@@ -2029,3 +2450,661 @@ Default impact:
 - 已完成 Tool/Memory positive s32 真实 probe。合入后 evidence table 为：`hold_conflict=463`，`keep_or_raise=44`，`suppress=12`，`preserve=39`，`no_decision=30`。
 - 新 gate `rcrf_evidence_routed_tmpos_s32_v1` 只改 `29/588` 个 residual key：Code `19`、Memory `7`、Tool `3`；增强 `24`、抑制 `5`。
 - `rcrf_evidence_routed_tmpos_s32_v1` 已 bake 并完成 quick eval：Tool BFCL quick = `0.8800 / 0.8600 / 0.8125 / 0.6250`，Memory eval_50 avg_f1 = `0.7802`。
+
+## 2026-05-21 RCRF Code Repair with Behavior Preserve / Harm Veto
+
+### Code changes
+
+- `scripts/attention_pauh/build_contrast_aware_residual_gates.py`
+  - Added optional default-off behavior harm veto.
+  - New arguments:
+    - `--harm-veto-summary`
+    - `--harm-veto-task`
+    - `--harm-veto-expert`
+    - `--harm-veto-min-normalized-harm`
+    - `--harm-veto-positive-scale`
+  - When enabled, positive Code pass/fail contrast deltas are scaled down for residual entries with high Tool/Memory `harm_mean`.
+  - Preserve behavior remains separate: `--preserve-summary` protects useful behavior residuals from negative deltas.
+  - Default behavior is unchanged when the new harm-veto arguments are not provided.
+
+### New candidates
+
+- v6 gate:
+  `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_code_spanaware_tmpos_s32_preserve_v6/gates.json`
+- v6 checkpoint:
+  `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_code_spanaware_tmpos_s32_preserve_v6`
+- v7 gate:
+  `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_code_spanaware_tmpos_s32_preserve_harmveto_v7/gates.json`
+- v7 checkpoint:
+  `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_code_spanaware_tmpos_s32_preserve_harmveto_v7`
+
+### Quick results
+
+| candidate | changed | Tool BFCL quick | Memory eval50 F1 | LiveBench hurt BoN | LiveCodeBench hurt BoN |
+|---|---:|---|---:|---|---|
+| `rcrf_evidence_routed_tmpos_s32_v1` | 29 | `0.8800 / 0.8600 / 0.8125 / 0.6250` | 0.7802 | `0.1875 / 0.4219` | `0.4375 / 0.6303` |
+| `rcrf_code_spanaware_tmpos_s32_preserve_v6` | 310 | `0.8800 / 0.8600 / 0.7500 / 0.6250` | 0.7528 | `0.3125 / 0.4922` | `0.6250 / 0.7395` |
+| `rcrf_code_spanaware_tmpos_s32_preserve_harmveto_v7` | 201 | `0.8800 / 0.8650 / 0.8125 / 0.6250` | 0.7425 | `0.2500 / 0.5156` | `0.7500 / 0.7731` |
+
+Interpretation:
+
+- v6/v7 prove that Code repair needs broad pass/fail contrast; the ultra-conservative s32 gate is too weak for Code.
+- v7 proves harm-veto can preserve Tool while restoring LiveCodeBench hurt performance.
+- Memory remains the unresolved conflict: current short behavior signature is insufficient; the next Memory utility must cover update turns plus final turn.
+
+## 2026-05-21 Memory Full-Trajectory Evidence Support
+
+Code changes:
+
+- `scripts/analysis/build_behavior_span_manifest.py`
+  - Added `--memory-response-mode {final,memory-plus-final,full-trajectory}`.
+  - Default remains `final`, so old manifest construction is unchanged.
+  - `full-trajectory` concatenates MemAgent-style update turn responses plus final answer into the teacher-forced `response` field.
+- `scripts/attention_pauh/build_contrast_aware_residual_gates.py`
+  - `--preserve-summary` and `--harm-veto-summary` now support repeated arguments.
+  - Default disabled behavior remains unchanged.
+  - This enables combining Tool call-span protection with Memory full-trajectory protection without merging files by hand.
+
+Purpose:
+
+- Test whether Memory degradation in v6/v7 comes from using too short a Memory behavior span.
+- Keep this as a mechanism diagnostic, not another free-form hyperparameter sweep.
+
+Validation:
+
+- `PYTHONDONTWRITEBYTECODE=1 python -m py_compile scripts/analysis/build_behavior_span_manifest.py scripts/attention_pauh/build_contrast_aware_residual_gates.py`
+
+Closed-loop result:
+
+- `rcrf_code_spanaware_tmpos_s32_memoryfull_v8`
+  - Tool BFCL quick: `0.8800 / 0.8600 / 0.8125 / 0.6250`
+  - Memory eval_50 F1: `0.7720`
+  - LiveBench hurt16 BoN: `0.2500 / 0.4688`
+  - LiveCodeBench hurt16 BoN: `0.3125 / 0.5378`
+
+Conclusion:
+
+- Full Memory trajectory evidence restores Memory relative to v7, but hard harm-veto over-suppresses Code repair. Next code change, if any, should implement soft Pareto routing rather than another threshold-only variant.
+
+Follow-up v9:
+
+- No new code changes.
+- Generated `rcrf_code_spanaware_tmpos_s32_memoryfull_softveto_v9` with the same evidence as v8 and `--harm-veto-positive-scale 0.5`.
+- Results: Tool BFCL quick `0.8800 / 0.8550 / 0.8125 / 0.6250`, Memory eval_50 F1 `0.7575`, LiveBench hurt16 BoN `0.2500 / 0.6250`, LiveCodeBench hurt16 BoN `0.6250 / 0.6555`.
+- Interpretation: fixed soft scale is a useful diagnostic; next code-level improvement should compute the soft scale from residual-level Code utility vs protected-task harm instead of hand choosing a constant.
+
+## 2026-05-22 Evidence-Ratio Harm Veto Mode
+
+Code changes:
+
+- `scripts/attention_pauh/build_contrast_aware_residual_gates.py`
+  - Added default-off `--harm-veto-positive-scale-mode {constant,evidence-ratio}`.
+  - Default `constant` preserves all existing behavior.
+  - `evidence-ratio` uses `code_utility / (code_utility + protected_harm + eps)` and treats `--harm-veto-positive-scale` as a lower floor.
+  - Added `harm_veto_effective_positive_scale` to decision rows for auditing.
+
+Validation:
+
+- `PYTHONDONTWRITEBYTECODE=1 python -m py_compile scripts/attention_pauh/build_contrast_aware_residual_gates.py scripts/analysis/build_behavior_span_manifest.py`
+
+v10 result:
+
+- `rcrf_code_spanaware_tmpos_s32_memoryfull_ratio_v10`
+  - Effective harm scale: count `78`, median `0.1837`, mean `0.1973`.
+  - Tool BFCL quick: `0.8800 / 0.8600 / 0.7500 / 0.6250`.
+  - Memory eval_50 F1: `0.7495`.
+  - LiveBench hurt16 BoN: `0.2500 / 0.6016`.
+  - LiveCodeBench hurt16 BoN: `0.3125 / 0.5378`.
+
+Interpretation:
+
+- Naive evidence-ratio is a useful negative result: it over-suppresses Code and does not improve Tool/Memory.
+- Next method should use task-typed protection rather than one global harm formula.
+
+## 2026-05-22 Task-Typed Harm Scale
+
+Code changes:
+
+- `scripts/attention_pauh/build_contrast_aware_residual_gates.py`
+  - Added default-off `--harm-veto-task-positive-scale TASK=SCALE`.
+  - This overrides the global harm scale/mode for matching protected-task harm signals.
+  - Default behavior is unchanged when the argument is absent.
+
+Validation:
+
+- `PYTHONDONTWRITEBYTECODE=1 python -m py_compile scripts/attention_pauh/build_contrast_aware_residual_gates.py scripts/analysis/build_behavior_span_manifest.py`
+
+v11 result:
+
+- `rcrf_code_spanaware_tmpos_s32_tasktyped_v11`
+  - Task scales: `tool=0.0`, `memory=0.5`.
+  - Tool BFCL quick: `0.8800 / 0.8600 / 0.8125 / 0.6250`.
+  - Memory eval_50 F1: `0.7701`.
+  - LiveBench hurt16 BoN: `0.2500 / 0.5469`.
+  - LiveCodeBench hurt16 BoN: `0.3750 / 0.5126`.
+
+Interpretation:
+
+- Task-typed protection restores Tool/Memory close to v8 but weakens Code relative to v9.
+- This supports the Pareto-frontier view: v9 is the better balanced operating point; v11 is the stronger behavior-preserving operating point.
+
+Follow-up consolidation:
+
+- Added `docs/report/RCRF/20260522_rcrf_method_blueprint.md`.
+  - Summarizes the residual-level attribution unit, Code pass/fail contrast, Tool call-span protection, Memory full-trajectory protection, and the v8-v11 Pareto frontier.
+  - Includes reproducible command skeletons for the key artifacts.
+- Added lightweight tests in `tests/test_attention_pauh.py`:
+  - `parse_task_scales(["tool=0", "memory=0.5"])`
+  - task-specific harm scale override
+  - evidence-ratio scale math
+
+Validation:
+
+- `PYTHONDONTWRITEBYTECODE=1 python -m py_compile scripts/attention_pauh/build_contrast_aware_residual_gates.py scripts/analysis/build_behavior_span_manifest.py`
+- `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python tests/test_attention_pauh.py`: `20 tests`, OK.
+- `pytest` is not installed in the BFCL environment, so the targeted test was run through stdlib `unittest`.
+
+## 2026-05-22 RCRF Pareto Frontier Harness
+
+Code changes:
+
+- Added `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Provides a single reproducible entry for the current RCRF Pareto frontier.
+  - Supports phases: `manifest`, `probe_memory`, `generate`, `bake`, `quick_eval`, `code_hurt_eval`, `all`.
+  - Supports `DRY_RUN=1` and `CANDIDATES=v8,v9,v10,v11`.
+  - Keeps GPU / port / dataset choices configurable through environment variables.
+  - Uses explicit `env ... bash ...` dry-run output for eval commands so commands are auditable.
+
+Documentation:
+
+- Updated `docs/report/RCRF/20260522_rcrf_method_blueprint.md` with the harness entrypoint and phase table.
+
+Validation:
+
+- `bash -n skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `DRY_RUN=1 PHASE=generate CANDIDATES=v11 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `DRY_RUN=1 PHASE=quick_eval CANDIDATES=v9 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `DRY_RUN=1 PHASE=code_hurt_eval CANDIDATES=v9 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+
+## 2026-05-22 RCRF Residual Conflict Atlas
+
+Code changes:
+
+- Added `scripts/analysis/build_rcrf_conflict_atlas.py`.
+  - Aligns Code pass/fail contrast, Tool/Memory behavior utility/harm summaries, and v8-v11 gate decision rows by `(param_name, expert)`.
+  - Emits row-level and aggregated role diagnostics: `code_repair_only`, `shared_positive`, `code_repair_vs_protected_harm`, `code_negative_but_protected_support`, `code_source_conflict_with_behavior`, etc.
+  - Does not load models, train, bake, or evaluate.
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added `PHASE=atlas`.
+
+Artifacts:
+
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_conflict_atlas_20260522/residual_conflict_atlas_summary.md`
+- `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_conflict_atlas_20260522/residual_conflict_atlas_rows.jsonl`
+- `docs/report/RCRF/20260522_residual_conflict_atlas.md`
+
+Key result:
+
+- `588` residual entries aligned.
+- Main role counts:
+  - `code_source_conflict_with_behavior=167`
+  - `code_source_conflict=112`
+  - `code_repair_only=60`
+  - `code_negative_but_protected_support=58`
+  - `shared_positive=17`
+  - `code_repair_vs_protected_harm=16`
+
+Interpretation:
+
+- The atlas supports the RCRF story more directly than scalar gate curves: most residuals are not task-pure, clean Code repair entries are limited, shared positive entries are rare, and Memory/Tool behavior constraints collide with Code spans in specific layer/module/expert regions.
+
+Validation:
+
+- `PYTHONDONTWRITEBYTECODE=1 python -m py_compile scripts/analysis/build_rcrf_conflict_atlas.py`
+- `PYTHONDONTWRITEBYTECODE=1 python scripts/analysis/build_rcrf_conflict_atlas.py`
+- `bash -n skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `DRY_RUN=1 PHASE=atlas bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+
+## 2026-05-22 RCRF Role-Routed Gate v12
+
+Code changes:
+
+- Added `scripts/analysis/build_rcrf_role_routed_gates.py`.
+  - Reads the residual conflict atlas and base gates.
+  - Materializes gates from fixed residual-role rules.
+  - Does not train, bake, or evaluate.
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added `PHASE=role_route`.
+  - Added `v12` to candidate mapping so it can be baked/evaluated through the same harness.
+
+Artifacts:
+
+- gate: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_role_routed_v12/gates.json`
+- summary: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_role_routed_v12/role_routing_summary.md`
+- structure summary: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_role_routed_v12/gate_structure_summary.md`
+- report: `docs/report/RCRF/20260522_role_routed_gate_v12.md`
+
+v12 result:
+
+- changed `133/588`
+- positive delta `73`
+- negative delta `60`
+- mean abs delta `0.004696`
+- role actions:
+  - `code_repair_only`: changed `60`, all positive
+  - `shared_positive`: changed `9`, all positive
+  - `code_negative_noise`: changed `56`, all negative
+  - `protected_harm_only`: changed `4`, all negative
+  - `code_negative_but_protected_support`: unchanged
+  - `code_source_conflict*`: unchanged
+
+Interpretation:
+
+- v12 is the first explicit `atlas -> role -> routing` materialization.
+- It is not a metric-tuned candidate. It encodes the current mechanism hypothesis: clean Code repair can be raised, Tool harm is near-hard, Memory harm is soft, and source-conflict residuals should not be guessed by scalar routing.
+
+Validation:
+
+- `PYTHONDONTWRITEBYTECODE=1 python -m py_compile scripts/analysis/build_rcrf_role_routed_gates.py`
+- `PYTHONDONTWRITEBYTECODE=1 python scripts/analysis/build_rcrf_role_routed_gates.py --output-dir /tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_role_routed_v12`
+- `bash -n skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `DRY_RUN=1 PHASE=role_route bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `DRY_RUN=1 PHASE=generate CANDIDATES=v12 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+
+Evaluation:
+
+- Baked checkpoint:
+  - `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_role_routed_v12`
+  - command: `CANDIDATES=v12 PHASE=bake bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- Tool/Memory quick:
+  - command: `CANDIDATES=v12 PHASE=quick_eval TOOL_GPU=0 TOOL_PORT=8152 MEMORY_GPU_IDS=1 MEMORY_DATASETS=eval_50 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+  - Tool: `0.8800 / 0.8650 / 0.8125 / 0.6250`
+  - Memory eval_50 F1: `0.7626831501831502`
+- Code hurt16:
+  - command: `CANDIDATES=v12 PHASE=code_hurt_eval CODE_GPU=2 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+  - LiveBenchCodeHurtRcrfVsTa16 BoN: `0.2500 / 0.4453125`
+  - LiveCodeBenchCodeHurtRcrfVsTa16 BoN: `0.4375 / 0.5294117647058824`
+
+Interpretation after eval:
+
+- v12 preserves Tool/Memory but underperforms v9 on Code.
+- The likely issue is not role attribution itself, but the suppression rule: treating `code_negative_noise` as prune-worthy is too aggressive.
+- Next role-routed variant should keep positive Code repair / shared-positive routing, but disable or source-condition negative Code suppression.
+
+## 2026-05-22 RCRF Positive-Only Role Routing v13
+
+Code changes:
+
+- `scripts/analysis/build_rcrf_role_routed_gates.py`
+  - Added `--code-negative-action {suppress,hold}`.
+  - Added `--protected-harm-action {suppress,hold}`.
+  - Defaults preserve v12 behavior: `suppress`.
+- `skill/command/run_20260522_rcrf_pareto_frontier.sh`
+  - Added candidate `v13`.
+  - `v13` maps to `rcrf_role_routed_positive_only_v13`.
+
+Artifacts:
+
+- gate: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_role_routed_positive_only_v13/gates.json`
+- checkpoint: `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_role_routed_positive_only_v13`
+- summary: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_role_routed_positive_only_v13/role_routing_summary.md`
+- report: `docs/report/RCRF/20260522_role_routed_positive_only_v13.md`
+
+v13 configuration:
+
+- `--variant-name rcrf_role_routed_positive_only_v13`
+- `--code-negative-action hold`
+- `--protected-harm-action hold`
+
+v13 gate result:
+
+- changed `73/588`
+- positive delta `73`
+- negative delta `0`
+- mean abs delta `0.002073`
+- role changes:
+  - `code_repair_only`: `60` positive
+  - `shared_positive`: `9` positive
+  - `code_repair_vs_protected_harm`: `3` positive
+  - `code_repair_shared_and_harm`: `1` positive
+  - `code_negative_noise`: unchanged
+  - `protected_harm_only`: unchanged
+  - `code_source_conflict*`: unchanged
+
+Evaluation:
+
+- Tool quick: `0.8800 / 0.8550 / 0.8125 / 0.6250`
+- Memory eval_50 F1: `0.7564083485958486`
+- LiveBenchCodeHurtRcrfVsTa16 BoN: `0.1250 / 0.2421875`
+- LiveCodeBenchCodeHurtRcrfVsTa16 BoN: `0.3125 / 0.5294117647058824`
+
+Interpretation:
+
+- v13 preserves Tool/Memory, but Code is worse than v9 and worse than v12 on LiveBench.
+- The failure is not only v12's negative suppression. Positive-only routing also fails because it holds all `code_source_conflict*` rows.
+- Next method must source-condition the conflict rows instead of holding them globally.
+
+## 2026-05-22 Code Expert Coefficient Ablation
+
+Code changes:
+
+- Added `scripts/analysis/build_expert_scaled_gate_ablation.py`.
+  - Reads an existing `gates.json`.
+  - Mechanically scales or sets one expert's coefficients.
+  - Writes `gates.json`, `expert_scale_summary.json`, and `expert_scale_summary.md`.
+  - Does not touch reward, rollout, training, baking, or evaluation logic.
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added candidate `v14_code_half`: v9 with all `::code` coefficients multiplied by `0.5`.
+  - Added candidate `v15_code_zero`: v9 with all `::code` coefficients set to `0.0`.
+
+Artifacts:
+
+- v14 gate: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_v9_code_half_v14/gates.json`
+- v15 gate: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_v9_code_zero_v15/gates.json`
+- v14 checkpoint: `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_v9_code_half_v14`
+- v15 checkpoint: `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_v9_code_zero_v15`
+- report: `docs/report/RCRF/20260522_code_expert_ablation.md`
+
+Validation / execution:
+
+- `PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile scripts/analysis/build_expert_scaled_gate_ablation.py`
+- `bash -n skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `DRY_RUN=1 PHASE=generate CANDIDATES=v14_code_half,v15_code_zero bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=generate CANDIDATES=v14_code_half,v15_code_zero bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=bake CANDIDATES=v14_code_half,v15_code_zero bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=quick_eval CANDIDATES=v14_code_half,v15_code_zero TOOL_GPU=0 TOOL_PORT=8154 MEMORY_GPU_IDS=1 MEMORY_DATASETS=eval_50 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=code_hurt_eval CANDIDATES=v14_code_half,v15_code_zero CODE_GPU=2 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+
+Result summary:
+
+- v14 code_half: Tool `0.8800 / 0.8600 / 0.8125 / 0.6250`; Memory F1 `0.7774`; Code hurt acc/BoN `0.2031/0.2500` and `0.2500/0.1875`.
+- v15 code_zero: Tool `0.8800 / 0.8650 / 0.7500 / 0.6250`; Memory F1 `0.7841`; Code hurt acc/BoN `0.0781/0.1250` and `0.1719/0.1875`.
+
+Interpretation:
+
+- Lowering Code globally releases Memory but destroys Code.
+- This is a useful negative control for the RCRF claim: scalar expert suppression is too crude; the method needs residual-level Code-critical vs Code-harmful separation.
+
+## 2026-05-22 RCF-BC Attribution Ledger
+
+Code changes:
+
+- Added `scripts/analysis/build_rcrf_attribution_ledger.py`.
+  - Joins residual conflict-cluster rows, `v18_rcf_bc` coefficients/deltas, and counterfactual group effects.
+  - Writes a 588-row CSV/JSONL ledger plus summary/report.
+  - Adds per-row `routing_action`, `validation_priority`, and `next_validation` so the ledger can drive the next intervention plan.
+  - Does not change gates, rewards, baking, or evaluation logic.
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added `PHASE=ledger`.
+  - Included `ledger` in `PHASE=paper_main`.
+- Updated `docs/harness/20260522_rcf_bc_reproducible_loop.md` with the ledger command and output paths.
+
+Artifacts:
+
+- report: `docs/report/RCRF/20260522_rcrf_attribution_ledger.md`
+- output dir: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_attribution_ledger_20260522`
+- CSV: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_attribution_ledger_20260522/rcrf_attribution_ledger.csv`
+- JSONL: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_attribution_ledger_20260522/rcrf_attribution_ledger.jsonl`
+
+Execution:
+
+- `PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile scripts/analysis/build_rcrf_attribution_ledger.py`
+- `PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python scripts/analysis/build_rcrf_attribution_ledger.py`
+
+Result summary:
+
+- Ledger rows: `588`.
+- `audit_before_prune`: `60` rows, including `code_negative_noise` and `weak_or_uninformative` code rows whose group shrink can hurt Tool/Memory.
+- `keep_capability_delta`: `77` rows.
+- `keep_continuous_field`: `279` rows, mostly mixed Code evidence rows where hard routing is unsafe.
+- Executable action layer:
+  - `retain_capability_delta`: `77` rows.
+  - `retain_continuous_field`: `279` rows.
+  - `retain_with_behavior_constraint`: `28` rows.
+  - `protect_behavior_anchor`: `66` rows.
+  - `do_not_prune_without_counterfactual`: `60` rows.
+- Validation priority after refinement: `high=172`, `medium=387`, `low=29`.
+
+Interpretation:
+
+- The ledger turns the "is Code globally too large?" question into row-level audit evidence.
+- Low-confidence or negative Code rows are not automatically safe to prune; several are behavior-coupled.
+- This supports the RCF-BC story: continuous residual field plus behavior-support audit, not hard scalar suppression.
+
+## 2026-05-22 RCF-BC Validation Planner
+
+Code changes:
+
+- Added `scripts/analysis/build_rcrf_validation_plan.py`.
+  - Reads `rcrf_attribution_ledger.csv`.
+  - Groups rows by `routing_action`, `validation_priority`, `archetype`, `expert`, `layer_band`, and `module_family`.
+  - Writes ranked validation cards with hypothesis, success criterion, failure read, and representative residual keys.
+  - Does not generate gates, bake checkpoints, run evaluation, or change model behavior.
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added `PHASE=validation_plan`.
+  - Included `validation_plan` in `PHASE=paper_main` after ledger generation.
+- Updated `docs/harness/20260522_rcf_bc_reproducible_loop.md`.
+  - Added the validation-plan command and output paths.
+
+Artifacts:
+
+- report: `docs/report/RCRF/20260522_rcrf_validation_plan.md`
+- output dir: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_validation_plan_20260522`
+- cards CSV: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_validation_plan_20260522/validation_cards.csv`
+- cards JSONL: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_validation_plan_20260522/validation_cards.jsonl`
+
+Execution:
+
+- `PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile scripts/analysis/build_rcrf_validation_plan.py`
+- `PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python scripts/analysis/build_rcrf_validation_plan.py`
+
+Result summary:
+
+- Generated `48` validation cards.
+- Top P0 cards focus on:
+  - early-layer `code_source_conflict` code residuals;
+  - Memory residuals on the Code/behavior Pareto boundary;
+  - behavior anchors and behavior guards;
+  - no-prune audit rows for weak/noisy code residuals.
+
+Interpretation:
+
+- The framework now has an explicit loop:
+  `residual evidence -> ledger decision -> routing action -> validation card -> counterfactual experiment`.
+- This is the operational bridge from mechanism analysis to the next model-composition experiment.
+
+## 2026-05-22 RCF-BC Validation Interventions
+
+Code changes:
+
+- Added `scripts/analysis/build_rcrf_validation_interventions.py`.
+  - Reads the ranked validation cards, attribution ledger, source `v18_rcf_bc` gate, and base gate.
+  - Materializes selected cards into minimal OP-VEC `gates.json` interventions.
+  - Default behavior uses the top `6` P0 cards and `--operation auto`.
+  - Auto operation rules:
+    - `retain_continuous_field`, `retain_capability_delta`, `behavior_guard`, `keep_small_until_validated` -> `drop-delta`;
+    - `retain_with_behavior_constraint` -> `half-delta`;
+    - `protect_behavior_anchor`, `do_not_prune_without_counterfactual` -> `shrink-coeff`.
+  - Does not bake checkpoints, run evaluation, or change the main RCF-BC gate.
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added `PHASE=validation_interventions`.
+  - Included it in `PHASE=paper_main` after validation-plan generation.
+- Updated `docs/harness/20260522_rcf_bc_reproducible_loop.md`.
+  - Added the command and output paths.
+
+Artifacts:
+
+- report: `docs/report/RCRF/20260522_rcrf_validation_interventions.md`
+- output dir: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/validation_card_interventions_20260522`
+- manifest: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/validation_card_interventions_20260522/validation_interventions_manifest.json`
+
+Execution:
+
+- `PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python -m py_compile scripts/analysis/build_rcrf_validation_interventions.py`
+- `DRY_RUN=1 PHASE=validation_interventions bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=validation_interventions bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+
+Result summary:
+
+- Generated `6` minimal validation-card gate interventions.
+- Each generated gate keeps `588` OP-VEC keys and changes only the representative rows from one card.
+- The first six cards test:
+  - early-layer Code `code_source_conflict` attention and MLP continuous-field deltas;
+  - Memory `code_repair_with_behavior_harm` Pareto-boundary rows;
+  - early-layer Memory source-conflict residuals.
+
+Interpretation:
+
+- The framework now has concrete counterfactual candidates ready for bake/eval.
+- These are validation probes, not new method variants.
+
+## 2026-05-22 Source-Conflict Routing v16/v17
+
+Code changes:
+
+- Updated `scripts/analysis/build_rcrf_role_routed_gates.py`.
+  - Added optional source-conflict routing:
+    - `--source-conflict-action {hold,suppress-dominant,route-dominant}`
+    - `--source-conflict-min-strength`
+    - `--source-conflict-dominance-ratio`
+    - `--source-conflict-protected-support-action {hold,allow}`
+  - Defaults preserve old behavior: `--source-conflict-action hold`.
+  - v12/v13 routes are therefore unchanged unless the new options are explicitly passed.
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added `v16_source_suppress`.
+  - Added `v17_source_route`.
+
+Artifacts:
+
+- v16 gate: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_source_conflict_suppress_v16/gates.json`
+- v17 gate: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/rcrf_source_conflict_route_v17/gates.json`
+- v16 checkpoint: `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_source_conflict_suppress_v16`
+- v17 checkpoint: `/tmp/shared-storage/OnPolicy/checkpoints/rcrf_source_conflict_route_v17`
+- report: `docs/report/RCRF/20260522_source_conflict_routing_v16_v17.md`
+
+Execution:
+
+- `PHASE=generate CANDIDATES=v16_source_suppress,v17_source_route bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=bake CANDIDATES=v16_source_suppress,v17_source_route bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=quick_eval CANDIDATES=v16_source_suppress,v17_source_route TOOL_GPU=0 TOOL_PORT=8155 MEMORY_GPU_IDS=1 MEMORY_DATASETS=eval_50 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+- `PHASE=code_hurt_eval CANDIDATES=v16_source_suppress,v17_source_route CODE_GPU=2 bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+
+Results:
+
+- v16: Tool `0.8800 / 0.8600 / 0.8125 / 0.6250`; Memory F1 `0.7660`; Code hurt acc/BoN `0.1094/0.2500` and `0.3281/0.4375`.
+- v17: Tool `0.8800 / 0.8550 / 0.8125 / 0.6250`; Memory F1 `0.7654`; Code hurt acc/BoN `0.1250/0.3125` and `0.2188/0.4375`.
+
+Interpretation:
+
+- Source-conflict routing is behavior-safe but too discretized for Code.
+- The stronger method direction is continuous Code pass/fail overlay with behavior constraints, not hard role routing alone.
+
+## 2026-05-22 Operating Point Comparison Diagnostic
+
+Code changes:
+
+- Added `scripts/analysis/compare_rcrf_operating_points.py`.
+  - Aligns atlas rows, a base gate, and multiple candidate gates.
+  - Computes per-row coefficient deltas.
+  - Reports lost reference deltas, sign mismatches, big gaps, and aggregate delta tables by role/source/layer/module/expert.
+  - Does not train, bake, evaluate, or change any gate.
+
+Default comparison:
+
+- reference: `v9`
+- candidates: `v13`, `v16`, `v17`
+
+Artifacts:
+
+- output: `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/rcrf_operating_point_compare_20260522`
+- report: `docs/report/RCRF/20260522_operating_point_delta_diagnosis.md`
+
+Execution:
+
+- `PYTHONDONTWRITEBYTECODE=1 /mnt/cache/wuruixiao/miniconda3/envs/BFCL/bin/python scripts/analysis/compare_rcrf_operating_points.py`
+
+Key result:
+
+- v9 changed `205` residual rows.
+- v17 still loses `110` v9 deltas and introduces `11` sign mismatches.
+- The largest lost regions are `code_source_conflict*`, `uninformative`, and `code_negative_noise`.
+
+Interpretation:
+
+- This supports the method shift from hard role routing to continuous residual capability field with behavior constraints.
+
+## 2026-05-22 RCF-BC Main Method Candidate
+
+Code changes:
+
+- Updated `skill/command/run_20260522_rcrf_pareto_frontier.sh`.
+  - Added candidate `v18_rcf_bc`.
+  - Maps to `/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates/residual_capability_field_behavior_constraints_v18`.
+  - Uses the continuous Code pass/fail overlay with Tool/Memory behavior preserve and harm-veto constraints.
+
+Execution:
+
+- `PHASE=generate CANDIDATES=v18_rcf_bc bash skill/command/run_20260522_rcrf_pareto_frontier.sh`
+
+Verification:
+
+- `v18_rcf_bc` and historical `v9` have identical gate values:
+  - `num_keys = 588`
+  - `max_abs_diff = 0.0`
+  - `different_count = 0`
+
+Report:
+
+- `docs/report/RCRF/20260522_rcf_bc_main_method.md`
+
+Interpretation:
+
+- `v18_rcf_bc` is not a new tuned model. It is the semantic method name for the already validated v9 operating point.
+- This makes the paper story cleaner: RCF-BC is the method; v9 is only the experimental lineage.
+
+## 2026-05-23 Paper-Main Method Config Freeze
+
+Documentation changes:
+
+- Added `docs/paper/ExpertGym_ICLR/PAPER_MAIN_METHOD_CONFIG.md`.
+  - Freezes the paper-main BCRC / RCF-BC configuration.
+  - Records residual granularity, evidence inputs, gate-builder thresholds, gate statistics, bake commands, and paper use rules.
+  - Documents that `v18` is the semantic method name and `v9` is the evaluated baked checkpoint alias because their 588 gate coefficients are numerically identical.
+- Updated `docs/paper/ExpertGym_ICLR/README.md`.
+  - Adds the frozen method config to evidence dependencies and reproduction pointers.
+- Updated `docs/paper/ExpertGym_ICLR/SUBMISSION_READINESS_AUDIT.md`.
+  - Marks exact method config as ready.
+  - Leaves full Eval6 execution as the remaining submission-critical empirical gap.
+- Updated `docs/paper/ExpertGym_ICLR/EXPERIMENT_EVIDENCE_MAP.md`.
+  - Adds the frozen paper-main method config as ready evidence.
+
+No training, reward, gate-building, baking, or evaluation code path was changed.
+
+## 2026-05-23 Paper-Main Eval6 Run Status Tracker
+
+Documentation changes:
+
+- Added `docs/paper/ExpertGym_ICLR/PAPER_MAIN_EVAL_RUN_STATUS.md`.
+  - Tracks the live `iclr_tm_20260523` Eval6 queue.
+  - Records the launch command, queue log, candidate status, current BFCL score, Memory harness command, and Memory artifact progress.
+- Updated `docs/paper/ExpertGym_ICLR/README.md`.
+  - Adds the run-status document next to the frozen queue and method config.
+
+No evaluation logic was changed.  This is only a status/index document for reproducibility and auditability.
+
+## 2026-05-23 Anchor Task Vector Baking Utility
+
+Code changes:
+
+- Added `scripts/eval/bake_anchor_task_vector_checkpoint.py`.
+  - Bakes OP-VEC task vectors from an existing mode manifest onto an arbitrary HF anchor checkpoint.
+  - Supports explicit expert coefficients such as `tool=1.0,memory=1.0,code=1.0`.
+  - Copies non-merged sidecar tensors from the anchor checkpoint, so the produced model remains a standard HF checkpoint.
+  - Writes `anchor_task_vector_bake_summary.json` with source paths, expert weights, merged tensor count, delta count, and norm diagnostics.
+
+Usage in current diagnostic experiment:
+
+- Produced `/tmp/shared-storage/ExpertGym/reproduce/deepseek_anchor_agentfull_20260523/baked_policy`.
+- Evaluation report: `docs/evaluation/20260523_deepseek_anchor_agentfull_eval.md`.
+
+No training, reward, rollout, optimizer, or evaluation scoring logic was changed.

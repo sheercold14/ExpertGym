@@ -159,34 +159,111 @@ def linear_delta_probe(
             f"delta={tuple(delta.shape)} inputs={tuple(inputs.shape)} output_grads={tuple(output_grads.shape)}"
         )
 
-    if token_mask is None:
-        selected_inputs = inputs
-        selected_grads = output_grads
-    else:
-        mask = token_mask.to(device=inputs.device, dtype=torch.bool)
-        if mask.ndim == 1:
-            if mask.numel() != inputs.shape[1]:
-                raise ValueError(f"1D token_mask length {mask.numel()} != seq_len {inputs.shape[1]}")
-            selected_inputs = inputs[:, mask, :]
-            selected_grads = output_grads[:, mask, :]
-        elif mask.ndim == 2:
-            if tuple(mask.shape) != tuple(inputs.shape[:2]):
-                raise ValueError(f"2D token_mask shape {tuple(mask.shape)} != token shape {tuple(inputs.shape[:2])}")
-            selected_inputs = inputs[mask].unsqueeze(0)
-            selected_grads = output_grads[mask].unsqueeze(0)
-        else:
-            raise ValueError(f"Unsupported token_mask ndim={mask.ndim}")
+    selected_inputs, selected_grads = select_probe_tokens(
+        inputs=inputs,
+        output_grads=output_grads,
+        token_mask=token_mask,
+    )
     if selected_inputs.numel() == 0:
         zero = torch.zeros(delta.shape[0], dtype=torch.float32, device=delta.device)
         return 0.0, 0.0, zero
 
-    delta_local = delta.to(device=selected_inputs.device, dtype=selected_inputs.dtype)
-    induced = torch.einsum("bsi,oi->bso", selected_inputs, delta_local)
+    induced = apply_linear_delta(delta=delta, selected_inputs=selected_inputs)
+    if induced.shape != selected_grads.shape:
+        raise ValueError(
+            "Delta output dimension does not match linear output gradients: "
+            f"induced={tuple(induced.shape)} grads={tuple(selected_grads.shape)}"
+        )
     selected_grads = selected_grads.to(dtype=induced.dtype)
     expression = induced.pow(2).sum(dim=-1).mean()
     signed_effect = -(selected_grads * induced).sum(dim=-1).mean()
     mean_update = induced.mean(dim=(0, 1)).detach().to(dtype=torch.float32, device="cpu")
     return float(expression.detach().float().item()), float(signed_effect.detach().float().item()), mean_update
+
+
+def linear_delta_probe_with_tokens(
+    *,
+    delta: torch.Tensor,
+    inputs: torch.Tensor,
+    output_grads: torch.Tensor,
+    token_mask: torch.Tensor | None = None,
+) -> tuple[float, float, torch.Tensor, torch.Tensor]:
+    """Return first-order utility plus selected-token induced updates.
+
+    The first three return values match :func:`linear_delta_probe`.  The final
+    tensor is ``D x`` for every selected token and stays on the model device so
+    callers can compute activation-update projection decompositions without a
+    CPU round trip.
+    """
+
+    selected_inputs, selected_grads = select_probe_tokens(
+        inputs=inputs,
+        output_grads=output_grads,
+        token_mask=token_mask,
+    )
+    if selected_inputs.numel() == 0:
+        zero = torch.zeros(delta.shape[0], dtype=torch.float32, device=delta.device)
+        empty = torch.zeros((0, 0, delta.shape[0]), dtype=torch.float32, device=inputs.device)
+        return 0.0, 0.0, zero, empty
+
+    induced = apply_linear_delta(delta=delta, selected_inputs=selected_inputs)
+    if induced.shape != selected_grads.shape:
+        raise ValueError(
+            "Delta output dimension does not match linear output gradients: "
+            f"induced={tuple(induced.shape)} grads={tuple(selected_grads.shape)}"
+        )
+    selected_grads = selected_grads.to(dtype=induced.dtype)
+    expression = induced.pow(2).sum(dim=-1).mean()
+    signed_effect = -(selected_grads * induced).sum(dim=-1).mean()
+    mean_update = induced.mean(dim=(0, 1)).detach().to(dtype=torch.float32, device="cpu")
+    return (
+        float(expression.detach().float().item()),
+        float(signed_effect.detach().float().item()),
+        mean_update,
+        induced.detach(),
+    )
+
+
+def select_probe_tokens(
+    *,
+    inputs: torch.Tensor,
+    output_grads: torch.Tensor,
+    token_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if inputs.ndim != 3 or output_grads.ndim != 3:
+        raise ValueError(
+            f"Expected rank-3 inputs/output_grads, got {tuple(inputs.shape)} and {tuple(output_grads.shape)}"
+        )
+    if inputs.shape[:2] != output_grads.shape[:2]:
+        raise ValueError(
+            f"Token shape mismatch: inputs={tuple(inputs.shape)} output_grads={tuple(output_grads.shape)}"
+        )
+    if token_mask is None:
+        return inputs, output_grads
+    mask = token_mask.to(device=inputs.device, dtype=torch.bool)
+    if mask.ndim == 1:
+        if mask.numel() != inputs.shape[1]:
+            raise ValueError(f"1D token_mask length {mask.numel()} != seq_len {inputs.shape[1]}")
+        return inputs[:, mask, :], output_grads[:, mask, :]
+    if mask.ndim == 2:
+        if tuple(mask.shape) != tuple(inputs.shape[:2]):
+            raise ValueError(f"2D token_mask shape {tuple(mask.shape)} != token shape {tuple(inputs.shape[:2])}")
+        return inputs[mask].unsqueeze(0), output_grads[mask].unsqueeze(0)
+    raise ValueError(f"Unsupported token_mask ndim={mask.ndim}")
+
+
+def apply_linear_delta(*, delta: torch.Tensor, selected_inputs: torch.Tensor) -> torch.Tensor:
+    if delta.ndim != 2:
+        raise ValueError(f"Expected rank-2 delta, got shape={tuple(delta.shape)}")
+    if selected_inputs.ndim != 3:
+        raise ValueError(f"Expected rank-3 selected_inputs, got shape={tuple(selected_inputs.shape)}")
+    if delta.shape[1] != selected_inputs.shape[-1]:
+        raise ValueError(
+            "Delta shape does not match linear input dimensions: "
+            f"delta={tuple(delta.shape)} inputs={tuple(selected_inputs.shape)}"
+        )
+    delta_local = delta.to(device=selected_inputs.device, dtype=selected_inputs.dtype)
+    return torch.einsum("bsi,oi->bso", selected_inputs, delta_local)
 
 
 def aggregate_layer_energy_scores(

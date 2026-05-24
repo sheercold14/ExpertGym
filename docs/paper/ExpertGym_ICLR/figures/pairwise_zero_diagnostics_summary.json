@@ -1,0 +1,99 @@
+{
+  "claim": "Pairwise-zero diagnostics show that each expert removal deletes a mixture of capability, behavior-support, and conflict residuals; scalar zeroing is therefore useful as a negative control but not as a composition method.",
+  "conflict_rows": [
+    {
+      "both_positive_rate": 0.4744897959183674,
+      "comparable_modules": 196,
+      "opposite_sign_rate": 0.5,
+      "pair_name": "tool_memory__code_zero",
+      "task": "tool"
+    },
+    {
+      "both_positive_rate": 0.3163265306122449,
+      "comparable_modules": 196,
+      "opposite_sign_rate": 0.6479591836734694,
+      "pair_name": "tool_memory__code_zero",
+      "task": "memory"
+    },
+    {
+      "both_positive_rate": 0.1666666666666666,
+      "comparable_modules": 156,
+      "opposite_sign_rate": 0.4551282051282051,
+      "pair_name": "tool_memory__code_zero",
+      "task": "code"
+    },
+    {
+      "both_positive_rate": null,
+      "comparable_modules": 0,
+      "opposite_sign_rate": null,
+      "pair_name": "tool_code__memory_zero",
+      "task": "tool"
+    },
+    {
+      "both_positive_rate": null,
+      "comparable_modules": 0,
+      "opposite_sign_rate": null,
+      "pair_name": "tool_code__memory_zero",
+      "task": "memory"
+    },
+    {
+      "both_positive_rate": 0.2941176470588235,
+      "comparable_modules": 136,
+      "opposite_sign_rate": 0.5294117647058824,
+      "pair_name": "tool_code__memory_zero",
+      "task": "code"
+    },
+    {
+      "both_positive_rate": null,
+      "comparable_modules": 0,
+      "opposite_sign_rate": null,
+      "pair_name": "memory_code__tool_zero",
+      "task": "tool"
+    },
+    {
+      "both_positive_rate": null,
+      "comparable_modules": 0,
+      "opposite_sign_rate": null,
+      "pair_name": "memory_code__tool_zero",
+      "task": "memory"
+    },
+    {
+      "both_positive_rate": 0.1866666666666666,
+      "comparable_modules": 150,
+      "opposite_sign_rate": 0.6066666666666667,
+      "pair_name": "memory_code__tool_zero",
+      "task": "code"
+    }
+  ],
+  "figure_pdf": "/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/paper/ExpertGym_ICLR/figures/pairwise_zero_diagnostics.pdf",
+  "figure_png": "/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/paper/ExpertGym_ICLR/figures/pairwise_zero_diagnostics.png",
+  "zero_rows": [
+    {
+      "code_repair_only": 43,
+      "memory_support_rows": 0,
+      "pair_name": "tool_memory__code_zero",
+      "removed_rows": 196,
+      "shared_positive": 0,
+      "tool_support_rows": 0,
+      "zero_expert": "code"
+    },
+    {
+      "code_repair_only": 4,
+      "memory_support_rows": 84,
+      "pair_name": "tool_code__memory_zero",
+      "removed_rows": 196,
+      "shared_positive": 0,
+      "tool_support_rows": 20,
+      "zero_expert": "memory"
+    },
+    {
+      "code_repair_only": 13,
+      "memory_support_rows": 0,
+      "pair_name": "memory_code__tool_zero",
+      "removed_rows": 196,
+      "shared_positive": 17,
+      "tool_support_rows": 126,
+      "zero_expert": "tool"
+    }
+  ]
+}

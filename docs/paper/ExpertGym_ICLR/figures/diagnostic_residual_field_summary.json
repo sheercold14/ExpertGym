@@ -1,0 +1,123 @@
+{
+  "figure_pdf": "/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/paper/ExpertGym_ICLR/figures/diagnostic_residual_field.pdf",
+  "figure_png": "/mnt/cache/wuruixiao/users/lsc/Agent/ExpertGym/docs/paper/ExpertGym_ICLR/figures/diagnostic_residual_field.png",
+  "span_order": [
+    "LB_prompt",
+    "LB_reasoning",
+    "LB_code",
+    "LCB_prompt",
+    "LCB_code"
+  ],
+  "top_conflict_pairs": [
+    {
+      "left": "LB_prompt",
+      "right": "LCB_prompt",
+      "pearson": -0.994829576107048,
+      "conflict_rate": 0.6394557823129252
+    },
+    {
+      "left": "LB_prompt",
+      "right": "LCB_code",
+      "pearson": -0.0144514535283063,
+      "conflict_rate": 0.564625850340136
+    },
+    {
+      "left": "LB_reasoning",
+      "right": "LCB_prompt",
+      "pearson": -0.0542615311839034,
+      "conflict_rate": 0.564625850340136
+    },
+    {
+      "left": "LB_code",
+      "right": "LCB_prompt",
+      "pearson": -0.0144161770321927,
+      "conflict_rate": 0.5272108843537415
+    },
+    {
+      "left": "LB_code",
+      "right": "LCB_code",
+      "pearson": -0.0381841136664479,
+      "conflict_rate": 0.5102040816326531
+    }
+  ],
+  "role_total": 588,
+  "role_rows": [
+    {
+      "archetype": "code_source_conflict",
+      "row_count": 279,
+      "fraction": 0.4744897959183674
+    },
+    {
+      "archetype": "weak_or_uninformative",
+      "row_count": 78,
+      "fraction": 0.1326530612244898
+    },
+    {
+      "archetype": "clean_code_repair",
+      "row_count": 77,
+      "fraction": 0.13095238095238096
+    },
+    {
+      "archetype": "code_negative_with_behavior_support",
+      "row_count": 58,
+      "fraction": 0.09863945578231292
+    },
+    {
+      "archetype": "code_negative_noise",
+      "row_count": 56,
+      "fraction": 0.09523809523809523
+    },
+    {
+      "archetype": "code_repair_with_behavior_harm",
+      "row_count": 28,
+      "fraction": 0.047619047619047616
+    },
+    {
+      "archetype": "behavior_only",
+      "row_count": 12,
+      "fraction": 0.02040816326530612
+    }
+  ],
+  "tradeoff_rows": [
+    {
+      "variant": "v8",
+      "method": "Code field + Tool/Memory hard behavior veto",
+      "tool_quick_mean": 0.794375,
+      "memory_eval50_f1": 0.7720457493894994,
+      "code_hurt_bon_mean": 0.28125,
+      "code_hurt_acc_mean": 0.1953125
+    },
+    {
+      "variant": "v18",
+      "method": "Main method name for v9: RCF-BC",
+      "tool_quick_mean": 0.793125,
+      "memory_eval50_f1": 0.75752442002442,
+      "code_hurt_bon_mean": 0.4375,
+      "code_hurt_acc_mean": 0.234375
+    },
+    {
+      "variant": "v19",
+      "method": "Ablation: strict archetype-consistency projection",
+      "tool_quick_mean": 0.795625,
+      "memory_eval50_f1": 0.7793498168498167,
+      "code_hurt_bon_mean": 0.3125,
+      "code_hurt_acc_mean": 0.2265625
+    },
+    {
+      "variant": "v14",
+      "method": "Negative control: v9 with code expert coefficients halved",
+      "tool_quick_mean": 0.794375,
+      "memory_eval50_f1": 0.7773532890720392,
+      "code_hurt_bon_mean": 0.21875,
+      "code_hurt_acc_mean": 0.2265625
+    },
+    {
+      "variant": "v15",
+      "method": "Negative control: v9 with code expert coefficients set to zero",
+      "tool_quick_mean": 0.78,
+      "memory_eval50_f1": 0.7841117216117216,
+      "code_hurt_bon_mean": 0.15625,
+      "code_hurt_acc_mean": 0.125
+    }
+  ]
+}

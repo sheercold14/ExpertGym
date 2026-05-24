@@ -47,6 +47,9 @@ LATEST_ANALYSIS_DIR = Path(
 LATEST_CONTRAST_GATES_DIR = Path(
     "/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/contrast_gates"
 )
+PAIRWISE_ZERO_DIR = Path(
+    "/tmp/shared-storage/ExpertGym/rcrf/code_hurt_subset_20260521/analysis/pairwise_zero_diagnostics_20260523"
+)
 LATEST_VARIANT_ORDER = [
     "v1_code_only",
     "v2_spanaware",
@@ -89,6 +92,7 @@ def main() -> None:
             "3. Interference Explorer / 跨专家干扰",
             "4. Gate Sparsity View / Gate 稀疏与抑制",
             "5. Research Questions / 下一步机制问题",
+            "6. Pairwise-Zero / 两两置零诊断",
         ],
     )
 
@@ -102,8 +106,10 @@ def main() -> None:
         page_interference(data)
     elif page.startswith("4."):
         page_gate_sparsity(data)
-    else:
+    elif page.startswith("5."):
         page_research_questions(data)
+    else:
+        page_pairwise_zero()
 
 
 @st.cache_data(show_spinner=False)
@@ -1595,6 +1601,125 @@ def page_research_questions(data: MechanismData) -> None:
         ],
         "把 eval 差异反查到 Gate/Interference/Prompt 页面，形成机制闭环。"
     )
+
+
+@st.cache_data(show_spinner=False)
+def load_pairwise_zero_findings() -> dict[str, Any]:
+    def read_csv(path: Path) -> pd.DataFrame:
+        if not path.exists():
+            return pd.DataFrame()
+        return pd.read_csv(path)
+
+    report_path = PAIRWISE_ZERO_DIR / "pairwise_zero_diagnostic_report.md"
+    report = ""
+    if report_path.exists():
+        report = report_path.read_text(encoding="utf-8", errors="ignore")
+    return {
+        "exists": PAIRWISE_ZERO_DIR.exists(),
+        "report": report,
+        "zero_summary": read_csv(PAIRWISE_ZERO_DIR / "zero_expert_summary.csv"),
+        "conflict_summary": read_csv(PAIRWISE_ZERO_DIR / "pairwise_conflict_summary.csv"),
+        "module_conflict": read_csv(PAIRWISE_ZERO_DIR / "pairwise_module_conflict_summary.csv"),
+        "figures": [
+            PAIRWISE_ZERO_DIR / "figures" / "pairwise_conflict_rate_heatmap.png",
+            PAIRWISE_ZERO_DIR / "figures" / "zero_expert_role_risk_heatmap.png",
+            PAIRWISE_ZERO_DIR / "figures" / "pairwise_expression_dominance.png",
+        ],
+    }
+
+
+def page_pairwise_zero() -> None:
+    latest = load_pairwise_zero_findings()
+    st.subheader("Pairwise-Zero Diagnostics / 两两置零诊断")
+    st.markdown(
+        f"""
+        这一页把三专家联合视角拆成三个二元问题：每次保留两个 expert，把第三个 expert 的 residual coefficient 置为 0。
+
+        当前读取目录：
+
+        `{PAIRWISE_ZERO_DIR}`
+
+        **用途**：这里不是最终评测页面，而是论文机制诊断页面。它帮助判断某个 expert 被置零时，到底删掉了能力 residual、行为保护 residual，还是冲突/noise residual。
+        """
+    )
+    if not latest["exists"]:
+        st.warning("pairwise-zero 目录还不存在。先运行 `scripts/analysis/build_rcrf_pairwise_zero_diagnostics.py`。")
+        return
+
+    zero_summary = latest["zero_summary"]
+    conflict_summary = latest["conflict_summary"]
+    module_conflict = latest["module_conflict"]
+
+    if not conflict_summary.empty:
+        st.markdown("### 二元冲突：哪个 pair 在哪个 task 上方向相反")
+        pivot = conflict_summary.pivot_table(
+            index="pair_name",
+            columns="task",
+            values="opposite_sign_rate",
+            aggfunc="mean",
+            observed=False,
+        )
+        fig = px.imshow(
+            pivot,
+            aspect="auto",
+            color_continuous_scale="Reds",
+            title="Opposite-sign rate by pair and task",
+            labels={"x": "task / 任务", "y": "pair / 二元视角", "color": "opposite rate"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(conflict_summary, use_container_width=True, hide_index=True)
+
+    if not zero_summary.empty:
+        st.markdown("### 置零一个 expert 会删掉什么 role")
+        role_cols = [col for col in zero_summary.columns if col.startswith("role_")]
+        if role_cols:
+            role_view = zero_summary[["pair_name", "zero_expert", *role_cols]].melt(
+                id_vars=["pair_name", "zero_expert"],
+                var_name="role",
+                value_name="count",
+            )
+            role_view["role"] = role_view["role"].str.replace("role_", "", regex=False)
+            fig = px.bar(
+                role_view,
+                x="pair_name",
+                y="count",
+                color="role",
+                title="Removed residual roles after zeroing one expert",
+                labels={"pair_name": "pairwise view / 二元视角", "count": "removed rows / 删除行数"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(zero_summary, use_container_width=True, hide_index=True)
+
+    if not module_conflict.empty:
+        st.markdown("### 层段 / 模块族冲突定位")
+        selected_pair = st.selectbox("pair", sorted(module_conflict["pair_name"].unique()))
+        selected_task = st.selectbox("task", sorted(module_conflict["task"].unique()))
+        view = module_conflict[
+            (module_conflict["pair_name"] == selected_pair) & (module_conflict["task"] == selected_task)
+        ].copy()
+        if not view.empty:
+            fig = px.bar(
+                view,
+                x="layer_band",
+                y="opposite_sign_rate",
+                color="module_family",
+                barmode="group",
+                title=f"{selected_pair} on {selected_task}: conflict by layer band and module family",
+                labels={"opposite_sign_rate": "opposite-sign rate / 方向相反比例"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(view, use_container_width=True, hide_index=True)
+
+    st.markdown("### 论文报告摘要")
+    if latest["report"]:
+        st.markdown(latest["report"])
+    else:
+        st.info("没有找到 pairwise_zero_diagnostic_report.md。")
+
+    st.markdown("### 静态图")
+    for figure in latest["figures"]:
+        if figure.exists():
+            st.image(str(figure), caption=figure.name, use_container_width=True)
 
 
 def metric_source_table(data: MechanismData, metric: str) -> pd.DataFrame:

@@ -1,0 +1,62 @@
+\begin{thebibliography}{8}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Cheng et~al.(2025)Cheng, Xiong, Wei, Zhu, and Yuan]{cheng2025wudi}
+Runxi Cheng, Feng Xiong, Yongxian Wei, Wanyun Zhu, and Chun Yuan.
+\newblock Whoever started the interference should end it: Guiding data-free
+  model merging via task vectors.
+\newblock In \emph{International Conference on Machine Learning}, 2025.
+
+\bibitem[Deep et~al.(2024)Deep, Bhardwaj, and Poria]{deep2024della}
+Pala~Tej Deep, Rishabh Bhardwaj, and Soujanya Poria.
+\newblock {DELLA}-merging: Reducing interference in model merging through
+  magnitude-based sampling.
+\newblock \emph{arXiv preprint arXiv:2406.11617}, 2024.
+
+\bibitem[Gargiulo et~al.(2025)Gargiulo, Crisostomi, Bucarelli, Scardapane,
+  Silvestri, and Rodola]{gargiulo2025tsv}
+Antonio~Andrea Gargiulo, Donato Crisostomi, Maria~Sofia Bucarelli, Simone
+  Scardapane, Fabrizio Silvestri, and Emanuele Rodola.
+\newblock Task singular vectors: Reducing task interference in model merging.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision
+  and Pattern Recognition}, 2025.
+
+\bibitem[Huang et~al.(2026)Huang, Liu, Lin, Lou, He, Tian, Li, and
+  Huang]{huang2026rain}
+Zhehao Huang, Yuhang Liu, Baijiong Lin, Yixin Lou, Zhengbao He, Hanling Tian,
+  Tao Li, and Xiaolin Huang.
+\newblock {RAIN}-merging: A gradient-free method to enhance instruction
+  following in large reasoning models with preserved thinking format.
+\newblock \emph{arXiv preprint arXiv:2602.22538}, 2026.
+
+\bibitem[Ilharco et~al.(2023)Ilharco, Ribeiro, Wortsman, Gururangan, Schmidt,
+  Hajishirzi, and Farhadi]{ilharco2023editing}
+Gabriel Ilharco, Marco~Tulio Ribeiro, Mitchell Wortsman, Suchin Gururangan,
+  Ludwig Schmidt, Hannaneh Hajishirzi, and Ali Farhadi.
+\newblock Editing models with task arithmetic.
+\newblock In \emph{International Conference on Learning Representations}, 2023.
+
+\bibitem[Yadav et~al.(2023)Yadav, Tam, Choshen, Raffel, and
+  Bansal]{yadav2023ties}
+Prateek Yadav, Derek Tam, Leshem Choshen, Colin Raffel, and Mohit Bansal.
+\newblock {TIES}-merging: Resolving interference when merging models.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2023.
+
+\bibitem[Yu et~al.(2023)Yu, Yu, Yu, Huang, and Li]{yu2023dare}
+Le~Yu, Bowen Yu, Haiyang Yu, Fei Huang, and Yongbin Li.
+\newblock Language models are super mario: Absorbing abilities from homologous
+  models as a free lunch.
+\newblock \emph{arXiv preprint arXiv:2311.03099}, 2023.
+
+\bibitem[Yuan et~al.(2026)Yuan, Shi, Zhang, Liu, Yao, Vosoughi, and
+  Lee]{yuan2026ram}
+Xiangchi Yuan, Dachuan Shi, Chunhui Zhang, Zheyuan Liu, Shenglong Yao, Soroush
+  Vosoughi, and Wenke Lee.
+\newblock Behavior knowledge merge in reinforced agentic models.
+\newblock \emph{arXiv preprint arXiv:2601.13572}, 2026.
+
+\end{thebibliography}
